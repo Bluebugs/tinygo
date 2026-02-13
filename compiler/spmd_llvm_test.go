@@ -389,3 +389,155 @@ func TestSPMDLLVMTypeConsistency(t *testing.T) {
 		t.Errorf("getLLVMType(varying int32) = %v, want VectorTypeKind", llvmType1.TypeKind())
 	}
 }
+
+func TestSPMDLaneOffsetConstant(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name      string
+		laneCount int
+		elemType  llvm.Type
+	}{
+		{"4xi32", 4, c.ctx.Int32Type()},
+		{"2xi64", 2, c.ctx.Int64Type()},
+		{"8xi16", 8, c.ctx.Int16Type()},
+		{"16xi8", 16, c.ctx.Int8Type()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := c.spmdLaneOffsetConst(tt.laneCount, tt.elemType)
+
+			if result.IsNil() {
+				t.Fatal("spmdLaneOffsetConst returned nil")
+			}
+
+			// Verify it's a vector type.
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
+			}
+
+			// Verify lane count.
+			if result.Type().VectorSize() != tt.laneCount {
+				t.Errorf("vector size = %d, want %d", result.Type().VectorSize(), tt.laneCount)
+			}
+
+			// Verify it's a constant.
+			if !result.IsConstant() {
+				t.Error("expected constant vector")
+			}
+
+			// Verify element type matches.
+			if result.Type().ElementType().C != tt.elemType.C {
+				t.Error("element type mismatch")
+			}
+		})
+	}
+}
+
+func TestSPMDComputeLaneIndices(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name      string
+		iterVal   uint64
+		laneCount int
+		elemType  llvm.Type
+	}{
+		{"iter0_4lanes", 0, 4, c.ctx.Int32Type()},
+		{"iter8_4lanes", 8, 4, c.ctx.Int32Type()},
+		{"iter12_4lanes", 12, 4, c.ctx.Int32Type()},
+		{"iter0_2lanes", 0, 2, c.ctx.Int64Type()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vecType := llvm.VectorType(tt.elemType, tt.laneCount)
+			scalarVal := llvm.ConstInt(tt.elemType, tt.iterVal, false)
+
+			// Splat scalar and add offset (mirrors emitSPMDBodyPrologue logic).
+			iterVec := b.splatScalar(scalarVal, vecType)
+			offsetVec := c.spmdLaneOffsetConst(tt.laneCount, tt.elemType)
+			laneIndices := b.CreateAdd(iterVec, offsetVec, "test.lane.idx")
+
+			// Verify result is a vector with correct lane count.
+			if laneIndices.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("result type = %v, want VectorTypeKind", laneIndices.Type().TypeKind())
+			}
+			if laneIndices.Type().VectorSize() != tt.laneCount {
+				t.Errorf("vector size = %d, want %d", laneIndices.Type().VectorSize(), tt.laneCount)
+			}
+		})
+	}
+}
+
+func TestSPMDComputeTailMask(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	elemType := c.ctx.Int32Type()
+	vecType := llvm.VectorType(elemType, laneCount)
+
+	tests := []struct {
+		name     string
+		iterVal  uint64
+		boundVal uint64
+	}{
+		{"all_active", 0, 16},        // lanes 0,1,2,3 < 16 → all true
+		{"partial_tail", 12, 14},     // lanes 12,13,14,15 < 14 → T,T,F,F
+		{"single_lane", 0, 1},        // lanes 0,1,2,3 < 1 → T,F,F,F
+		{"all_active_exact", 12, 16}, // lanes 12,13,14,15 < 16 → all true
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create lane indices.
+			scalarVal := llvm.ConstInt(elemType, tt.iterVal, false)
+			iterVec := b.splatScalar(scalarVal, vecType)
+			offsetVec := c.spmdLaneOffsetConst(laneCount, elemType)
+			laneIndices := b.CreateAdd(iterVec, offsetVec, "test.idx")
+
+			// Create bound vector.
+			boundScalar := llvm.ConstInt(elemType, tt.boundVal, false)
+			boundVec := b.splatScalar(boundScalar, vecType)
+
+			// Compute tail mask.
+			tailMask := b.CreateICmp(llvm.IntSLT, laneIndices, boundVec, "test.mask")
+
+			// Verify result is a vector of i1.
+			if tailMask.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("tail mask type = %v, want VectorTypeKind", tailMask.Type().TypeKind())
+			}
+			if tailMask.Type().VectorSize() != laneCount {
+				t.Errorf("tail mask size = %d, want %d", tailMask.Type().VectorSize(), laneCount)
+			}
+			if tailMask.Type().ElementType().TypeKind() != llvm.IntegerTypeKind {
+				t.Errorf("tail mask element type = %v, want IntegerTypeKind", tailMask.Type().ElementType().TypeKind())
+			}
+		})
+	}
+}
+
+func TestSPMDAnalyzeLoopsNil(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// With no spmdInfo, analyzeSPMDLoops should return nil.
+	if b.spmdInfo != nil {
+		t.Fatal("expected spmdInfo to be nil for test builder")
+	}
+
+	state := b.analyzeSPMDLoops()
+	if state != nil {
+		t.Errorf("analyzeSPMDLoops() = %v, want nil for non-SPMD function", state)
+	}
+}

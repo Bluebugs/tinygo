@@ -177,6 +177,8 @@ type builder struct {
 	deferBuiltinFuncs map[ssa.Value]deferBuiltin
 	runDefersBlock    []llvm.BasicBlock
 	afterDefersBlock  []llvm.BasicBlock
+	spmdLoopState     *spmdLoopState            // SPMD loop analysis results (nil if no SPMD)
+	spmdValueOverride map[ssa.Value]llvm.Value   // SPMD value substitutions (e.g., iter phi -> lane indices)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1364,6 +1366,9 @@ func (b *builder) createFunctionStart(intrinsic bool) {
 func (b *builder) createFunction() {
 	b.createFunctionStart(false)
 
+	// SPMD: analyze loops before compiling blocks.
+	b.spmdLoopState = b.analyzeSPMDLoops()
+
 	// Fill blocks with instructions.
 	for _, block := range b.fn.DomPreorder() {
 		if b.DumpSSA {
@@ -1372,6 +1377,16 @@ func (b *builder) createFunction() {
 		b.currentBlock = block
 		b.currentBlockInfo = &b.blockInfo[block.Index]
 		b.SetInsertPointAtEnd(b.currentBlockInfo.entry)
+
+		// SPMD: enable value overrides for body blocks, clear for other blocks.
+		if b.spmdLoopState != nil {
+			if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
+				b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
+			} else {
+				b.spmdValueOverride = nil
+			}
+		}
+
 		for _, instr := range block.Instrs {
 			if instr, ok := instr.(*ssa.DebugRef); ok {
 				if !b.Debug {
@@ -1405,6 +1420,16 @@ func (b *builder) createFunction() {
 				}
 			}
 			b.createInstruction(instr)
+
+			// SPMD: after compiling an SPMD loop's iter phi, emit the body prologue.
+			if b.spmdValueOverride != nil {
+				if phi, ok := instr.(*ssa.Phi); ok {
+					if loop, ok := b.spmdLoopState.activeLoops[phi]; ok {
+						b.emitSPMDBodyPrologue(loop)
+						b.spmdValueOverride[phi] = loop.laneIndices
+					}
+				}
+			}
 		}
 		if b.fn.Name() == "init" && len(block.Instrs) == 0 {
 			b.CreateRetVoid()
@@ -2027,6 +2052,12 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 // getValue returns the LLVM value of a constant, function value, global, or
 // already processed SSA expression.
 func (b *builder) getValue(expr ssa.Value, pos token.Pos) llvm.Value {
+	// SPMD: check for value overrides (e.g., iter phi -> lane indices vector).
+	if b.spmdValueOverride != nil {
+		if override, ok := b.spmdValueOverride[expr]; ok {
+			return override
+		}
+	}
 	switch expr := expr.(type) {
 	case *ssa.Const:
 		if pos == token.NoPos {
@@ -2125,6 +2156,14 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 	case *ssa.BinOp:
 		x := b.getValue(expr.X, getPos(expr))
 		y := b.getValue(expr.Y, getPos(expr))
+		// SPMD: replace +1 with +laneCount for SPMD loop increment.
+		if b.spmdLoopState != nil && expr.Op == token.ADD {
+			if loop, ok := b.spmdLoopState.loopBlocks[b.currentBlock.Index]; ok {
+				if expr == loop.incrBinOp {
+					y = llvm.ConstInt(x.Type(), uint64(loop.laneCount), false)
+				}
+			}
+		}
 		return b.createBinOp(expr.Op, expr.X.Type(), expr.Y.Type(), x, y, expr.Pos())
 	case *ssa.Call:
 		return b.createFunctionCall(expr.Common())

@@ -322,3 +322,170 @@ func (c *compilerContext) createSPMDConst(expr *ssa.Const, spmdType *types.SPMDT
 	}
 	return llvm.ConstVector(elts, false)
 }
+
+// spmdLoopState holds per-function SPMD loop analysis results.
+type spmdLoopState struct {
+	activeLoops map[ssa.Value]*spmdActiveLoop // iter phi -> active loop
+	bodyBlocks  map[int]*spmdActiveLoop       // body block index -> loop
+	loopBlocks  map[int]*spmdActiveLoop       // loop block index -> loop
+}
+
+// spmdActiveLoop holds state for one SPMD loop during compilation.
+type spmdActiveLoop struct {
+	info       *SPMDLoopInfo
+	iterPhi    *ssa.Phi    // the "rangeint.iter" phi in body block
+	laneCount  int         // e.g. 4 for int32 on WASM SIMD128
+	boundValue ssa.Value   // N in "range N"
+	incrBinOp  *ssa.BinOp  // the ADD in the loop block
+
+	// Set during IR generation:
+	laneIndices llvm.Value // <iter, iter+1, ..., iter+laneCount-1>
+	tailMask    llvm.Value // per-lane bounds check
+}
+
+// analyzeSPMDLoops performs pre-analysis of SPMD loops before block compilation.
+// It identifies the SSA pattern for "go for i := range N" loops and extracts the
+// key values needed for vectorization: the iter phi, bound value, and increment operation.
+//
+// This relies on golang.org/x/tools/go/ssa's rangeint pattern comments:
+//   - "rangeint.body": loop body block containing the iteration variable phi
+//   - "rangeint.iter": phi instruction for the loop counter
+//   - "rangeint.loop": successor block with increment (ADD) and bounds check (LSS)
+//
+// If go/ssa internals change in x/tools, this detection may need updates.
+func (b *builder) analyzeSPMDLoops() *spmdLoopState {
+	if b.spmdInfo == nil {
+		return nil
+	}
+
+	state := &spmdLoopState{
+		activeLoops: make(map[ssa.Value]*spmdActiveLoop),
+		bodyBlocks:  make(map[int]*spmdActiveLoop),
+		loopBlocks:  make(map[int]*spmdActiveLoop),
+	}
+
+	// Iterate over ALL blocks (not just DomPreorder) to find rangeint patterns.
+	for _, block := range b.fn.Blocks {
+		// Look for rangeint.body blocks.
+		if block.Comment != "rangeint.body" {
+			continue
+		}
+
+		// Find the rangeint.iter phi instruction.
+		var iterPhi *ssa.Phi
+		for _, instr := range block.Instrs {
+			if phi, ok := instr.(*ssa.Phi); ok && phi.Comment == "rangeint.iter" {
+				iterPhi = phi
+				break
+			}
+		}
+		if iterPhi == nil {
+			continue
+		}
+
+		// Check if this phi's position is inside an SPMD loop.
+		loopInfo := b.isInSPMDLoop(iterPhi.Pos())
+		if loopInfo == nil {
+			continue
+		}
+
+		// Find the successor rangeint.loop block.
+		var loopBlock *ssa.BasicBlock
+		for _, succ := range block.Succs {
+			if succ.Comment == "rangeint.loop" {
+				loopBlock = succ
+				break
+			}
+		}
+		if loopBlock == nil {
+			continue
+		}
+
+		// Find the increment BinOp (iter + 1) in the loop block.
+		var incrBinOp *ssa.BinOp
+		var boundValue ssa.Value
+		for _, instr := range loopBlock.Instrs {
+			if binOp, ok := instr.(*ssa.BinOp); ok {
+				if binOp.Op == token.ADD && binOp.X == iterPhi {
+					incrBinOp = binOp
+				}
+				// Find the bounds check (incr < N).
+				if binOp.Op == token.LSS && incrBinOp != nil && binOp.X == incrBinOp {
+					boundValue = binOp.Y
+				}
+			}
+		}
+		if incrBinOp == nil || boundValue == nil {
+			continue
+		}
+
+		// Compute lane count based on the iter phi's element type.
+		// The phi has Go's int type, which on WASM is i32.
+		elemType := b.getLLVMType(iterPhi.Type())
+		laneCount := b.spmdLaneCount(elemType)
+
+		// Create the active loop entry.
+		loop := &spmdActiveLoop{
+			info:       loopInfo,
+			iterPhi:    iterPhi,
+			laneCount:  laneCount,
+			boundValue: boundValue,
+			incrBinOp:  incrBinOp,
+		}
+
+		// Populate the maps for quick lookup.
+		state.activeLoops[iterPhi] = loop
+		state.bodyBlocks[block.Index] = loop
+		state.loopBlocks[loopBlock.Index] = loop
+	}
+
+	if len(state.activeLoops) == 0 {
+		return nil
+	}
+
+	return state
+}
+
+// spmdLaneOffsetConst creates a constant vector <0, 1, 2, ..., laneCount-1>.
+func (c *compilerContext) spmdLaneOffsetConst(laneCount int, elemType llvm.Type) llvm.Value {
+	elts := make([]llvm.Value, laneCount)
+	for i := 0; i < laneCount; i++ {
+		elts[i] = llvm.ConstInt(elemType, uint64(i), false)
+	}
+	return llvm.ConstVector(elts, false)
+}
+
+// emitSPMDBodyPrologue emits the lane indices and tail mask after phi compilation.
+// This transforms the scalar loop iterator into a vector of lane indices, and
+// computes a per-lane bounds check mask.
+func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
+	// Get the scalar phi value (already compiled as LLVM phi).
+	scalarPhi := b.locals[loop.iterPhi]
+
+	// Get element type from the scalar phi (e.g., i32 for int on WASM).
+	elemType := scalarPhi.Type()
+
+	// Create vector type for the lane count.
+	vecType := llvm.VectorType(elemType, loop.laneCount)
+
+	// Splat the scalar iterator across all lanes.
+	iterVec := b.splatScalar(scalarPhi, vecType)
+
+	// Create the offset constant <0, 1, 2, ..., laneCount-1>.
+	offsetVec := b.spmdLaneOffsetConst(loop.laneCount, elemType)
+
+	// Compute lane indices: <iter, iter+1, iter+2, ..., iter+laneCount-1>.
+	laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
+
+	// Get the bound value and splat it.
+	boundScalar := b.getValue(loop.boundValue, token.NoPos)
+	boundVec := b.splatScalar(boundScalar, vecType)
+
+	// Compute tail mask: laneIndices < bound (per-lane comparison).
+	// Use IntSLT for signed comparison since Go's int is signed.
+	tailMask := b.CreateICmp(llvm.IntSLT, laneIndices, boundVec, "spmd.tail.mask")
+
+	// Store the results in the loop state.
+	loop.laneIndices = laneIndices
+	loop.tailMask = tailMask
+}
