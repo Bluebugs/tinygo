@@ -1728,6 +1728,7 @@ func main() {
 		GOARCH:          goenv.Get("GOARCH"),
 		GOARM:           goenv.Get("GOARM"),
 		GOMIPS:          goenv.Get("GOMIPS"),
+		GOExperiment:    goenv.Get("GOEXPERIMENT"),
 		Target:          *target,
 		BuildMode:       *buildMode,
 		StackSize:       stackSize,

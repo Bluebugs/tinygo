@@ -60,13 +60,25 @@ func (c *Config) BuildMode() string {
 // RISC-V processor, that could be "+a,+c,+m". For many targets, an empty list
 // will be returned.
 func (c *Config) Features() string {
-	if c.Target.Features == "" {
-		return c.Options.LLVMFeatures
+	features := c.Target.Features
+	if c.Options.LLVMFeatures != "" {
+		if features == "" {
+			features = c.Options.LLVMFeatures
+		} else {
+			features = features + "," + c.Options.LLVMFeatures
+		}
 	}
-	if c.Options.LLVMFeatures == "" {
-		return c.Target.Features
+	// Auto-enable SIMD128 for WASM targets when SPMD experiment is active.
+	if hasExperiment(c.Options.GOExperiment, "spmd") && c.Target.GOARCH == "wasm" {
+		if !strings.Contains(features, "+simd128") {
+			if features == "" {
+				features = "+simd128"
+			} else {
+				features = features + ",+simd128"
+			}
+		}
 	}
-	return c.Target.Features + "," + c.Options.LLVMFeatures
+	return features
 }
 
 // ABI returns the -mabi= flag for this target (like -mabi=lp64). A zero-length
@@ -99,6 +111,22 @@ func (c *Config) GOARM() string {
 // building a program.
 func (c *Config) GOMIPS() string {
 	return c.Options.GOMIPS
+}
+
+// GOExperiment returns the GOEXPERIMENT value.
+func (c *Config) GOExperiment() string {
+	return c.Options.GOExperiment
+}
+
+// hasExperiment checks if a specific experiment is enabled in a
+// comma-separated GOEXPERIMENT string (e.g., "spmd" in "spmd,foo").
+func hasExperiment(goexperiment, name string) bool {
+	for _, exp := range strings.Split(goexperiment, ",") {
+		if exp == name {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildTags returns the complete list of build tags used during this build.

@@ -25,6 +25,7 @@ type Options struct {
 	GOARCH          string // environment variable
 	GOARM           string // environment variable (only used with GOARCH=arm)
 	GOMIPS          string // environment variable (only used with GOARCH=mips and GOARCH=mipsle)
+	GOExperiment    string // environment variable (GOEXPERIMENT)
 	Directory       string // working dir, leave it unset to use the current working dir
 	Target          string
 	BuildMode       string // -buildmode flag

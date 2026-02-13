@@ -27,6 +27,7 @@ var Keys = []string{
 	"GOCACHE",
 	"CGO_ENABLED",
 	"TINYGOROOT",
+	"GOEXPERIMENT",
 }
 
 func init() {
@@ -157,6 +158,8 @@ func Get(name string) string {
 		return "1"
 	case "TINYGOROOT":
 		return sourceDir()
+	case "GOEXPERIMENT":
+		return os.Getenv("GOEXPERIMENT")
 	case "WASMOPT":
 		if path := os.Getenv("WASMOPT"); path != "" {
 			err := wasmOptCheckVersion(path)

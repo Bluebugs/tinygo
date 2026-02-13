@@ -24,6 +24,9 @@ func List(config *compileopts.Config, extraArgs, pkgs []string) (*exec.Cmd, erro
 	args = append(args, pkgs...)
 	cmd := exec.Command(filepath.Join(goenv.Get("GOROOT"), "bin", "go"), args...)
 	cmd.Env = append(os.Environ(), "GOROOT="+goroot, "GOOS="+config.GOOS(), "GOARCH="+config.GOARCH(), "CGO_ENABLED=1")
+	if exp := config.GOExperiment(); exp != "" {
+		cmd.Env = append(cmd.Env, "GOEXPERIMENT="+exp)
+	}
 	if config.Options.Directory != "" {
 		cmd.Dir = config.Options.Directory
 	}
