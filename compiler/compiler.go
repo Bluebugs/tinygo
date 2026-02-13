@@ -92,6 +92,7 @@ type compilerContext struct {
 	pkg              *types.Package
 	packageDir       string // directory for this package
 	runtimePkg       *types.Package
+	spmdInfo         *SPMDInfo // SPMD metadata extracted from AST (nil if no SPMD code)
 }
 
 // newCompilerContext returns a new compiler context ready for use, most
@@ -313,6 +314,9 @@ func CompilePackage(moduleName string, pkg *loader.Package, ssaPkg *ssa.Package,
 
 	// Load comments such as //go:extern on globals.
 	c.loadASTComments(pkg)
+
+	// Extract SPMD metadata from typed AST for vectorization.
+	c.loadSPMDInfo(pkg)
 
 	// Predeclare the runtime.alloc function, which is used by the wordpack
 	// functionality.
