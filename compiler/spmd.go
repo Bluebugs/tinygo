@@ -13,6 +13,7 @@ import (
 
 	"github.com/tinygo-org/tinygo/loader"
 	"golang.org/x/tools/go/ssa"
+	"tinygo.org/x/go-llvm"
 )
 
 // SPMDLoopInfo holds metadata about a go for loop extracted from the AST.
@@ -268,4 +269,56 @@ func (c *compilerContext) isSPMDFunction(fn *ssa.Function) bool {
 // (loops or functions).
 func (c *compilerContext) hasSPMDCode() bool {
 	return c.spmdInfo != nil
+}
+
+// spmdLaneCount returns the number of SIMD lanes for a given LLVM element type.
+// For WASM SIMD128: 128 bits / element size in bits.
+func (c *compilerContext) spmdLaneCount(elemType llvm.Type) int {
+	elemSize := c.targetData.TypeAllocSize(elemType)
+	if elemSize == 0 {
+		return 1
+	}
+	return 16 / int(elemSize) // 128-bit SIMD
+}
+
+// splatScalar broadcasts a scalar value to fill all lanes of a vector type.
+func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
+	undef := llvm.Undef(vecType)
+	zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+	ins := b.CreateInsertElement(undef, scalar, zero, "")
+	mask := llvm.ConstNull(llvm.VectorType(b.ctx.Int32Type(), vecType.VectorSize()))
+	return b.CreateShuffleVector(ins, undef, mask, "splat")
+}
+
+// spmdBroadcastMatch ensures both operands have matching types for SPMD operations.
+// If one operand is a vector and the other is a scalar, the scalar is splatted.
+func (b *builder) spmdBroadcastMatch(x, y llvm.Value) (llvm.Value, llvm.Value) {
+	xIsVec := x.Type().TypeKind() == llvm.VectorTypeKind
+	yIsVec := y.Type().TypeKind() == llvm.VectorTypeKind
+	if xIsVec && !yIsVec {
+		y = b.splatScalar(y, x.Type())
+	} else if !xIsVec && yIsVec {
+		x = b.splatScalar(x, y.Type())
+	}
+	return x, y
+}
+
+// createSPMDConst creates a splatted vector constant for an SPMD varying type.
+func (c *compilerContext) createSPMDConst(expr *ssa.Const, spmdType *types.SPMDType, pos token.Pos) llvm.Value {
+	vecType := c.getLLVMType(spmdType)
+	if expr.Value == nil {
+		return llvm.ConstNull(vecType)
+	}
+
+	// Create scalar constant using the element type.
+	scalarConst := ssa.NewConst(expr.Value, spmdType.Elem())
+	scalar := c.createConst(scalarConst, pos)
+
+	// Splat scalar across all lanes.
+	laneCount := vecType.VectorSize()
+	elts := make([]llvm.Value, laneCount)
+	for i := range elts {
+		elts[i] = scalar
+	}
+	return llvm.ConstVector(elts, false)
 }

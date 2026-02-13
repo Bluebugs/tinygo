@@ -389,6 +389,13 @@ func (c *compilerContext) getLLVMRuntimeType(name string) llvm.Type {
 // created types. This is somewhat important for performance, but especially
 // important for named struct types (which should only be created once).
 func (c *compilerContext) getLLVMType(goType types.Type) llvm.Type {
+	// SPMDType is not supported by typeutil.Map's hasher (from x/tools),
+	// so handle it directly without caching. The element type lookup is
+	// itself cached, and llvm.VectorType is deterministic.
+	if spmdType, ok := goType.(*types.SPMDType); ok {
+		return c.makeLLVMType(spmdType)
+	}
+
 	// Try to load the LLVM type from the cache.
 	// Note: *types.Named isn't unique when working with generics.
 	// See https://github.com/golang/go/issues/53914
@@ -482,6 +489,13 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 			members[i] = c.getLLVMType(typ.At(i).Type())
 		}
 		return c.ctx.StructType(members, false)
+	case *types.SPMDType:
+		if typ.IsVarying() {
+			elemType := c.getLLVMType(typ.Elem())
+			laneCount := c.spmdLaneCount(elemType)
+			return llvm.VectorType(elemType, laneCount)
+		}
+		return c.getLLVMType(typ.Elem())
 	default:
 		panic("unknown type: " + goType.String())
 	}
@@ -2561,6 +2575,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 // and is encoded in the operation in LLVM IR: this is important for some
 // operations such as divide.
 func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Value, pos token.Pos) (llvm.Value, error) {
+	// Broadcast scalar operand to vector for mixed SPMD operations.
+	x, y = b.spmdBroadcastMatch(x, y)
 	switch typ := typ.Underlying().(type) {
 	case *types.Basic:
 		if typ.Info()&types.IsInteger != 0 {
@@ -2972,6 +2988,10 @@ func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Va
 
 // createConst creates a LLVM constant value from a Go constant.
 func (c *compilerContext) createConst(expr *ssa.Const, pos token.Pos) llvm.Value {
+	// Handle SPMD varying constants by splatting the scalar value.
+	if spmdType, ok := expr.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
+		return c.createSPMDConst(expr, spmdType, pos)
+	}
 	switch typ := expr.Type().Underlying().(type) {
 	case *types.Basic:
 		llvmType := c.getLLVMType(typ)
@@ -3324,7 +3344,7 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 	case token.SUB: // -x
 		if typ, ok := unop.X.Type().Underlying().(*types.Basic); ok {
 			if typ.Info()&types.IsInteger != 0 {
-				return b.CreateSub(llvm.ConstInt(x.Type(), 0, false), x, ""), nil
+				return b.CreateSub(llvm.ConstNull(x.Type()), x, ""), nil
 			} else if typ.Info()&types.IsFloat != 0 {
 				return b.CreateFNeg(x, ""), nil
 			} else if typ.Info()&types.IsComplex != 0 {
@@ -3370,7 +3390,7 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 			return load, nil
 		}
 	case token.XOR: // ^x, toggle all bits in integer
-		return b.CreateXor(x, llvm.ConstInt(x.Type(), ^uint64(0), false), ""), nil
+		return b.CreateXor(x, llvm.ConstAllOnes(x.Type()), ""), nil
 	case token.ARROW: // <-x, receive from channel
 		return b.createChanRecv(unop), nil
 	default:
