@@ -734,3 +734,181 @@ func TestSPMDBroadcastMatchForSelect(t *testing.T) {
 		})
 	}
 }
+
+func TestSPMDMaskType(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name          string
+		createSig     func() *types.Signature
+		wantMaskType  bool
+		wantLaneCount int
+		wantElemWidth int
+	}{
+		{
+			name: "no_varying_params",
+			createSig: func() *types.Signature {
+				params := types.NewTuple(
+					types.NewVar(token.NoPos, nil, "x", types.Typ[types.Int32]),
+					types.NewVar(token.NoPos, nil, "y", types.Typ[types.Float64]),
+				)
+				return types.NewSignatureType(nil, nil, nil, params, nil, false)
+			},
+			wantMaskType: false,
+		},
+		{
+			name: "varying_int32_param",
+			createSig: func() *types.Signature {
+				params := types.NewTuple(
+					types.NewVar(token.NoPos, nil, "v", types.NewVarying(types.Typ[types.Int32])),
+				)
+				return types.NewSignatureType(nil, nil, nil, params, nil, false)
+			},
+			wantMaskType:  true,
+			wantLaneCount: 4, // 128 bits / 32 bits = 4 lanes
+			wantElemWidth: 1, // i1 for mask
+		},
+		{
+			name: "varying_int8_param",
+			createSig: func() *types.Signature {
+				params := types.NewTuple(
+					types.NewVar(token.NoPos, nil, "v", types.NewVarying(types.Typ[types.Int8])),
+				)
+				return types.NewSignatureType(nil, nil, nil, params, nil, false)
+			},
+			wantMaskType:  true,
+			wantLaneCount: 16, // 128 bits / 8 bits = 16 lanes
+			wantElemWidth: 1,
+		},
+		{
+			name: "varying_float64_param",
+			createSig: func() *types.Signature {
+				params := types.NewTuple(
+					types.NewVar(token.NoPos, nil, "v", types.NewVarying(types.Typ[types.Float64])),
+				)
+				return types.NewSignatureType(nil, nil, nil, params, nil, false)
+			},
+			wantMaskType:  true,
+			wantLaneCount: 2, // 128 bits / 64 bits = 2 lanes
+			wantElemWidth: 1,
+		},
+		{
+			name: "mixed_params_with_varying",
+			createSig: func() *types.Signature {
+				params := types.NewTuple(
+					types.NewVar(token.NoPos, nil, "x", types.Typ[types.Int32]),
+					types.NewVar(token.NoPos, nil, "v", types.NewVarying(types.Typ[types.Int32])),
+					types.NewVar(token.NoPos, nil, "y", types.Typ[types.Float64]),
+				)
+				return types.NewSignatureType(nil, nil, nil, params, nil, false)
+			},
+			wantMaskType:  true,
+			wantLaneCount: 4,
+			wantElemWidth: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sig := tt.createSig()
+			maskType := c.spmdMaskTypeFromSig(sig)
+
+			if tt.wantMaskType {
+				// Expect a valid mask type.
+				if maskType == (llvm.Type{}) {
+					t.Errorf("spmdMaskTypeFromSig(%s) returned zero-value, want mask type", tt.name)
+					return
+				}
+
+				// Verify it's a vector type.
+				if maskType.TypeKind() != llvm.VectorTypeKind {
+					t.Errorf("spmdMaskTypeFromSig(%s) type kind = %v, want VectorTypeKind",
+						tt.name, maskType.TypeKind())
+				}
+
+				// Verify lane count.
+				gotLaneCount := maskType.VectorSize()
+				if gotLaneCount != tt.wantLaneCount {
+					t.Errorf("spmdMaskTypeFromSig(%s) lane count = %d, want %d",
+						tt.name, gotLaneCount, tt.wantLaneCount)
+				}
+
+				// Verify element type is i1.
+				elemType := maskType.ElementType()
+				if elemType.TypeKind() != llvm.IntegerTypeKind {
+					t.Errorf("spmdMaskTypeFromSig(%s) elem type kind = %v, want IntegerTypeKind",
+						tt.name, elemType.TypeKind())
+				}
+				if elemType.IntTypeWidth() != tt.wantElemWidth {
+					t.Errorf("spmdMaskTypeFromSig(%s) elem width = %d, want %d",
+						tt.name, elemType.IntTypeWidth(), tt.wantElemWidth)
+				}
+			} else {
+				// Expect zero-value (no mask).
+				if maskType != (llvm.Type{}) {
+					t.Errorf("spmdMaskTypeFromSig(%s) returned mask type, want zero-value", tt.name)
+				}
+			}
+		})
+	}
+}
+
+func TestSPMDCallMaskAllTrue(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name      string
+		laneCount int
+	}{
+		{"4_lanes", 4},
+		{"2_lanes", 2},
+		{"8_lanes", 8},
+		{"16_lanes", 16},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create <N x i1> mask type.
+			maskType := llvm.VectorType(c.ctx.Int1Type(), tt.laneCount)
+
+			// Create all-ones mask (all lanes active).
+			allOnes := llvm.ConstAllOnes(maskType)
+
+			// Verify result is not nil.
+			if allOnes.IsNil() {
+				t.Errorf("ConstAllOnes(%s) returned nil", tt.name)
+				return
+			}
+
+			// Verify result type is <N x i1>.
+			if allOnes.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("ConstAllOnes(%s) type kind = %v, want VectorTypeKind",
+					tt.name, allOnes.Type().TypeKind())
+			}
+
+			gotLaneCount := allOnes.Type().VectorSize()
+			if gotLaneCount != tt.laneCount {
+				t.Errorf("ConstAllOnes(%s) lane count = %d, want %d",
+					tt.name, gotLaneCount, tt.laneCount)
+			}
+
+			elemType := allOnes.Type().ElementType()
+			if elemType.TypeKind() != llvm.IntegerTypeKind {
+				t.Errorf("ConstAllOnes(%s) elem type = %v, want IntegerTypeKind",
+					tt.name, elemType.TypeKind())
+			}
+
+			// Verify it's a constant.
+			if !allOnes.IsConstant() {
+				t.Errorf("ConstAllOnes(%s) not constant", tt.name)
+			}
+
+			// Verify it's not null (all-ones means all true).
+			if allOnes.IsNull() {
+				t.Errorf("ConstAllOnes(%s) is null, want all-ones", tt.name)
+			}
+		})
+	}
+}

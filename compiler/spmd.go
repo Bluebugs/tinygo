@@ -769,3 +769,59 @@ func (b *builder) spmdIsReachableFrom(start, target, barrier *ssa.BasicBlock) bo
 
 	return dfs(start)
 }
+
+// spmdMaskType returns the LLVM mask type for an SPMD function's implicit first parameter.
+// Returns zero-value llvm.Type{} if the function has no varying parameters.
+func (c *compilerContext) spmdMaskType(fn *ssa.Function) llvm.Type {
+	return c.spmdMaskTypeFromSig(fn.Signature)
+}
+
+// spmdMaskTypeFromSig returns the LLVM mask type for an SPMD signature's implicit mask parameter.
+// The mask is a <N x i1> vector where N is determined by the first varying parameter's element type.
+// Returns zero-value llvm.Type{} if the signature has no varying parameters.
+func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
+	if sig == nil {
+		return llvm.Type{}
+	}
+	params := sig.Params()
+	for i := 0; i < params.Len(); i++ {
+		param := params.At(i)
+		if spmdType, ok := param.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
+			// Found a varying parameter. Compute lane count from its element type.
+			elemType := c.getLLVMType(spmdType.Elem())
+			laneCount := c.spmdLaneCount(elemType)
+			return llvm.VectorType(c.ctx.Int1Type(), laneCount)
+		}
+	}
+	return llvm.Type{} // No varying parameters
+}
+
+// spmdCallMask returns the mask value to pass when calling an SPMD function.
+// The mask is determined by the current execution context:
+// - If inside an SPMD loop: use the loop's tail mask
+// - If inside an SPMD function: use the entry mask
+// - Otherwise: all lanes active (all-ones mask)
+func (b *builder) spmdCallMask(fn *ssa.Function) llvm.Value {
+	maskType := b.spmdMaskType(fn)
+	if maskType == (llvm.Type{}) {
+		// Not an SPMD function, no mask needed.
+		return llvm.Value{}
+	}
+
+	// Check if we're inside an SPMD loop.
+	if b.spmdLoopState != nil {
+		for _, loop := range b.spmdLoopState.activeLoops {
+			if !loop.tailMask.IsNil() {
+				return loop.tailMask
+			}
+		}
+	}
+
+	// Check if we're inside an SPMD function.
+	if !b.spmdEntryMask.IsNil() {
+		return b.spmdEntryMask
+	}
+
+	// Fallback: all lanes active.
+	return llvm.ConstAllOnes(maskType)
+}

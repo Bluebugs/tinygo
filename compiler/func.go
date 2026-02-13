@@ -70,6 +70,14 @@ func (c *compilerContext) getLLVMFunctionType(typ *types.Signature) llvm.Type {
 
 	// Get the parameter types.
 	var paramTypes []llvm.Type
+
+	// SPMD: insert execution mask type as first parameter for SPMD signatures.
+	// This is used for function pointer types. Exported SPMD functions are
+	// forbidden by the type checker, so all SPMD function values have a mask.
+	if maskType := c.spmdMaskTypeFromSig(typ); maskType != (llvm.Type{}) {
+		paramTypes = append(paramTypes, maskType)
+	}
+
 	if typ.Recv() != nil {
 		recv := c.getLLVMType(typ.Recv().Type())
 		if recv.StructName() == "runtime._interface" {

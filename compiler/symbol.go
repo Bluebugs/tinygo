@@ -91,6 +91,14 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 	}
 
 	var paramInfos []paramInfo
+
+	// SPMD: insert execution mask as first parameter for SPMD functions.
+	if maskType := c.spmdMaskType(fn); maskType != (llvm.Type{}) {
+		if !info.exported {
+			paramInfos = append(paramInfos, paramInfo{llvmType: maskType, name: "spmd.mask", elemSize: 0})
+		}
+	}
+
 	for _, param := range getParams(fn.Signature) {
 		paramType := c.getLLVMType(param.Type())
 		paramFragmentInfos := c.expandFormalParamType(paramType, param.Name(), param.Type())

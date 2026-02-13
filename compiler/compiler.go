@@ -182,6 +182,7 @@ type builder struct {
 	spmdVaryingIfs        map[int]*spmdVaryingIf   // if-block index -> varying if info
 	spmdThenExitRedirects map[int]llvm.BasicBlock  // then-exit block index -> else-entry LLVM block
 	spmdMergeSelects      map[int]*spmdVaryingIf   // merge block index -> varying if info
+	spmdEntryMask         llvm.Value               // SPMD function entry mask (zero if not SPMD function)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1294,6 +1295,15 @@ func (b *builder) createFunctionStart(intrinsic bool) {
 
 	// Load function parameters
 	llvmParamIndex := 0
+
+	// SPMD: extract entry mask if this is an SPMD function.
+	if maskType := b.spmdMaskType(b.fn); maskType != (llvm.Type{}) && !b.info.exported {
+		mask := b.llvmFn.Param(llvmParamIndex)
+		mask.SetName("spmd.mask")
+		b.spmdEntryMask = mask
+		llvmParamIndex++
+	}
+
 	for _, param := range b.fn.Params {
 		llvmType := b.getLLVMType(param.Type())
 		fields := make([]llvm.Value, 0, 1)
@@ -2002,6 +2012,19 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 	var params []llvm.Value
 	for _, param := range instr.Args {
 		params = append(params, b.getValue(param, getPos(instr)))
+	}
+
+	// SPMD: insert execution mask as first argument for non-exported SPMD function calls.
+	// Exported SPMD functions are forbidden by the type checker, but we guard
+	// defensively to match the mask exclusion in getFunction/createFunctionStart.
+	if fn := instr.StaticCallee(); fn != nil && b.isSPMDFunction(fn) {
+		info := b.getFunctionInfo(fn)
+		if !info.exported {
+			mask := b.spmdCallMask(fn)
+			if !mask.IsNil() {
+				params = append([]llvm.Value{mask}, params...)
+			}
+		}
 	}
 
 	// Try to call the function directly for trivially static calls.
