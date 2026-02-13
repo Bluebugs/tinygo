@@ -149,36 +149,39 @@ func (c *compilerContext) dispose() {
 type builder struct {
 	*compilerContext
 	llvm.Builder
-	fn                *ssa.Function
-	llvmFnType        llvm.Type
-	llvmFn            llvm.Value
-	info              functionInfo
-	locals            map[ssa.Value]llvm.Value // local variables
-	blockInfo         []blockInfo
-	currentBlock      *ssa.BasicBlock
-	currentBlockInfo  *blockInfo
-	tarjanStack       []uint
-	tarjanIndex       uint
-	phis              []phiNode
-	deferPtr          llvm.Value
-	deferFrame        llvm.Value
-	stackChainAlloca  llvm.Value
-	landingpad        llvm.BasicBlock
-	difunc            llvm.Metadata
-	dilocals          map[*types.Var]llvm.Metadata
-	initInlinedAt     llvm.Metadata            // fake inlinedAt position
-	initPseudoFuncs   map[string]llvm.Metadata // fake "inlined" functions for proper init debug locations
-	allDeferFuncs     []interface{}
-	deferFuncs        map[*ssa.Function]int
-	deferInvokeFuncs  map[string]int
-	deferClosureFuncs map[*ssa.Function]int
-	deferExprFuncs    map[ssa.Value]int
-	selectRecvBuf     map[*ssa.Select]llvm.Value
-	deferBuiltinFuncs map[ssa.Value]deferBuiltin
-	runDefersBlock    []llvm.BasicBlock
-	afterDefersBlock  []llvm.BasicBlock
-	spmdLoopState     *spmdLoopState            // SPMD loop analysis results (nil if no SPMD)
-	spmdValueOverride map[ssa.Value]llvm.Value   // SPMD value substitutions (e.g., iter phi -> lane indices)
+	fn                    *ssa.Function
+	llvmFnType            llvm.Type
+	llvmFn                llvm.Value
+	info                  functionInfo
+	locals                map[ssa.Value]llvm.Value // local variables
+	blockInfo             []blockInfo
+	currentBlock          *ssa.BasicBlock
+	currentBlockInfo      *blockInfo
+	tarjanStack           []uint
+	tarjanIndex           uint
+	phis                  []phiNode
+	deferPtr              llvm.Value
+	deferFrame            llvm.Value
+	stackChainAlloca      llvm.Value
+	landingpad            llvm.BasicBlock
+	difunc                llvm.Metadata
+	dilocals              map[*types.Var]llvm.Metadata
+	initInlinedAt         llvm.Metadata            // fake inlinedAt position
+	initPseudoFuncs       map[string]llvm.Metadata // fake "inlined" functions for proper init debug locations
+	allDeferFuncs         []interface{}
+	deferFuncs            map[*ssa.Function]int
+	deferInvokeFuncs      map[string]int
+	deferClosureFuncs     map[*ssa.Function]int
+	deferExprFuncs        map[ssa.Value]int
+	selectRecvBuf         map[*ssa.Select]llvm.Value
+	deferBuiltinFuncs     map[ssa.Value]deferBuiltin
+	runDefersBlock        []llvm.BasicBlock
+	afterDefersBlock      []llvm.BasicBlock
+	spmdLoopState         *spmdLoopState           // SPMD loop analysis results (nil if no SPMD)
+	spmdValueOverride     map[ssa.Value]llvm.Value // SPMD value substitutions (e.g., iter phi -> lane indices)
+	spmdVaryingIfs        map[int]*spmdVaryingIf   // if-block index -> varying if info
+	spmdThenExitRedirects map[int]llvm.BasicBlock  // then-exit block index -> else-entry LLVM block
+	spmdMergeSelects      map[int]*spmdVaryingIf   // merge block index -> varying if info
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1369,6 +1372,13 @@ func (b *builder) createFunction() {
 	// SPMD: analyze loops before compiling blocks.
 	b.spmdLoopState = b.analyzeSPMDLoops()
 
+	// SPMD: initialize varying if/else maps.
+	if b.spmdLoopState != nil {
+		b.spmdVaryingIfs = make(map[int]*spmdVaryingIf)
+		b.spmdThenExitRedirects = make(map[int]llvm.BasicBlock)
+		b.spmdMergeSelects = make(map[int]*spmdVaryingIf)
+	}
+
 	// Fill blocks with instructions.
 	for _, block := range b.fn.DomPreorder() {
 		if b.DumpSSA {
@@ -1382,6 +1392,8 @@ func (b *builder) createFunction() {
 		if b.spmdLoopState != nil {
 			if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
 				b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
+			} else if b.spmdValueOverride != nil && b.isBlockInSPMDBody(block) != nil {
+				// Keep existing overrides for if.then/if.else/if.done inside SPMD body.
 			} else {
 				b.spmdValueOverride = nil
 			}
@@ -1572,10 +1584,20 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		block := instr.Block()
 		blockThen := b.blockInfo[block.Succs[0].Index].entry
 		blockElse := b.blockInfo[block.Succs[1].Index].entry
-		b.CreateCondBr(cond, blockThen, blockElse)
+		// SPMD: linearize varying if/else (vector condition).
+		if b.spmdLoopState != nil && cond.Type().TypeKind() == llvm.VectorTypeKind {
+			b.spmdDetectVaryingIf(block, cond)
+			b.CreateBr(blockThen)
+		} else {
+			b.CreateCondBr(cond, blockThen, blockElse)
+		}
 	case *ssa.Jump:
-		blockJump := b.blockInfo[instr.Block().Succs[0].Index].entry
-		b.CreateBr(blockJump)
+		if target, ok := b.spmdShouldRedirectJump(instr.Block()); ok {
+			b.CreateBr(target)
+		} else {
+			blockJump := b.blockInfo[instr.Block().Succs[0].Index].entry
+			b.CreateBr(blockJump)
+		}
 	case *ssa.MapUpdate:
 		m := b.getValue(instr.Map, getPos(instr))
 		key := b.getValue(instr.Key, getPos(instr))
@@ -2416,6 +2438,9 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			return b.createMapIteratorNext(rangeVal, llvmRangeVal, it), nil
 		}
 	case *ssa.Phi:
+		if val, ok := b.spmdCreateMergeSelect(expr); ok {
+			return val, nil
+		}
 		phi := b.CreatePHI(b.getLLVMType(expr.Type()), "")
 		b.phis = append(b.phis, phiNode{expr, phi})
 		return phi, nil

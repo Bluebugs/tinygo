@@ -333,10 +333,10 @@ type spmdLoopState struct {
 // spmdActiveLoop holds state for one SPMD loop during compilation.
 type spmdActiveLoop struct {
 	info       *SPMDLoopInfo
-	iterPhi    *ssa.Phi    // the "rangeint.iter" phi in body block
-	laneCount  int         // e.g. 4 for int32 on WASM SIMD128
-	boundValue ssa.Value   // N in "range N"
-	incrBinOp  *ssa.BinOp  // the ADD in the loop block
+	iterPhi    *ssa.Phi   // the "rangeint.iter" phi in body block
+	laneCount  int        // e.g. 4 for int32 on WASM SIMD128
+	boundValue ssa.Value  // N in "range N"
+	incrBinOp  *ssa.BinOp // the ADD in the loop block
 
 	// Set during IR generation:
 	laneIndices llvm.Value // <iter, iter+1, ..., iter+laneCount-1>
@@ -488,4 +488,284 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	// Store the results in the loop state.
 	loop.laneIndices = laneIndices
 	loop.tailMask = tailMask
+}
+
+// spmdVaryingIf holds analysis results for a varying (vector) if/else construct.
+type spmdVaryingIf struct {
+	cond           llvm.Value // vector condition (<N x i1>)
+	ifBlockIndex   int        // block with the If instruction
+	thenEntryIndex int        // Succs[0] of if-block
+	elseEntryIndex int        // Succs[1] of if-block (or merge for if-without-else)
+	mergeIndex     int        // common successor (merge point)
+	hasElse        bool       // true if then/else are distinct from merge
+}
+
+// isBlockInSPMDBody checks if a given SSA block is inside an SPMD loop body.
+// This extends beyond just rangeint.body blocks to include if.then/if.else/if.done.
+func (b *builder) isBlockInSPMDBody(block *ssa.BasicBlock) *SPMDLoopInfo {
+	if b.spmdInfo == nil {
+		return nil
+	}
+
+	// Check if any instruction position in the block falls inside an SPMD loop body.
+	for _, instr := range block.Instrs {
+		if loopInfo := b.isInSPMDLoop(instr.Pos()); loopInfo != nil {
+			return loopInfo
+		}
+	}
+
+	return nil
+}
+
+// spmdDetectVaryingIf detects and analyzes a varying if/else construct at ifBlock.
+// The condition is a vector (<N x i1>), so both branches must execute for their
+// respective lanes. Populates spmdVaryingIfs, spmdThenExitRedirects, and spmdMergeSelects.
+func (b *builder) spmdDetectVaryingIf(ifBlock *ssa.BasicBlock, cond llvm.Value) {
+	thenEntry := ifBlock.Succs[0]
+	elseEntry := ifBlock.Succs[1]
+
+	// Find the merge block (common successor).
+	merge := b.spmdFindMerge(thenEntry, elseEntry)
+	if merge == nil {
+		// No merge found (possibly unreachable code or exit branches).
+		return
+	}
+
+	// Determine if this is if-with-else or if-without-else.
+	// If-without-else: elseEntry IS the merge block.
+	hasElse := (elseEntry != merge)
+
+	info := &spmdVaryingIf{
+		cond:           cond,
+		ifBlockIndex:   ifBlock.Index,
+		thenEntryIndex: thenEntry.Index,
+		elseEntryIndex: elseEntry.Index,
+		mergeIndex:     merge.Index,
+		hasElse:        hasElse,
+	}
+
+	// Register the varying if.
+	b.spmdVaryingIfs[ifBlock.Index] = info
+	b.spmdMergeSelects[merge.Index] = info
+
+	if hasElse {
+		// For if-with-else: redirect then-exit blocks to else-entry.
+		thenExits := b.spmdFindThenExits(thenEntry, merge)
+		elseLLVMBlock := b.blockInfo[elseEntry.Index].entry
+		for _, exitBlock := range thenExits {
+			b.spmdThenExitRedirects[exitBlock.Index] = elseLLVMBlock
+		}
+	}
+}
+
+// spmdFindMerge finds the merge block (common successor) of then and else branches.
+// Uses a simple approach: walk from thenEntry through Jump successors until finding
+// a block that is also reachable from elseEntry.
+func (b *builder) spmdFindMerge(thenEntry, elseEntry *ssa.BasicBlock) *ssa.BasicBlock {
+	// Handle if-without-else: elseEntry itself is the merge.
+	if b.spmdIsReachableFrom(thenEntry, elseEntry, nil) {
+		return elseEntry
+	}
+
+	// Build reachable set from thenEntry (excluding elseEntry subtree).
+	visited := make(map[int]bool)
+	var walkThen func(*ssa.BasicBlock)
+	walkThen = func(block *ssa.BasicBlock) {
+		if visited[block.Index] || block == elseEntry {
+			return
+		}
+		visited[block.Index] = true
+		for _, succ := range block.Succs {
+			walkThen(succ)
+		}
+	}
+	walkThen(thenEntry)
+
+	// Find first block reachable from elseEntry that's also in thenEntry's reachable set.
+	var findIntersection func(*ssa.BasicBlock) *ssa.BasicBlock
+	elseVisited := make(map[int]bool)
+	findIntersection = func(block *ssa.BasicBlock) *ssa.BasicBlock {
+		if elseVisited[block.Index] {
+			return nil
+		}
+		elseVisited[block.Index] = true
+
+		if visited[block.Index] {
+			return block
+		}
+
+		for _, succ := range block.Succs {
+			if result := findIntersection(succ); result != nil {
+				return result
+			}
+		}
+		return nil
+	}
+
+	return findIntersection(elseEntry)
+}
+
+// spmdFindThenExits finds all blocks in the then-branch that jump to the merge block.
+// These are the "then-exit" blocks that need to be redirected to else-entry.
+func (b *builder) spmdFindThenExits(thenEntry, merge *ssa.BasicBlock) []*ssa.BasicBlock {
+	var exits []*ssa.BasicBlock
+	visited := make(map[int]bool)
+
+	var walk func(*ssa.BasicBlock)
+	walk = func(block *ssa.BasicBlock) {
+		if visited[block.Index] || block == merge {
+			return
+		}
+		visited[block.Index] = true
+
+		// Check if this block's last instruction is a Jump to merge.
+		if len(block.Instrs) > 0 {
+			if _, ok := block.Instrs[len(block.Instrs)-1].(*ssa.Jump); ok {
+				if len(block.Succs) == 1 && block.Succs[0] == merge {
+					exits = append(exits, block)
+					return // Don't recurse past the exit.
+				}
+			}
+		}
+
+		// Recurse to successors.
+		for _, succ := range block.Succs {
+			walk(succ)
+		}
+	}
+
+	walk(thenEntry)
+	return exits
+}
+
+// spmdShouldRedirectJump checks if a Jump instruction at the given block should
+// be redirected to the else-entry (for then-exit blocks in if-with-else).
+// Returns (elseLLVMBlock, true) if redirect is needed, (zero, false) otherwise.
+func (b *builder) spmdShouldRedirectJump(block *ssa.BasicBlock) (llvm.BasicBlock, bool) {
+	if b.spmdThenExitRedirects == nil {
+		return llvm.BasicBlock{}, false
+	}
+	elseLLVMBlock, ok := b.spmdThenExitRedirects[block.Index]
+	return elseLLVMBlock, ok
+}
+
+// spmdCreateMergeSelect converts a phi at a merge block into a select instruction
+// when the phi results from a varying if/else. Returns (value, true) if a select
+// was created, (zero, false) if this phi is not a varying merge phi.
+func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
+	if b.spmdMergeSelects == nil {
+		return llvm.Value{}, false
+	}
+
+	info, ok := b.spmdMergeSelects[phi.Block().Index]
+	if !ok {
+		return llvm.Value{}, false
+	}
+
+	// Phi must have exactly 2 edges for merge.
+	if len(phi.Edges) != 2 {
+		return llvm.Value{}, false
+	}
+
+	block := phi.Block()
+	preds := block.Preds
+
+	// Determine which edge is "then" and which is "else".
+	// For if-without-else: predecessor matching ifBlockIndex is "else" (default), other is "then".
+	// For if-with-else: determine based on reachability from then-entry vs else-entry.
+	var thenValue, elseValue llvm.Value
+	if !info.hasElse {
+		// If-without-else: elseEntry IS merge, so ifBlock predecessor is "else" edge.
+		for i := 0; i < len(preds); i++ {
+			if preds[i].Index == info.ifBlockIndex {
+				// This edge comes from ifBlock (the else/default path).
+				elseValue = b.getValue(phi.Edges[i], token.NoPos)
+			} else {
+				// This edge comes from then-branch.
+				thenValue = b.getValue(phi.Edges[i], token.NoPos)
+			}
+		}
+	} else {
+		// If-with-else: determine based on reachability.
+		thenEntry := b.fn.Blocks[info.thenEntryIndex]
+		for i := 0; i < len(preds); i++ {
+			if b.spmdIsReachableFrom(thenEntry, preds[i], block) {
+				// This edge comes from then-branch.
+				thenValue = b.getValue(phi.Edges[i], token.NoPos)
+			} else {
+				// This edge comes from else-branch.
+				elseValue = b.getValue(phi.Edges[i], token.NoPos)
+			}
+		}
+	}
+
+	// Ensure both values are non-nil.
+	if thenValue.IsNil() || elseValue.IsNil() {
+		return llvm.Value{}, false
+	}
+
+	// Handle type mismatches via broadcast.
+	thenValue, elseValue = b.spmdBroadcastMatch(thenValue, elseValue)
+
+	// Determine select type based on operand types.
+	thenIsVec := thenValue.Type().TypeKind() == llvm.VectorTypeKind
+	elseIsVec := elseValue.Type().TypeKind() == llvm.VectorTypeKind
+
+	if thenIsVec || elseIsVec {
+		// At least one operand is a vector → vector select.
+		return b.CreateSelect(info.cond, thenValue, elseValue, ""), true
+	}
+
+	// Both are scalars → reduce condition to scalar boolean and use scalar select.
+	// Scalar phis at a varying merge represent uniform values. We use any-true
+	// reduction: if any lane took the then-branch, use the then-value. This is
+	// safe because the SPMD type checker forbids varying-dependent mutation of
+	// uniform variables, so both edges carry the same value in practice.
+	scalarCond := b.spmdVectorAnyTrue(info.cond)
+	return b.CreateSelect(scalarCond, thenValue, elseValue, ""), true
+}
+
+// spmdVectorAnyTrue reduces a vector condition <N x i1> to a scalar i1.
+// Returns true if any lane is true.
+func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
+	// Bitcast <N x i1> to iN (e.g., <4 x i1> → i4).
+	vecSize := mask.Type().VectorSize()
+	intType := b.ctx.IntType(vecSize)
+	intVal := b.CreateBitCast(mask, intType, "")
+
+	// Compare intVal != 0.
+	zero := llvm.ConstNull(intType)
+	return b.CreateICmp(llvm.IntNE, intVal, zero, "")
+}
+
+// spmdIsReachableFrom checks if target is reachable from start without going
+// through barrier. Returns true if a path exists from start to target.
+func (b *builder) spmdIsReachableFrom(start, target, barrier *ssa.BasicBlock) bool {
+	if start == target {
+		return true
+	}
+	if start == barrier {
+		return false
+	}
+
+	visited := make(map[int]bool)
+	var dfs func(*ssa.BasicBlock) bool
+	dfs = func(block *ssa.BasicBlock) bool {
+		if block == target {
+			return true
+		}
+		if block == barrier || visited[block.Index] {
+			return false
+		}
+		visited[block.Index] = true
+
+		for _, succ := range block.Succs {
+			if dfs(succ) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return dfs(start)
 }

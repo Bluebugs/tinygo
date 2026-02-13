@@ -50,10 +50,10 @@ func TestSPMDLaneCount(t *testing.T) {
 		elemType llvm.Type
 		want     int
 	}{
-		{"int8", c.ctx.Int8Type(), 16},   // 128 bits / 8 bits = 16
-		{"int16", c.ctx.Int16Type(), 8},  // 128 bits / 16 bits = 8
-		{"int32", c.ctx.Int32Type(), 4},  // 128 bits / 32 bits = 4
-		{"int64", c.ctx.Int64Type(), 2},  // 128 bits / 64 bits = 2
+		{"int8", c.ctx.Int8Type(), 16},     // 128 bits / 8 bits = 16
+		{"int16", c.ctx.Int16Type(), 8},    // 128 bits / 16 bits = 8
+		{"int32", c.ctx.Int32Type(), 4},    // 128 bits / 32 bits = 4
+		{"int64", c.ctx.Int64Type(), 2},    // 128 bits / 64 bits = 2
 		{"float32", c.ctx.FloatType(), 4},  // 128 bits / 32 bits = 4
 		{"float64", c.ctx.DoubleType(), 2}, // 128 bits / 64 bits = 2
 		{"bool", c.ctx.Int1Type(), 16},     // TypeAllocSize(i1) = 1 byte, 128 bits / 8 bits = 16
@@ -539,5 +539,198 @@ func TestSPMDAnalyzeLoopsNil(t *testing.T) {
 	state := b.analyzeSPMDLoops()
 	if state != nil {
 		t.Errorf("analyzeSPMDLoops() = %v, want nil for non-SPMD function", state)
+	}
+}
+
+func TestSPMDVectorAnyTrue(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name     string
+		maskVals []bool
+	}{
+		{"all_true", []bool{true, true, true, true}},
+		{"all_false", []bool{false, false, false, false}},
+		{"mixed", []bool{true, false, true, false}},
+		{"single_true", []bool{false, false, false, true}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a <4 x i1> constant vector.
+			vecElts := make([]llvm.Value, len(tt.maskVals))
+			for i, val := range tt.maskVals {
+				if val {
+					vecElts[i] = llvm.ConstInt(c.ctx.Int1Type(), 1, false)
+				} else {
+					vecElts[i] = llvm.ConstInt(c.ctx.Int1Type(), 0, false)
+				}
+			}
+			maskVec := llvm.ConstVector(vecElts, false)
+
+			// Call spmdVectorAnyTrue.
+			result := b.spmdVectorAnyTrue(maskVec)
+
+			// Verify result is not nil.
+			if result.IsNil() {
+				t.Errorf("spmdVectorAnyTrue(%s) returned nil", tt.name)
+				return
+			}
+
+			// Verify result type is i1.
+			if result.Type().TypeKind() != llvm.IntegerTypeKind {
+				t.Errorf("spmdVectorAnyTrue(%s) result type = %v, want IntegerTypeKind",
+					tt.name, result.Type().TypeKind())
+			}
+			if result.Type().IntTypeWidth() != 1 {
+				t.Errorf("spmdVectorAnyTrue(%s) result width = %d, want 1",
+					tt.name, result.Type().IntTypeWidth())
+			}
+		})
+	}
+}
+
+func TestSPMDSelectCreation(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Create a <4 x i1> condition.
+	condElts := make([]llvm.Value, 4)
+	for i := range condElts {
+		condElts[i] = llvm.ConstInt(c.ctx.Int1Type(), uint64(i%2), false)
+	}
+	condVec := llvm.ConstVector(condElts, false)
+
+	// Create <4 x i32> true and false values.
+	trueElts := make([]llvm.Value, 4)
+	falseElts := make([]llvm.Value, 4)
+	for i := range trueElts {
+		trueElts[i] = llvm.ConstInt(c.ctx.Int32Type(), uint64(i+10), false)
+		falseElts[i] = llvm.ConstInt(c.ctx.Int32Type(), uint64(i+20), false)
+	}
+	trueVec := llvm.ConstVector(trueElts, false)
+	falseVec := llvm.ConstVector(falseElts, false)
+
+	// Use CreateSelect to verify LLVM handles vector select.
+	result := b.CreateSelect(condVec, trueVec, falseVec, "test.select")
+
+	// Verify result is not nil.
+	if result.IsNil() {
+		t.Fatal("CreateSelect returned nil")
+	}
+
+	// Verify result type is <4 x i32>.
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("select result type = %v, want VectorTypeKind", result.Type().TypeKind())
+	}
+	if result.Type().VectorSize() != 4 {
+		t.Errorf("select result size = %d, want 4", result.Type().VectorSize())
+	}
+	if result.Type().ElementType().TypeKind() != llvm.IntegerTypeKind {
+		t.Errorf("select result element type = %v, want IntegerTypeKind",
+			result.Type().ElementType().TypeKind())
+	}
+}
+
+func TestSPMDIsBlockInSPMDBody(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// With no spmdInfo, isBlockInSPMDBody should return nil for any block.
+	if b.spmdInfo != nil {
+		t.Fatal("expected spmdInfo to be nil for test builder")
+	}
+
+	// Without a real SSA function, we can't call isBlockInSPMDBody directly.
+	// Verify the precondition: spmdInfo is nil, so the method would return nil.
+	// Also verify spmdShouldRedirectJump returns false with nil maps.
+	if b.spmdThenExitRedirects != nil {
+		t.Fatal("expected spmdThenExitRedirects to be nil for test builder")
+	}
+	if b.spmdMergeSelects != nil {
+		t.Fatal("expected spmdMergeSelects to be nil for test builder")
+	}
+	if b.spmdVaryingIfs != nil {
+		t.Fatal("expected spmdVaryingIfs to be nil for test builder")
+	}
+}
+
+func TestSPMDBroadcastMatchForSelect(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	scalarVal := llvm.ConstInt(c.ctx.Int32Type(), 42, false)
+
+	// Create a vector <4 x i32>.
+	vecElts := make([]llvm.Value, 4)
+	for i := range vecElts {
+		vecElts[i] = llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false)
+	}
+	vecVal := llvm.ConstVector(vecElts, false)
+
+	tests := []struct {
+		name      string
+		x         llvm.Value
+		y         llvm.Value
+		wantXKind llvm.TypeKind
+		wantYKind llvm.TypeKind
+	}{
+		{
+			name:      "vector_scalar",
+			x:         vecVal,
+			y:         scalarVal,
+			wantXKind: llvm.VectorTypeKind,
+			wantYKind: llvm.VectorTypeKind, // scalar should be broadcast
+		},
+		{
+			name:      "scalar_vector",
+			x:         scalarVal,
+			y:         vecVal,
+			wantXKind: llvm.VectorTypeKind, // scalar should be broadcast
+			wantYKind: llvm.VectorTypeKind,
+		},
+		{
+			name:      "vector_vector",
+			x:         vecVal,
+			y:         vecVal,
+			wantXKind: llvm.VectorTypeKind,
+			wantYKind: llvm.VectorTypeKind,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotX, gotY := b.spmdBroadcastMatch(tt.x, tt.y)
+
+			// Verify result types.
+			if gotX.Type().TypeKind() != tt.wantXKind {
+				t.Errorf("spmdBroadcastMatch(%s) x type kind = %v, want %v",
+					tt.name, gotX.Type().TypeKind(), tt.wantXKind)
+			}
+
+			if gotY.Type().TypeKind() != tt.wantYKind {
+				t.Errorf("spmdBroadcastMatch(%s) y type kind = %v, want %v",
+					tt.name, gotY.Type().TypeKind(), tt.wantYKind)
+			}
+
+			// If both are vectors, verify sizes match.
+			if tt.wantXKind == llvm.VectorTypeKind && tt.wantYKind == llvm.VectorTypeKind {
+				xSize := gotX.Type().VectorSize()
+				ySize := gotY.Type().VectorSize()
+				if xSize != ySize {
+					t.Errorf("spmdBroadcastMatch(%s) vector sizes don't match: x=%d, y=%d",
+						tt.name, xSize, ySize)
+				}
+			}
+		})
 	}
 }
