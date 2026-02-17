@@ -60,7 +60,7 @@ bool tinygo_clang_driver(int argc, char **argv) {
 			}
 
 			// Create the actual diagnostics engine.
-			Clang->createDiagnostics(*llvm::vfs::getRealFileSystem());
+			Clang->createDiagnostics();
 			if (!Clang->hasDiagnostics()) {
 				return false;
 			}

@@ -68,6 +68,16 @@ var goEnvVarsErr error // error returned from cmd.Run
 func readGoEnvVars() error {
 	goEnvVarsOnce.Do(func() {
 		cmd := exec.Command("go", "env", "-json", "GOPATH", "GOROOT", "GOVERSION")
+		// Filter out GOEXPERIMENT to avoid issues with custom experiments
+		// that the system Go toolchain doesn't recognize.
+		env := os.Environ()
+		filteredEnv := make([]string, 0, len(env))
+		for _, e := range env {
+			if !strings.HasPrefix(e, "GOEXPERIMENT=") {
+				filteredEnv = append(filteredEnv, e)
+			}
+		}
+		cmd.Env = filteredEnv
 		output, err := cmd.Output()
 		if err != nil {
 			// Check for "command not found" error.
