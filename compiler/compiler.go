@@ -713,6 +713,21 @@ func (c *compilerContext) createDIType(typ types.Type) llvm.Metadata {
 			Elements:    elements,
 		})
 		return md
+	case *types.SPMDType:
+		// SPMD vector type - represent as array in DWARF for debugger display.
+		elemDI := c.getDIType(typ.Elem())
+		laneCount := c.spmdLaneCount(c.getLLVMType(typ.Elem()))
+		return c.dibuilder.CreateArrayType(llvm.DIArrayType{
+			SizeInBits:  sizeInBytes * 8,
+			AlignInBits: uint32(c.targetData.ABITypeAlignment(llvmType)) * 8,
+			ElementType: elemDI,
+			Subscripts: []llvm.DISubrange{
+				{
+					Lo:    0,
+					Count: int64(laneCount),
+				},
+			},
+		})
 	case *types.TypeParam:
 		return c.getDIType(typ.Underlying())
 	default:
@@ -1706,6 +1721,11 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 				if mask.IsNil() {
 					mask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), ci.loop.laneCount))
 				}
+				// Splat scalar values to vector for masked store.
+				if llvmVal.Type().TypeKind() != llvm.VectorTypeKind {
+					vecType := llvm.VectorType(llvmVal.Type(), ci.loop.laneCount)
+					llvmVal = b.splatScalar(llvmVal, vecType)
+				}
 				b.spmdMaskedStore(llvmVal, ci.scalarPtr, mask)
 				return
 			}
@@ -2279,9 +2299,14 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		x := b.getValue(expr.X, getPos(expr))
 		y := b.getValue(expr.Y, getPos(expr))
 		// SPMD: replace +1 with +laneCount for SPMD loop increment.
+		// In merged body+loop blocks, x may be a vector (from spmdValueOverride),
+		// but the increment must remain scalar to feed back into the scalar phi.
 		if b.spmdLoopState != nil && expr.Op == token.ADD {
 			if loop, ok := b.spmdLoopState.loopBlocks[b.currentBlock.Index]; ok {
 				if expr == loop.incrBinOp {
+					if !loop.scalarIterVal.IsNil() {
+						x = loop.scalarIterVal
+					}
 					y = llvm.ConstInt(x.Type(), uint64(loop.laneCount), false)
 				}
 			}
@@ -2303,26 +2328,55 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		// LLVM type as well.
 		x := b.getValue(expr.X, getPos(expr))
 		llvmType := b.getLLVMType(expr.Type())
+		// SPMD: if input is a vector but output is scalar, vectorize the output.
+		if x.Type().TypeKind() == llvm.VectorTypeKind && llvmType.TypeKind() != llvm.VectorTypeKind {
+			llvmType = llvm.VectorType(llvmType, x.Type().VectorSize())
+		}
+		var changeTypeResult llvm.Value
 		if x.Type() == llvmType {
 			// Different Go type but same LLVM type (for example, named int).
 			// This is the common case.
-			return x, nil
-		}
-		// Figure out what kind of type we need to cast.
-		switch llvmType.TypeKind() {
-		case llvm.StructTypeKind:
-			// Unfortunately, we can't just bitcast structs. We have to
-			// actually create a new struct of the correct type and insert the
-			// values from the previous struct in there.
-			value := llvm.Undef(llvmType)
-			for i := 0; i < llvmType.StructElementTypesCount(); i++ {
-				field := b.CreateExtractValue(x, i, "changetype.field")
-				value = b.CreateInsertValue(value, field, i, "changetype.struct")
+			changeTypeResult = x
+		} else {
+			// Figure out what kind of type we need to cast.
+			switch llvmType.TypeKind() {
+			case llvm.StructTypeKind:
+				// Unfortunately, we can't just bitcast structs. We have to
+				// actually create a new struct of the correct type and insert the
+				// values from the previous struct in there.
+				value := llvm.Undef(llvmType)
+				for i := 0; i < llvmType.StructElementTypesCount(); i++ {
+					field := b.CreateExtractValue(x, i, "changetype.field")
+					value = b.CreateInsertValue(value, field, i, "changetype.struct")
+				}
+				changeTypeResult = value
+			case llvm.IntegerTypeKind, llvm.PointerTypeKind, llvm.DoubleTypeKind, llvm.FloatTypeKind:
+				changeTypeResult = b.CreateBitCast(x, llvmType, "changetype")
+			case llvm.VectorTypeKind:
+				if x.Type().TypeKind() != llvm.VectorTypeKind {
+					// Scalar to vector: broadcast (splat) the scalar.
+					changeTypeResult = b.splatScalar(x, llvmType)
+				} else {
+					changeTypeResult = b.CreateBitCast(x, llvmType, "changetype.vec")
+				}
+			default:
+				return llvm.Value{}, errors.New("todo: unknown ChangeType type: " + expr.X.Type().String())
 			}
-			return value, nil
-		default:
-			return llvm.Value{}, errors.New("todo: unknown ChangeType type: " + expr.X.Type().String())
 		}
+		// SPMD: propagate value override and activeLoops through ChangeType so
+		// that contiguous access detection in IndexAddr can see past type changes
+		// (e.g. the changetype lanes.Varying[int] <- int wrapping the iter phi).
+		if b.spmdValueOverride != nil {
+			if override, ok := b.spmdValueOverride[expr.X]; ok {
+				b.spmdValueOverride[expr] = override
+			}
+		}
+		if b.spmdLoopState != nil {
+			if loop, ok := b.spmdLoopState.activeLoops[expr.X]; ok {
+				b.spmdLoopState.activeLoops[expr] = loop
+			}
+		}
+		return changeTypeResult, nil
 	case *ssa.Const:
 		panic("const is not an expression")
 	case *ssa.Convert:
@@ -3307,6 +3361,11 @@ func (c *compilerContext) createConst(expr *ssa.Const, pos token.Pos) llvm.Value
 func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, pos token.Pos) (llvm.Value, error) {
 	llvmTypeFrom := value.Type()
 	llvmTypeTo := b.getLLVMType(typeTo)
+
+	// SPMD: if input is a vector but output is scalar, vectorize the output.
+	if llvmTypeFrom.TypeKind() == llvm.VectorTypeKind && llvmTypeTo.TypeKind() != llvm.VectorTypeKind {
+		llvmTypeTo = llvm.VectorType(llvmTypeTo, llvmTypeFrom.VectorSize())
+	}
 
 	// Conversion between unsafe.Pointer and uintptr.
 	isPtrFrom := isPointer(typeFrom.Underlying())

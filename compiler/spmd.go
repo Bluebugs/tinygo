@@ -390,9 +390,17 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		if iterPhi == nil {
 			continue
 		}
-
-		// Check if this phi's position is inside an SPMD loop.
-		loopInfo := b.isInSPMDLoop(iterPhi.Pos())
+		// Check if this block is inside an SPMD loop using any instruction with a valid position.
+		// The phi itself has NoPos (synthetic from SSA lift), so use body block instructions.
+		var loopInfo *SPMDLoopInfo
+		for _, instr := range block.Instrs {
+			if pos := instr.(interface{ Pos() token.Pos }).Pos(); pos != token.NoPos {
+				loopInfo = b.isInSPMDLoop(pos)
+				if loopInfo != nil {
+					break
+				}
+			}
+		}
 		if loopInfo == nil {
 			continue
 		}
@@ -406,7 +414,16 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			}
 		}
 		if loopBlock == nil {
-			continue
+			// Check for merged body+loop block (body loops back to itself).
+			for _, succ := range block.Succs {
+				if succ == block {
+					loopBlock = block
+					break
+				}
+			}
+			if loopBlock == nil {
+				continue
+			}
 		}
 
 		// Find the increment BinOp (iter + 1) in the loop block.
@@ -432,7 +449,7 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		elemType := b.getLLVMType(iterPhi.Type())
 		laneCount := b.spmdLaneCount(elemType)
 
-		// Create the active loop entry.
+			// Create the active loop entry.
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
 			iterPhi:       iterPhi,
