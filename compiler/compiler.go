@@ -1405,8 +1405,15 @@ func (b *builder) createFunction() {
 
 		// SPMD: enable value overrides for body blocks, clear for other blocks.
 		if b.spmdLoopState != nil {
-			if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
+			if loop, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
 				b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
+				// SPMD: rangeindex body blocks have no iter phi, so emit prologue here.
+				// For rangeint, the prologue is triggered later when the iter phi is compiled.
+				if loop.isRangeIndex {
+					b.emitSPMDBodyPrologue(loop)
+					b.spmdValueOverride[loop.bodyIterValue] = loop.laneIndices
+					b.spmdMaskStack = []llvm.Value{loop.tailMask}
+				}
 			} else if b.spmdValueOverride != nil && b.isBlockInSPMDBody(block) != nil {
 				// Keep existing overrides for if.then/if.else/if.done inside SPMD body.
 			} else {
@@ -1511,6 +1518,14 @@ func (b *builder) createFunction() {
 		block := phi.ssa.Block()
 		for i, edge := range phi.ssa.Edges {
 			llvmVal := b.getValue(edge, getPos(phi.ssa))
+			// SPMD: rangeindex loop phi starts at -1; change to -laneCount.
+			if b.spmdLoopState != nil {
+				if loop, ok := b.spmdLoopState.activeLoops[phi.ssa]; ok && loop.isRangeIndex {
+					if i == loop.initEdgeIndex {
+						llvmVal = llvm.ConstInt(llvmVal.Type(), uint64(int64(-loop.laneCount)), true)
+					}
+				}
+			}
 			llvmBlock := b.blockInfo[block.Preds[i].Index].exit
 			phi.llvm.AddIncoming([]llvm.Value{llvmVal}, []llvm.BasicBlock{llvmBlock})
 		}

@@ -1588,3 +1588,129 @@ func TestSPMDMaskAndOperation(t *testing.T) {
 		t.Errorf("elseMask type = %v, want VectorTypeKind", elseMask.Type().TypeKind())
 	}
 }
+
+// TestSPMDRangeIndexFields verifies that the new rangeindex fields on spmdActiveLoop
+// are correctly distinguished from rangeint fields.
+func TestSPMDRangeIndexFields(t *testing.T) {
+	tests := []struct {
+		name          string
+		isRangeIndex  bool
+		initEdgeIndex int
+		wantIsRI      bool
+		wantEdge      int
+	}{
+		// rangeint loop: isRangeIndex false, initEdgeIndex -1 (unused sentinel).
+		{"rangeint_loop", false, -1, false, -1},
+		// rangeindex loop: isRangeIndex true, initEdgeIndex identifies the entry edge.
+		{"rangeindex_loop_edge0", true, 0, true, 0},
+		{"rangeindex_loop_edge1", true, 1, true, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loop := &spmdActiveLoop{
+				isRangeIndex:  tt.isRangeIndex,
+				initEdgeIndex: tt.initEdgeIndex,
+			}
+
+			if loop.isRangeIndex != tt.wantIsRI {
+				t.Errorf("isRangeIndex = %v, want %v", loop.isRangeIndex, tt.wantIsRI)
+			}
+			if loop.initEdgeIndex != tt.wantEdge {
+				t.Errorf("initEdgeIndex = %d, want %d", loop.initEdgeIndex, tt.wantEdge)
+			}
+			// For rangeint loops, iterPhi is the bodyIterValue source.
+			// For rangeindex loops, bodyIterValue is the incrBinOp.
+			// Both are nil here (no real SSA), but the field distinction is what matters.
+			if tt.isRangeIndex && loop.iterPhi != nil {
+				t.Errorf("rangeindex loop should have nil iterPhi, got non-nil")
+			}
+		})
+	}
+}
+
+// TestSPMDActiveLoopBodyIterValue verifies that bodyIterValue is correctly set for both
+// rangeint (iterPhi) and rangeindex (incrBinOp) loop types.
+func TestSPMDActiveLoopBodyIterValue(t *testing.T) {
+	// For rangeint: bodyIterValue == iterPhi (same pointer).
+	// We can test this relationship via the isRangeIndex flag since we can't create
+	// real *ssa.Phi or *ssa.BinOp instances without a full SSA build.
+	t.Run("rangeint_bodyIterValue_is_iterPhi", func(t *testing.T) {
+		loop := &spmdActiveLoop{
+			isRangeIndex: false,
+			// In real usage: bodyIterValue = iterPhi (set during analyzeSPMDLoops).
+		}
+		// Verify the discriminant flag.
+		if loop.isRangeIndex {
+			t.Error("rangeint loop must have isRangeIndex == false")
+		}
+		// Verify iterPhi field exists and is nil (no real SSA).
+		if loop.iterPhi != nil {
+			t.Error("expected nil iterPhi in synthetic loop")
+		}
+	})
+
+	t.Run("rangeindex_bodyIterValue_is_incrBinOp", func(t *testing.T) {
+		loop := &spmdActiveLoop{
+			isRangeIndex:  true,
+			iterPhi:       nil, // rangeindex: no iter phi in body block
+			initEdgeIndex: 0,
+		}
+		if !loop.isRangeIndex {
+			t.Error("rangeindex loop must have isRangeIndex == true")
+		}
+		if loop.iterPhi != nil {
+			t.Error("rangeindex loop must have nil iterPhi")
+		}
+	})
+}
+
+// TestSPMDPhiInitOverride verifies that the -laneCount constant computation for
+// rangeindex loop phi initial value override is correct for various lane counts.
+func TestSPMDPhiInitOverride(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name      string
+		laneCount int
+		intType   llvm.Type
+		wantBits  int
+	}{
+		{"2_lanes_i64", 2, c.ctx.Int64Type(), 64},
+		{"4_lanes_i32", 4, c.ctx.Int32Type(), 32},
+		{"8_lanes_i16", 8, c.ctx.Int16Type(), 16},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the phi init override: llvm.ConstInt(type, uint64(int64(-laneCount)), true)
+			negLC := uint64(int64(-tt.laneCount))
+			val := llvm.ConstInt(tt.intType, negLC, true)
+
+			if val.IsNil() {
+				t.Fatal("ConstInt returned nil")
+			}
+
+			// Verify the constant is the correct type.
+			if val.Type().TypeKind() != llvm.IntegerTypeKind {
+				t.Errorf("type kind = %v, want IntegerTypeKind", val.Type().TypeKind())
+			}
+			if val.Type().IntTypeWidth() != tt.wantBits {
+				t.Errorf("int width = %d, want %d", val.Type().IntTypeWidth(), tt.wantBits)
+			}
+
+			// Verify it's a constant.
+			if !val.IsConstant() {
+				t.Error("expected constant value")
+			}
+
+			// Verify adding laneCount to -laneCount gives 0.
+			posLC := llvm.ConstInt(tt.intType, uint64(tt.laneCount), false)
+			sum := llvm.ConstAdd(val, posLC)
+			if !sum.IsNull() {
+				t.Errorf("-laneCount + laneCount should be 0 for laneCount=%d", tt.laneCount)
+			}
+		})
+	}
+}

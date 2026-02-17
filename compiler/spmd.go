@@ -334,26 +334,32 @@ type spmdLoopState struct {
 // spmdActiveLoop holds state for one SPMD loop during compilation.
 type spmdActiveLoop struct {
 	info       *SPMDLoopInfo
-	iterPhi    *ssa.Phi   // the "rangeint.iter" phi in body block
+	iterPhi    *ssa.Phi   // the "rangeint.iter" phi in body block (nil for rangeindex)
 	laneCount  int        // e.g. 4 for int32 on WASM SIMD128
 	boundValue ssa.Value  // N in "range N"
 	incrBinOp  *ssa.BinOp // the ADD in the loop block
 
+	// Range-over-slice specific fields (isRangeIndex == true):
+	isRangeIndex  bool      // true for rangeindex pattern (range-over-slice)
+	bodyIterValue ssa.Value // value body uses as index: iterPhi (rangeint) or incrBinOp (rangeindex)
+	initEdgeIndex int       // phi edge index for the entry predecessor (rangeindex only; -1 for rangeint)
+
 	// Set during IR generation:
 	laneIndices   llvm.Value // <iter, iter+1, ..., iter+laneCount-1>
 	tailMask      llvm.Value // per-lane bounds check
-	scalarIterVal llvm.Value // scalar LLVM phi value (before override to lane indices)
+	scalarIterVal llvm.Value // scalar LLVM value (before override to lane indices)
 }
 
-// analyzeSPMDLoops performs pre-analysis of SPMD loops before block compilation.
-// It identifies the SSA pattern for "go for i := range N" loops and extracts the
-// key values needed for vectorization: the iter phi, bound value, and increment operation.
+// analyzeSPMDLoops performs two-pass pre-analysis of SPMD loops before block compilation.
 //
-// This relies on golang.org/x/tools/go/ssa's rangeint pattern comments:
-//   - "rangeint.body": loop body block containing the iteration variable phi
-//   - "rangeint.iter": phi instruction for the loop counter
-//   - "rangeint.loop": successor block with increment (ADD) and bounds check (LSS)
+// Pass 1 detects range-over-int (rangeint) patterns via "rangeint.body" block comments.
+// The iter phi is in the body block with comment "rangeint.iter".
 //
+// Pass 2 detects range-over-slice (rangeindex) patterns via "rangeindex.body" block comments.
+// The iter phi is in the loop block (not body) with comment "rangeindex", and the body
+// uses the increment BinOp (loopPhi + 1) as its index.
+//
+// This relies on golang.org/x/tools/go/ssa's block and phi comment conventions.
 // If go/ssa internals change in x/tools, this detection may need updates.
 func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 	if b.spmdInfo == nil {
@@ -428,15 +434,128 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 
 		// Create the active loop entry.
 		loop := &spmdActiveLoop{
-			info:       loopInfo,
-			iterPhi:    iterPhi,
-			laneCount:  laneCount,
-			boundValue: boundValue,
-			incrBinOp:  incrBinOp,
+			info:          loopInfo,
+			iterPhi:       iterPhi,
+			laneCount:     laneCount,
+			boundValue:    boundValue,
+			incrBinOp:     incrBinOp,
+			isRangeIndex:  false,
+			bodyIterValue: iterPhi, // rangeint: body uses the phi directly
+			initEdgeIndex: -1,      // unused for rangeint; -1 ensures no accidental match
 		}
 
 		// Populate the maps for quick lookup.
 		state.activeLoops[iterPhi] = loop
+		state.bodyBlocks[block.Index] = loop
+		state.loopBlocks[loopBlock.Index] = loop
+	}
+
+	// Second pass: detect range-over-slice (rangeindex) patterns.
+	//
+	// The SSA pattern for "go for i, v := range slice" differs from range-over-int:
+	//   rangeindex.loop: phi "rangeindex" = [entry:-1, body:incr]
+	//                    incr = phi + 1
+	//                    if incr < len(slice): goto body else done
+	//   rangeindex.body: (no iter phi here; body uses incr from loop block)
+	//                    ptr = IndexAddr(slice, incr)
+	//                    ...
+	for _, block := range b.fn.Blocks {
+		if block.Comment != "rangeindex.body" {
+			continue
+		}
+
+		// The loop block is a predecessor of the body block with comment "rangeindex.loop".
+		var loopBlock *ssa.BasicBlock
+		for _, pred := range block.Preds {
+			if pred.Comment == "rangeindex.loop" {
+				loopBlock = pred
+				break
+			}
+		}
+		if loopBlock == nil {
+			continue
+		}
+
+		// Find the "rangeindex" phi in the loop block.
+		var loopPhi *ssa.Phi
+		for _, instr := range loopBlock.Instrs {
+			if phi, ok := instr.(*ssa.Phi); ok && phi.Comment == "rangeindex" {
+				loopPhi = phi
+				break
+			}
+		}
+		if loopPhi == nil {
+			continue
+		}
+
+		// Check SPMD membership using body block instruction positions.
+		// The phi is in the loop block, not the body, so we must check body instructions.
+		var loopInfo *SPMDLoopInfo
+		for _, instr := range block.Instrs {
+			if pos := instr.Pos(); pos.IsValid() {
+				if info := b.isInSPMDLoop(pos); info != nil {
+					loopInfo = info
+					break
+				}
+			}
+		}
+		if loopInfo == nil {
+			// No SPMD loop found via body instruction positions. This can happen
+			// if the body block contains only synthetic instructions with no source
+			// position. In practice, go for range-over-slice bodies always contain
+			// at least one user instruction (IndexAddr, etc.).
+			continue
+		}
+
+		// Find the increment BinOp (loopPhi + 1) and the bounds check (incr < len) in the loop block.
+		var incrBinOp *ssa.BinOp
+		var boundValue ssa.Value
+		for _, instr := range loopBlock.Instrs {
+			if binOp, ok := instr.(*ssa.BinOp); ok {
+				if binOp.Op == token.ADD && binOp.X == loopPhi {
+					incrBinOp = binOp
+				}
+				if binOp.Op == token.LSS && incrBinOp != nil && binOp.X == incrBinOp {
+					boundValue = binOp.Y
+				}
+			}
+		}
+		if incrBinOp == nil || boundValue == nil {
+			continue
+		}
+
+		// Determine initEdgeIndex: the phi edge whose predecessor is NOT the body block.
+		// The rangeindex phi starts at -1 from the entry predecessor.
+		initEdgeIndex := -1
+		for i, pred := range loopBlock.Preds {
+			if pred != block {
+				initEdgeIndex = i
+				break
+			}
+		}
+		if initEdgeIndex < 0 {
+			continue
+		}
+
+		// Compute lane count from the increment value's type.
+		elemType := b.getLLVMType(incrBinOp.Type())
+		laneCount := b.spmdLaneCount(elemType)
+
+		loop := &spmdActiveLoop{
+			info:          loopInfo,
+			iterPhi:       nil,  // rangeindex has no iter phi in body
+			laneCount:     laneCount,
+			boundValue:    boundValue,
+			incrBinOp:     incrBinOp,
+			isRangeIndex:  true,
+			bodyIterValue: incrBinOp,  // rangeindex: body uses the incr BinOp
+			initEdgeIndex: initEdgeIndex,
+		}
+
+		// Register both loopPhi and incrBinOp as keys so IndexAddr contiguous
+		// detection can find this loop via either value.
+		state.activeLoops[loopPhi] = loop
+		state.activeLoops[incrBinOp] = loop
 		state.bodyBlocks[block.Index] = loop
 		state.loopBlocks[loopBlock.Index] = loop
 	}
@@ -460,11 +579,25 @@ func (c *compilerContext) spmdLaneOffsetConst(laneCount int, elemType llvm.Type)
 // emitSPMDBodyPrologue emits the lane indices and tail mask after phi compilation.
 // This transforms the scalar loop iterator into a vector of lane indices, and
 // computes a per-lane bounds check mask.
+//
+// For rangeint loops (isRangeIndex == false), the scalar base value is the iter
+// phi already compiled in the body block.
+// For rangeindex loops (isRangeIndex == true), the scalar base value is the
+// incrBinOp (loopPhi + 1) compiled in the loop block, which dominates the body
+// block so its LLVM value is already present in b.locals via DomPreorder.
 func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
-	// Get the scalar phi value (already compiled as LLVM phi).
-	scalarPhi := b.locals[loop.iterPhi]
+	// Obtain the scalar iteration value that the body block uses as its index.
+	var scalarPhi llvm.Value
+	if loop.isRangeIndex {
+		// rangeindex: the incr BinOp (loopPhi+1) is the index seen by body instructions.
+		// It was compiled in the loop block (which dominates body) so b.locals has it.
+		scalarPhi = b.locals[loop.bodyIterValue]
+	} else {
+		// rangeint: the iter phi is in the body block itself.
+		scalarPhi = b.locals[loop.iterPhi]
+	}
 
-	// Save the scalar phi for later use in contiguous IndexAddr detection.
+	// Save the scalar value for later use in contiguous IndexAddr detection.
 	loop.scalarIterVal = scalarPhi
 
 	// Get element type from the scalar phi (e.g., i32 for int on WASM).
