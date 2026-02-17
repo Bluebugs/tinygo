@@ -8,6 +8,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"strconv"
 	"testing"
 
 	"golang.org/x/tools/go/ssa"
@@ -908,6 +909,408 @@ func TestSPMDCallMaskAllTrue(t *testing.T) {
 			// Verify it's not null (all-ones means all true).
 			if allOnes.IsNull() {
 				t.Errorf("ConstAllOnes(%s) is null, want all-ones", tt.name)
+			}
+		})
+	}
+}
+
+func TestSPMDVectorTypeSuffix(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name    string
+		vecType llvm.Type
+		want    string
+	}{
+		{"v4i32", llvm.VectorType(c.ctx.Int32Type(), 4), "v4i32"},
+		{"v2i64", llvm.VectorType(c.ctx.Int64Type(), 2), "v2i64"},
+		{"v16i8", llvm.VectorType(c.ctx.Int8Type(), 16), "v16i8"},
+		{"v4f32", llvm.VectorType(c.ctx.FloatType(), 4), "v4f32"},
+		{"v2f64", llvm.VectorType(c.ctx.DoubleType(), 2), "v2f64"},
+		{"v4i1", llvm.VectorType(c.ctx.Int1Type(), 4), "v4i1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := spmdVectorTypeSuffix(tt.vecType)
+			if got != tt.want {
+				t.Errorf("spmdVectorTypeSuffix(%s) = %q, want %q", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSPMDCallVectorReduce(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name         string
+		op           string
+		vecType      llvm.Type
+		wantRetKind  llvm.TypeKind
+		wantRetWidth int // for integer types; 0 to skip check
+	}{
+		{
+			name:         "add_v4i32",
+			op:           "add",
+			vecType:      llvm.VectorType(c.ctx.Int32Type(), 4),
+			wantRetKind:  llvm.IntegerTypeKind,
+			wantRetWidth: 32,
+		},
+		{
+			name:         "and_v4i1",
+			op:           "and",
+			vecType:      llvm.VectorType(c.ctx.Int1Type(), 4),
+			wantRetKind:  llvm.IntegerTypeKind,
+			wantRetWidth: 1,
+		},
+		{
+			name:         "or_v4i32",
+			op:           "or",
+			vecType:      llvm.VectorType(c.ctx.Int32Type(), 4),
+			wantRetKind:  llvm.IntegerTypeKind,
+			wantRetWidth: 32,
+		},
+		{
+			name:         "smax_v4i32",
+			op:           "smax",
+			vecType:      llvm.VectorType(c.ctx.Int32Type(), 4),
+			wantRetKind:  llvm.IntegerTypeKind,
+			wantRetWidth: 32,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vec := llvm.ConstNull(tt.vecType)
+			result := b.spmdCallVectorReduce(tt.op, vec)
+
+			if result.IsNil() {
+				t.Fatalf("spmdCallVectorReduce(%s, %s) returned nil", tt.op, tt.name)
+			}
+
+			// Verify return type is scalar, not vector.
+			resultType := result.Type()
+			if resultType.TypeKind() == llvm.VectorTypeKind {
+				t.Errorf("spmdCallVectorReduce(%s) returned vector type, want scalar", tt.name)
+			}
+
+			if resultType.TypeKind() != tt.wantRetKind {
+				t.Errorf("spmdCallVectorReduce(%s) return type kind = %v, want %v",
+					tt.name, resultType.TypeKind(), tt.wantRetKind)
+			}
+
+			if tt.wantRetWidth > 0 && resultType.TypeKind() == llvm.IntegerTypeKind {
+				if resultType.IntTypeWidth() != tt.wantRetWidth {
+					t.Errorf("spmdCallVectorReduce(%s) return width = %d, want %d",
+						tt.name, resultType.IntTypeWidth(), tt.wantRetWidth)
+				}
+			}
+
+			// Verify intrinsic was declared in the module.
+			intrinsicName := "llvm.vector.reduce." + tt.op + "." + spmdVectorTypeSuffix(tt.vecType)
+			llvmFn := c.mod.NamedFunction(intrinsicName)
+			if llvmFn.IsNil() {
+				t.Errorf("intrinsic %q not found in module", intrinsicName)
+			}
+		})
+	}
+}
+
+func TestSPMDCallVectorReduceFloat(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name     string
+		op       string
+		startVal float64
+		vecType  llvm.Type
+	}{
+		{
+			name:     "fadd_v4f32",
+			op:       "fadd",
+			startVal: 0.0,
+			vecType:  llvm.VectorType(c.ctx.FloatType(), 4),
+		},
+		{
+			name:     "fmul_v4f32",
+			op:       "fmul",
+			startVal: 1.0,
+			vecType:  llvm.VectorType(c.ctx.FloatType(), 4),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vec := llvm.ConstNull(tt.vecType)
+			elemType := tt.vecType.ElementType()
+			startVal := llvm.ConstFloat(elemType, tt.startVal)
+			result := b.spmdCallVectorReduceFloat(tt.op, startVal, vec)
+
+			if result.IsNil() {
+				t.Fatalf("spmdCallVectorReduceFloat(%s) returned nil", tt.name)
+			}
+
+			// Verify return type is scalar float, not vector.
+			resultType := result.Type()
+			if resultType.TypeKind() == llvm.VectorTypeKind {
+				t.Errorf("spmdCallVectorReduceFloat(%s) returned vector type, want scalar", tt.name)
+			}
+
+			// Should match element type kind.
+			if resultType.TypeKind() != elemType.TypeKind() {
+				t.Errorf("spmdCallVectorReduceFloat(%s) return type kind = %v, want %v",
+					tt.name, resultType.TypeKind(), elemType.TypeKind())
+			}
+
+			// Verify intrinsic was declared.
+			intrinsicName := "llvm.vector.reduce." + tt.op + "." + spmdVectorTypeSuffix(tt.vecType)
+			llvmFn := c.mod.NamedFunction(intrinsicName)
+			if llvmFn.IsNil() {
+				t.Errorf("intrinsic %q not found in module", intrinsicName)
+			}
+		})
+	}
+}
+
+func TestSPMDReduceAllVectorFull(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name     string
+		maskVals []bool
+	}{
+		{"all_true", []bool{true, true, true, true}},
+		{"mixed", []bool{true, false, true, false}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create <4 x i1> constant vector.
+			vecElts := make([]llvm.Value, len(tt.maskVals))
+			for i, val := range tt.maskVals {
+				if val {
+					vecElts[i] = llvm.ConstInt(c.ctx.Int1Type(), 1, false)
+				} else {
+					vecElts[i] = llvm.ConstInt(c.ctx.Int1Type(), 0, false)
+				}
+			}
+			maskVec := llvm.ConstVector(vecElts, false)
+
+			// Simulate reduce.All: bitcast to iN, compare == -1
+			vecSize := maskVec.Type().VectorSize()
+			intType := c.ctx.IntType(vecSize)
+			intVal := b.CreateBitCast(maskVec, intType, "")
+			allOnes := llvm.ConstAllOnes(intType)
+			result := b.CreateICmp(llvm.IntEQ, intVal, allOnes, "")
+
+			// Verify result is i1.
+			if result.Type().TypeKind() != llvm.IntegerTypeKind {
+				t.Errorf("reduce.All(%s) result type = %v, want IntegerTypeKind",
+					tt.name, result.Type().TypeKind())
+			}
+			if result.Type().IntTypeWidth() != 1 {
+				t.Errorf("reduce.All(%s) result width = %d, want 1",
+					tt.name, result.Type().IntTypeWidth())
+			}
+		})
+	}
+}
+
+func TestSPMDReduceCount(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name     string
+		maskVals []bool
+	}{
+		{"all_true", []bool{true, true, true, true}},
+		{"two_true", []bool{true, false, true, false}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create <4 x i1> constant vector.
+			vecElts := make([]llvm.Value, len(tt.maskVals))
+			for i, val := range tt.maskVals {
+				if val {
+					vecElts[i] = llvm.ConstInt(c.ctx.Int1Type(), 1, false)
+				} else {
+					vecElts[i] = llvm.ConstInt(c.ctx.Int1Type(), 0, false)
+				}
+			}
+			maskVec := llvm.ConstVector(vecElts, false)
+
+			// Simulate reduce.Count: bitcast to iN, ctpop, zext
+			vecSize := maskVec.Type().VectorSize()
+			intType := c.ctx.IntType(vecSize)
+			intVal := b.CreateBitCast(maskVec, intType, "")
+
+			intrinsicName := "llvm.ctpop.i" + strconv.Itoa(vecSize)
+			llvmFn := c.mod.NamedFunction(intrinsicName)
+			fnType := llvm.FunctionType(intType, []llvm.Type{intType}, false)
+			if llvmFn.IsNil() {
+				llvmFn = llvm.AddFunction(c.mod, intrinsicName, fnType)
+			}
+			popcount := b.createCall(fnType, llvmFn, []llvm.Value{intVal}, "")
+
+			// Verify ctpop returns the right type.
+			if popcount.IsNil() {
+				t.Fatal("ctpop returned nil")
+			}
+
+			if popcount.Type().TypeKind() != llvm.IntegerTypeKind {
+				t.Errorf("ctpop result type = %v, want IntegerTypeKind", popcount.Type().TypeKind())
+			}
+
+			// Verify the intrinsic was declared.
+			declaredFn := c.mod.NamedFunction(intrinsicName)
+			if declaredFn.IsNil() {
+				t.Errorf("intrinsic %q not found in module", intrinsicName)
+			}
+		})
+	}
+}
+
+func TestSPMDLanesIndex(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name      string
+		laneCount int
+		elemType  llvm.Type
+	}{
+		{"4_lanes_i32", 4, c.ctx.Int32Type()},
+		{"16_lanes_i8", 16, c.ctx.Int8Type()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// lanes.Index() generates spmdLaneOffsetConst
+			result := c.spmdLaneOffsetConst(tt.laneCount, tt.elemType)
+
+			if result.IsNil() {
+				t.Fatal("spmdLaneOffsetConst returned nil")
+			}
+
+			// Verify it's a vector type.
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
+			}
+
+			// Verify lane count.
+			if result.Type().VectorSize() != tt.laneCount {
+				t.Errorf("vector size = %d, want %d", result.Type().VectorSize(), tt.laneCount)
+			}
+
+			// Verify it's a constant.
+			if !result.IsConstant() {
+				t.Error("expected constant vector")
+			}
+
+			// Verify element type matches.
+			if result.Type().ElementType().C != tt.elemType.C {
+				t.Error("element type mismatch")
+			}
+		})
+	}
+}
+
+func TestSPMDLanesBroadcast(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Create a vector [10, 20, 30, 40].
+	vecElts := make([]llvm.Value, 4)
+	for i := range vecElts {
+		vecElts[i] = llvm.ConstInt(c.ctx.Int32Type(), uint64((i+1)*10), false)
+	}
+	vecVal := llvm.ConstVector(vecElts, false)
+
+	// Extract element at lane 2 and splat to all lanes.
+	lane := llvm.ConstInt(c.ctx.Int32Type(), 2, false)
+	elem := b.CreateExtractElement(vecVal, lane, "broadcast.elem")
+	result := b.splatScalar(elem, vecVal.Type())
+
+	// Verify result is not nil.
+	if result.IsNil() {
+		t.Fatal("broadcast returned nil")
+	}
+
+	// Verify result is a vector with 4 lanes.
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
+	}
+	if result.Type().VectorSize() != 4 {
+		t.Errorf("vector size = %d, want 4", result.Type().VectorSize())
+	}
+
+	// Verify element type matches.
+	if result.Type().ElementType().C != c.ctx.Int32Type().C {
+		t.Error("element type mismatch")
+	}
+}
+
+func TestSPMDIsSignedInt(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  types.Type
+		want bool
+	}{
+		{"int32", types.Typ[types.Int32], true},
+		{"int64", types.Typ[types.Int64], true},
+		{"int", types.Typ[types.Int], true},
+		{"uint32", types.Typ[types.Uint32], false},
+		{"uint64", types.Typ[types.Uint64], false},
+		{"float32", types.Typ[types.Float32], false},
+		{"float64", types.Typ[types.Float64], false},
+		{"bool", types.Typ[types.Bool], false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := spmdIsSignedInt(tt.typ)
+			if got != tt.want {
+				t.Errorf("spmdIsSignedInt(%s) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSPMDIsFloat(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  types.Type
+		want bool
+	}{
+		{"float32", types.Typ[types.Float32], true},
+		{"float64", types.Typ[types.Float64], true},
+		{"int32", types.Typ[types.Int32], false},
+		{"uint64", types.Typ[types.Uint64], false},
+		{"bool", types.Typ[types.Bool], false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := spmdIsFloat(tt.typ)
+			if got != tt.want {
+				t.Errorf("spmdIsFloat(%s) = %v, want %v", tt.name, got, tt.want)
 			}
 		})
 	}

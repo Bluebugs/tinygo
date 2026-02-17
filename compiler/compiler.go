@@ -2006,6 +2006,10 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 			if !retval.IsNil() {
 				return retval, nil
 			}
+		case strings.HasPrefix(name, "lanes."):
+			return b.createLanesBuiltin(instr, name)
+		case strings.HasPrefix(name, "reduce."):
+			return b.createReduceBuiltin(instr, name)
 		}
 	}
 

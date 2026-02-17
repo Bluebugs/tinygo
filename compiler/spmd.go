@@ -10,6 +10,7 @@ import (
 	"go/types"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/tinygo-org/tinygo/loader"
 	"golang.org/x/tools/go/ssa"
@@ -824,4 +825,296 @@ func (b *builder) spmdCallMask(fn *ssa.Function) llvm.Value {
 
 	// Fallback: all lanes active.
 	return llvm.ConstAllOnes(maskType)
+}
+
+// spmdVectorTypeSuffix returns the LLVM intrinsic name suffix for a vector type.
+// e.g., <4 x i32> → "v4i32", <4 x float> → "v4f32", <2 x double> → "v2f64"
+func spmdVectorTypeSuffix(vecType llvm.Type) string {
+	n := vecType.VectorSize()
+	elemType := vecType.ElementType()
+	var suffix string
+	switch elemType.TypeKind() {
+	case llvm.IntegerTypeKind:
+		suffix = "i" + strconv.Itoa(elemType.IntTypeWidth())
+	case llvm.FloatTypeKind:
+		suffix = "f32"
+	case llvm.DoubleTypeKind:
+		suffix = "f64"
+	default:
+		suffix = "i32" // fallback
+	}
+	return "v" + strconv.Itoa(n) + suffix
+}
+
+// spmdCallVectorReduce declares and calls an LLVM integer vector reduction intrinsic.
+// op is the operation name: "add", "mul", "and", "or", "xor", "smax", "smin", "umax", "umin".
+// Returns the scalar result.
+func (b *builder) spmdCallVectorReduce(op string, vec llvm.Value) llvm.Value {
+	vecType := vec.Type()
+	elemType := vecType.ElementType()
+	intrinsicName := "llvm.vector.reduce." + op + "." + spmdVectorTypeSuffix(vecType)
+	llvmFn := b.mod.NamedFunction(intrinsicName)
+	fnType := llvm.FunctionType(elemType, []llvm.Type{vecType}, false)
+	if llvmFn.IsNil() {
+		llvmFn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	return b.createCall(fnType, llvmFn, []llvm.Value{vec}, "")
+}
+
+// spmdCallVectorReduceFloat declares and calls an LLVM float vector reduction intrinsic.
+// op is "fadd" or "fmul". startVal is the identity element (0.0 for add, 1.0 for mul).
+// Returns the scalar result.
+func (b *builder) spmdCallVectorReduceFloat(op string, startVal, vec llvm.Value) llvm.Value {
+	vecType := vec.Type()
+	elemType := vecType.ElementType()
+	intrinsicName := "llvm.vector.reduce." + op + "." + spmdVectorTypeSuffix(vecType)
+	llvmFn := b.mod.NamedFunction(intrinsicName)
+	fnType := llvm.FunctionType(elemType, []llvm.Type{elemType, vecType}, false)
+	if llvmFn.IsNil() {
+		llvmFn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	return b.createCall(fnType, llvmFn, []llvm.Value{startVal, vec}, "")
+}
+
+// spmdIsSignedInt returns true if the Go type is a signed integer type.
+func spmdIsSignedInt(t types.Type) bool {
+	if basic, ok := t.Underlying().(*types.Basic); ok {
+		return basic.Info()&types.IsInteger != 0 && basic.Info()&types.IsUnsigned == 0
+	}
+	return false
+}
+
+// spmdIsFloat returns true if the Go type is a float type.
+func spmdIsFloat(t types.Type) bool {
+	if basic, ok := t.Underlying().(*types.Basic); ok {
+		return basic.Info()&types.IsFloat != 0
+	}
+	return false
+}
+
+// createLanesBuiltin handles interception of lanes.* function calls.
+// Returns the LLVM value result and nil error on success.
+func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	switch {
+	case name == "lanes.Index":
+		// lanes.Index() returns <0, 1, 2, ..., N-1> as Varying[int]
+		elemType := b.getLLVMType(instr.Signature().Results().At(0).Type().(*types.SPMDType).Elem())
+		laneCount := b.spmdLaneCount(elemType)
+		return b.spmdLaneOffsetConst(laneCount, elemType), nil
+
+	case strings.HasPrefix(name, "lanes.Count["):
+		// lanes.Count[T](v) returns scalar int (lane count, compile-time constant)
+		// Get element type from the argument's SPMDType
+		argType := instr.Args[0].Type()
+		var elemType llvm.Type
+		if spmdType, ok := argType.(*types.SPMDType); ok {
+			elemType = b.getLLVMType(spmdType.Elem())
+		} else {
+			elemType = b.getLLVMType(argType)
+		}
+		laneCount := b.spmdLaneCount(elemType)
+		return llvm.ConstInt(b.intType, uint64(laneCount), false), nil
+
+	case strings.HasPrefix(name, "lanes.Broadcast["):
+		// lanes.Broadcast[T](value, lane) — extract element at lane index, splat to all lanes
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		lane := b.getValue(instr.Args[1], getPos(instr))
+		elem := b.CreateExtractElement(vec, lane, "broadcast.elem")
+		return b.splatScalar(elem, vec.Type()), nil
+
+	case strings.HasPrefix(name, "lanes.ShiftLeft["):
+		// lanes.ShiftLeft[T](value, shift) — per-lane left shift
+		value := b.getValue(instr.Args[0], getPos(instr))
+		shift := b.getValue(instr.Args[1], getPos(instr))
+		return b.CreateShl(value, shift, ""), nil
+
+	case strings.HasPrefix(name, "lanes.ShiftRight["):
+		// lanes.ShiftRight[T](value, shift) — per-lane right shift
+		// Signed types use arithmetic shift right, unsigned use logical shift right
+		value := b.getValue(instr.Args[0], getPos(instr))
+		shift := b.getValue(instr.Args[1], getPos(instr))
+		// Get element type from SPMDType to determine signedness
+		argType := instr.Args[0].Type()
+		if spmdType, ok := argType.(*types.SPMDType); ok && spmdIsSignedInt(spmdType.Elem()) {
+			return b.CreateAShr(value, shift, ""), nil
+		}
+		return b.CreateLShr(value, shift, ""), nil
+
+	case strings.HasPrefix(name, "lanes.From["):
+		// lanes.From[T](data []T) — load N contiguous elements from slice as vector
+		// Extract pointer from the slice value (element 0 is the data pointer)
+		sliceVal := b.getValue(instr.Args[0], getPos(instr))
+		ptr := b.CreateExtractValue(sliceVal, 0, "slice.ptr")
+		// Determine vector type from result SPMDType
+		resultType := instr.Signature().Results().At(0).Type()
+		vecType := b.getLLVMType(resultType)
+		// Load as vector
+		return b.CreateLoad(vecType, ptr, "lanes.from"), nil
+
+	default:
+		return llvm.Value{}, b.makeError(getPos(instr), "unsupported lanes builtin: "+name)
+	}
+}
+
+// createReduceBuiltin handles interception of reduce.* function calls.
+// Returns the LLVM value result and nil error on success.
+func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	switch {
+	case strings.HasPrefix(name, "reduce.Add["):
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		argType := instr.Args[0].Type()
+		if spmdType, ok := argType.(*types.SPMDType); ok && spmdIsFloat(spmdType.Elem()) {
+			// Float: ordered fadd reduction with start = 0.0
+			elemType := vec.Type().ElementType()
+			startVal := llvm.ConstFloat(elemType, 0.0)
+			return b.spmdCallVectorReduceFloat("fadd", startVal, vec), nil
+		}
+		return b.spmdCallVectorReduce("add", vec), nil
+
+	case strings.HasPrefix(name, "reduce.Mul["):
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		argType := instr.Args[0].Type()
+		if spmdType, ok := argType.(*types.SPMDType); ok && spmdIsFloat(spmdType.Elem()) {
+			// Float: ordered fmul reduction with start = 1.0
+			elemType := vec.Type().ElementType()
+			startVal := llvm.ConstFloat(elemType, 1.0)
+			return b.spmdCallVectorReduceFloat("fmul", startVal, vec), nil
+		}
+		return b.spmdCallVectorReduce("mul", vec), nil
+
+	case name == "reduce.All":
+		// reduce.All(v Varying[bool]) bool — true if all lanes are true
+		// Bitcast <N x i1> to iN, compare == -1 (all bits set)
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		vecSize := vec.Type().VectorSize()
+		intType := b.ctx.IntType(vecSize)
+		intVal := b.CreateBitCast(vec, intType, "")
+		allOnes := llvm.ConstAllOnes(intType)
+		return b.CreateICmp(llvm.IntEQ, intVal, allOnes, ""), nil
+
+	case name == "reduce.Any":
+		// reduce.Any(v Varying[bool]) bool — true if any lane is true
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		return b.spmdVectorAnyTrue(vec), nil
+
+	case strings.HasPrefix(name, "reduce.Max["):
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		argType := instr.Args[0].Type()
+		if spmdType, ok := argType.(*types.SPMDType); ok {
+			if spmdIsFloat(spmdType.Elem()) {
+				return b.spmdCallVectorReduce("fmax", vec), nil
+			}
+			if spmdIsSignedInt(spmdType.Elem()) {
+				return b.spmdCallVectorReduce("smax", vec), nil
+			}
+		}
+		return b.spmdCallVectorReduce("umax", vec), nil
+
+	case strings.HasPrefix(name, "reduce.Min["):
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		argType := instr.Args[0].Type()
+		if spmdType, ok := argType.(*types.SPMDType); ok {
+			if spmdIsFloat(spmdType.Elem()) {
+				return b.spmdCallVectorReduce("fmin", vec), nil
+			}
+			if spmdIsSignedInt(spmdType.Elem()) {
+				return b.spmdCallVectorReduce("smin", vec), nil
+			}
+		}
+		return b.spmdCallVectorReduce("umin", vec), nil
+
+	case strings.HasPrefix(name, "reduce.Or["):
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		return b.spmdCallVectorReduce("or", vec), nil
+
+	case strings.HasPrefix(name, "reduce.And["):
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		return b.spmdCallVectorReduce("and", vec), nil
+
+	case strings.HasPrefix(name, "reduce.Xor["):
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		return b.spmdCallVectorReduce("xor", vec), nil
+
+	case strings.HasPrefix(name, "reduce.From["):
+		// reduce.From[T](v Varying[T]) []T — extract all lanes into a slice.
+		// NOTE: Uses stack allocation (alloca). The resulting slice is only valid
+		// within the current function scope. TinyGo's escape analysis will promote
+		// this to a heap allocation if the slice escapes. For the PoC this is
+		// acceptable; a production implementation would use runtime.alloc directly.
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		vecType := vec.Type()
+		elemType := vecType.ElementType()
+		laneCount := vecType.VectorSize()
+
+		// Allocate stack space for the elements.
+		arrType := llvm.ArrayType(elemType, laneCount)
+		alloca := b.CreateAlloca(arrType, "reduce.from.arr")
+
+		// Extract each element and store
+		for i := 0; i < laneCount; i++ {
+			idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+			elem := b.CreateExtractElement(vec, idx, "")
+			gep := b.CreateInBoundsGEP(arrType, alloca, []llvm.Value{
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+				llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false),
+			}, "")
+			b.CreateStore(elem, gep)
+		}
+
+		// Create slice triple {ptr, len, cap}
+		ptr := b.CreateBitCast(alloca, b.dataPtrType, "")
+		lenVal := llvm.ConstInt(b.uintptrType, uint64(laneCount), false)
+		sliceType := b.getLLVMType(instr.Signature().Results().At(0).Type())
+		slice := llvm.Undef(sliceType)
+		slice = b.CreateInsertValue(slice, ptr, 0, "")
+		slice = b.CreateInsertValue(slice, lenVal, 1, "")
+		slice = b.CreateInsertValue(slice, lenVal, 2, "") // cap = len
+		return slice, nil
+
+	case name == "reduce.Count":
+		// reduce.Count(v Varying[bool]) int — count of true lanes
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		vecSize := vec.Type().VectorSize()
+		intType := b.ctx.IntType(vecSize)
+		intVal := b.CreateBitCast(vec, intType, "")
+		// Call llvm.ctpop to count set bits
+		intrinsicName := "llvm.ctpop.i" + strconv.Itoa(vecSize)
+		llvmFn := b.mod.NamedFunction(intrinsicName)
+		fnType := llvm.FunctionType(intType, []llvm.Type{intType}, false)
+		if llvmFn.IsNil() {
+			llvmFn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+		}
+		popcount := b.createCall(fnType, llvmFn, []llvm.Value{intVal}, "")
+		return b.createZExtOrTrunc(popcount, b.intType), nil
+
+	case name == "reduce.FindFirstSet":
+		// reduce.FindFirstSet(v Varying[bool]) int — index of first true lane
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		vecSize := vec.Type().VectorSize()
+		intType := b.ctx.IntType(vecSize)
+		intVal := b.CreateBitCast(vec, intType, "")
+		// Call llvm.cttz to count trailing zeros
+		intrinsicName := "llvm.cttz.i" + strconv.Itoa(vecSize)
+		llvmFn := b.mod.NamedFunction(intrinsicName)
+		fnType := llvm.FunctionType(intType, []llvm.Type{intType, b.ctx.Int1Type()}, false)
+		if llvmFn.IsNil() {
+			llvmFn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+		}
+		cttz := b.createCall(fnType, llvmFn, []llvm.Value{
+			intVal,
+			llvm.ConstInt(b.ctx.Int1Type(), 0, false), // is_zero_poison = false
+		}, "")
+		return b.createZExtOrTrunc(cttz, b.intType), nil
+
+	case name == "reduce.Mask":
+		// reduce.Mask(v Varying[bool]) int — bitmask of active lanes
+		vec := b.getValue(instr.Args[0], getPos(instr))
+		vecSize := vec.Type().VectorSize()
+		intType := b.ctx.IntType(vecSize)
+		intVal := b.CreateBitCast(vec, intType, "")
+		return b.CreateZExt(intVal, b.intType, ""), nil
+
+	default:
+		return llvm.Value{}, b.makeError(getPos(instr), "unsupported reduce builtin: "+name)
+	}
 }
