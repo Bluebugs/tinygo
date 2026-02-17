@@ -1315,3 +1315,276 @@ func TestSPMDIsFloat(t *testing.T) {
 		})
 	}
 }
+
+func TestSPMDMaskStack(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i1Type := c.ctx.Int1Type()
+	mask4Type := llvm.VectorType(i1Type, 4)
+
+	allTrue := llvm.ConstAllOnes(mask4Type)
+	allFalse := llvm.ConstNull(mask4Type)
+
+	// Empty stack returns nil.
+	mask := b.spmdCurrentMask()
+	if !mask.IsNil() {
+		t.Error("expected nil mask from empty stack")
+	}
+
+	// Pop on empty stack is a no-op (no panic).
+	b.spmdPopMask()
+	mask = b.spmdCurrentMask()
+	if !mask.IsNil() {
+		t.Error("expected nil mask after pop on empty stack")
+	}
+
+	// Push one mask and read it back.
+	b.spmdPushMask(allTrue)
+	mask = b.spmdCurrentMask()
+	if mask.IsNil() {
+		t.Fatal("expected non-nil mask after push")
+	}
+	if mask.C != allTrue.C {
+		t.Error("expected allTrue mask after push")
+	}
+
+	// Push a second mask: top changes.
+	b.spmdPushMask(allFalse)
+	mask = b.spmdCurrentMask()
+	if mask.C != allFalse.C {
+		t.Error("expected allFalse mask after second push")
+	}
+
+	// Pop second mask: back to first.
+	b.spmdPopMask()
+	mask = b.spmdCurrentMask()
+	if mask.C != allTrue.C {
+		t.Error("expected allTrue mask after pop")
+	}
+
+	// Pop first mask: stack empty again.
+	b.spmdPopMask()
+	mask = b.spmdCurrentMask()
+	if !mask.IsNil() {
+		t.Error("expected nil mask after popping all")
+	}
+}
+
+func TestSPMDMaskedLoadIntrinsic(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name      string
+		elemType  llvm.Type
+		laneCount int
+		wantSuffix string
+	}{
+		{"v4i32", c.ctx.Int32Type(), 4, "v4i32"},
+		{"v2i64", c.ctx.Int64Type(), 2, "v2i64"},
+		{"v4f32", c.ctx.FloatType(), 4, "v4f32"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vecType := llvm.VectorType(tt.elemType, tt.laneCount)
+			maskType := llvm.VectorType(c.ctx.Int1Type(), tt.laneCount)
+
+			// Allocate a stack buffer to use as pointer for the load.
+			arrType := llvm.ArrayType(tt.elemType, tt.laneCount)
+			ptr := b.CreateAlloca(arrType, "test.alloca")
+
+			// Get a GEP pointer to the first element (scalar pointer).
+			zero := llvm.ConstInt(c.ctx.Int32Type(), 0, false)
+			scalarPtr := b.CreateInBoundsGEP(arrType, ptr, []llvm.Value{zero, zero}, "test.ptr")
+
+			// Use all-true mask.
+			mask := llvm.ConstAllOnes(maskType)
+
+			// Call spmdMaskedLoad.
+			result := b.spmdMaskedLoad(vecType, scalarPtr, mask)
+
+			if result.IsNil() {
+				t.Fatalf("spmdMaskedLoad returned nil")
+			}
+
+			// Verify result type is the vector type.
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
+			}
+			if result.Type().VectorSize() != tt.laneCount {
+				t.Errorf("result lane count = %d, want %d", result.Type().VectorSize(), tt.laneCount)
+			}
+
+			// Verify the intrinsic was declared in the module.
+			intrinsicName := "llvm.masked.load." + tt.wantSuffix + ".p0"
+			fn := c.mod.NamedFunction(intrinsicName)
+			if fn.IsNil() {
+				t.Errorf("intrinsic %q not declared in module", intrinsicName)
+			}
+		})
+	}
+}
+
+func TestSPMDMaskedStoreIntrinsic(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name       string
+		elemType   llvm.Type
+		laneCount  int
+		wantSuffix string
+	}{
+		{"v4i32", c.ctx.Int32Type(), 4, "v4i32"},
+		{"v2i64", c.ctx.Int64Type(), 2, "v2i64"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vecType := llvm.VectorType(tt.elemType, tt.laneCount)
+			maskType := llvm.VectorType(c.ctx.Int1Type(), tt.laneCount)
+
+			// Allocate a stack buffer to use as destination pointer.
+			arrType := llvm.ArrayType(tt.elemType, tt.laneCount)
+			ptr := b.CreateAlloca(arrType, "test.alloca")
+			zero := llvm.ConstInt(c.ctx.Int32Type(), 0, false)
+			scalarPtr := b.CreateInBoundsGEP(arrType, ptr, []llvm.Value{zero, zero}, "test.ptr")
+
+			// Create a null vector value to store.
+			val := llvm.ConstNull(vecType)
+
+			// Use all-true mask.
+			mask := llvm.ConstAllOnes(maskType)
+
+			// Call spmdMaskedStore (void return, so just verify no panic).
+			b.spmdMaskedStore(val, scalarPtr, mask)
+
+			// Verify the intrinsic was declared in the module.
+			intrinsicName := "llvm.masked.store." + tt.wantSuffix + ".p0"
+			fn := c.mod.NamedFunction(intrinsicName)
+			if fn.IsNil() {
+				t.Errorf("intrinsic %q not declared in module", intrinsicName)
+			}
+		})
+	}
+}
+
+func TestSPMDMaskTransitionTypes(t *testing.T) {
+	// Verify that spmdMaskTransition structs can be constructed correctly.
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
+	cond := llvm.ConstAllOnes(maskType)
+
+	// Construct each transition type and verify the kind field.
+	pushTr := &spmdMaskTransition{kind: "pushThen", cond: cond}
+	swapTr := &spmdMaskTransition{kind: "swapElse", cond: cond}
+	popTr := &spmdMaskTransition{kind: "pop"}
+
+	if pushTr.kind != "pushThen" {
+		t.Errorf("pushThen kind = %q, want %q", pushTr.kind, "pushThen")
+	}
+	if swapTr.kind != "swapElse" {
+		t.Errorf("swapElse kind = %q, want %q", swapTr.kind, "swapElse")
+	}
+	if popTr.kind != "pop" {
+		t.Errorf("pop kind = %q, want %q", popTr.kind, "pop")
+	}
+	if pushTr.cond.C != cond.C {
+		t.Error("pushThen cond not preserved")
+	}
+
+	// Verify builder starts with nil mask transitions map.
+	if b.spmdMaskTransitions != nil {
+		t.Error("expected nil spmdMaskTransitions for fresh builder")
+	}
+	if b.spmdContiguousPtr != nil {
+		t.Error("expected nil spmdContiguousPtr for fresh builder")
+	}
+}
+
+func TestSPMDContiguousInfoFields(t *testing.T) {
+	// Verify spmdContiguousInfo fields can be set and read.
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	elemType := c.ctx.Int32Type()
+	arrType := llvm.ArrayType(elemType, 4)
+	ptr := b.CreateAlloca(arrType, "test.alloca")
+	zero := llvm.ConstInt(c.ctx.Int32Type(), 0, false)
+	scalarPtr := b.CreateInBoundsGEP(arrType, ptr, []llvm.Value{zero, zero}, "scalar.ptr")
+
+	loop := &spmdActiveLoop{
+		laneCount: 4,
+	}
+
+	info := &spmdContiguousInfo{
+		scalarPtr: scalarPtr,
+		loop:      loop,
+	}
+
+	if info.scalarPtr.IsNil() {
+		t.Error("expected non-nil scalarPtr")
+	}
+	if info.loop == nil {
+		t.Error("expected non-nil loop")
+	}
+	if info.loop.laneCount != 4 {
+		t.Errorf("loop.laneCount = %d, want 4", info.loop.laneCount)
+	}
+}
+
+func TestSPMDMaskAndOperation(t *testing.T) {
+	// Verify mask AND operations used in mask transitions produce correct vector types.
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i1Type := c.ctx.Int1Type()
+	maskType := llvm.VectorType(i1Type, laneCount)
+
+	// Create parent mask (all true) and condition (alternating).
+	parentMask := llvm.ConstAllOnes(maskType)
+	condElts := make([]llvm.Value, laneCount)
+	for i := range condElts {
+		condElts[i] = llvm.ConstInt(i1Type, uint64(i%2), false)
+	}
+	cond := llvm.ConstVector(condElts, false)
+
+	// Simulate pushThen: thenMask = parentMask AND cond.
+	thenMask := b.CreateAnd(parentMask, cond, "spmd.then.mask")
+	if thenMask.IsNil() {
+		t.Fatal("CreateAnd returned nil")
+	}
+	if thenMask.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("thenMask type = %v, want VectorTypeKind", thenMask.Type().TypeKind())
+	}
+	if thenMask.Type().VectorSize() != laneCount {
+		t.Errorf("thenMask size = %d, want %d", thenMask.Type().VectorSize(), laneCount)
+	}
+
+	// Simulate swapElse: elseMask = parentMask AND NOT(cond).
+	notCond := b.CreateNot(cond, "")
+	elseMask := b.CreateAnd(parentMask, notCond, "spmd.else.mask")
+	if elseMask.IsNil() {
+		t.Fatal("CreateAnd(not) returned nil")
+	}
+	if elseMask.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("elseMask type = %v, want VectorTypeKind", elseMask.Type().TypeKind())
+	}
+}

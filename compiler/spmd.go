@@ -340,8 +340,9 @@ type spmdActiveLoop struct {
 	incrBinOp  *ssa.BinOp // the ADD in the loop block
 
 	// Set during IR generation:
-	laneIndices llvm.Value // <iter, iter+1, ..., iter+laneCount-1>
-	tailMask    llvm.Value // per-lane bounds check
+	laneIndices   llvm.Value // <iter, iter+1, ..., iter+laneCount-1>
+	tailMask      llvm.Value // per-lane bounds check
+	scalarIterVal llvm.Value // scalar LLVM phi value (before override to lane indices)
 }
 
 // analyzeSPMDLoops performs pre-analysis of SPMD loops before block compilation.
@@ -463,6 +464,9 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	// Get the scalar phi value (already compiled as LLVM phi).
 	scalarPhi := b.locals[loop.iterPhi]
 
+	// Save the scalar phi for later use in contiguous IndexAddr detection.
+	loop.scalarIterVal = scalarPhi
+
 	// Get element type from the scalar phi (e.g., i32 for int on WASM).
 	elemType := scalarPhi.Type()
 
@@ -491,6 +495,26 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	loop.tailMask = tailMask
 }
 
+// spmdPushMask pushes a new execution mask onto the stack.
+func (b *builder) spmdPushMask(mask llvm.Value) {
+	b.spmdMaskStack = append(b.spmdMaskStack, mask)
+}
+
+// spmdPopMask removes the top mask from the stack.
+func (b *builder) spmdPopMask() {
+	if len(b.spmdMaskStack) > 0 {
+		b.spmdMaskStack = b.spmdMaskStack[:len(b.spmdMaskStack)-1]
+	}
+}
+
+// spmdCurrentMask returns the top of the mask stack, or a nil Value if empty.
+func (b *builder) spmdCurrentMask() llvm.Value {
+	if len(b.spmdMaskStack) > 0 {
+		return b.spmdMaskStack[len(b.spmdMaskStack)-1]
+	}
+	return llvm.Value{}
+}
+
 // spmdVaryingIf holds analysis results for a varying (vector) if/else construct.
 type spmdVaryingIf struct {
 	cond           llvm.Value // vector condition (<N x i1>)
@@ -499,6 +523,18 @@ type spmdVaryingIf struct {
 	elseEntryIndex int        // Succs[1] of if-block (or merge for if-without-else)
 	mergeIndex     int        // common successor (merge point)
 	hasElse        bool       // true if then/else are distinct from merge
+}
+
+// spmdMaskTransition describes how the execution mask changes at a block boundary.
+type spmdMaskTransition struct {
+	kind string     // "pushThen", "swapElse", "pop"
+	cond llvm.Value // vector condition (for pushThen/swapElse)
+}
+
+// spmdContiguousInfo tracks an IndexAddr result that was detected as contiguous SPMD access.
+type spmdContiguousInfo struct {
+	scalarPtr llvm.Value      // scalar GEP result (base of contiguous access)
+	loop      *spmdActiveLoop // owning loop (for lane count)
 }
 
 // isBlockInSPMDBody checks if a given SSA block is inside an SPMD loop body.
@@ -556,6 +592,15 @@ func (b *builder) spmdDetectVaryingIf(ifBlock *ssa.BasicBlock, cond llvm.Value) 
 		for _, exitBlock := range thenExits {
 			b.spmdThenExitRedirects[exitBlock.Index] = elseLLVMBlock
 		}
+	}
+
+	// Record mask transitions for block-level mask stack management.
+	if b.spmdMaskTransitions != nil {
+		b.spmdMaskTransitions[thenEntry.Index] = &spmdMaskTransition{kind: "pushThen", cond: cond}
+		if hasElse {
+			b.spmdMaskTransitions[elseEntry.Index] = &spmdMaskTransition{kind: "swapElse", cond: cond}
+		}
+		b.spmdMaskTransitions[merge.Index] = &spmdMaskTransition{kind: "pop"}
 	}
 }
 
@@ -1117,4 +1162,127 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 	default:
 		return llvm.Value{}, b.makeError(getPos(instr), "unsupported reduce builtin: "+name)
 	}
+}
+
+// spmdMaskedLoad calls llvm.masked.load.<suffix>.p0 to load a vector from a scalar pointer with a per-lane mask.
+func (b *builder) spmdMaskedLoad(vecType llvm.Type, ptr, mask llvm.Value) llvm.Value {
+	suffix := spmdVectorTypeSuffix(vecType)
+	intrinsicName := "llvm.masked.load." + suffix + ".p0"
+
+	ptrType := ptr.Type()
+	i32Type := b.ctx.Int32Type()
+	fnType := llvm.FunctionType(vecType, []llvm.Type{ptrType, i32Type, mask.Type(), vecType}, false)
+
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+
+	elemSize := b.targetData.TypeAllocSize(vecType.ElementType())
+	align := llvm.ConstInt(i32Type, elemSize, false)
+	passthru := llvm.ConstNull(vecType)
+
+	return b.createCall(fnType, fn, []llvm.Value{ptr, align, mask, passthru}, "spmd.load")
+}
+
+// spmdMaskedStore calls llvm.masked.store.<suffix>.p0 to store a vector to a scalar pointer with a per-lane mask.
+func (b *builder) spmdMaskedStore(val, ptr, mask llvm.Value) {
+	vecType := val.Type()
+	suffix := spmdVectorTypeSuffix(vecType)
+	intrinsicName := "llvm.masked.store." + suffix + ".p0"
+
+	ptrType := ptr.Type()
+	i32Type := b.ctx.Int32Type()
+	fnType := llvm.FunctionType(b.ctx.VoidType(), []llvm.Type{vecType, ptrType, i32Type, mask.Type()}, false)
+
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+
+	elemSize := b.targetData.TypeAllocSize(vecType.ElementType())
+	align := llvm.ConstInt(i32Type, elemSize, false)
+
+	b.createCall(fnType, fn, []llvm.Value{val, ptr, align, mask}, "")
+}
+
+// spmdMaskedGather calls llvm.masked.gather.<suffix>.v<N>p0 for non-contiguous loads from a vector of pointers.
+func (b *builder) spmdMaskedGather(vecType llvm.Type, ptrs, mask llvm.Value) llvm.Value {
+	suffix := spmdVectorTypeSuffix(vecType)
+	laneCount := ptrs.Type().VectorSize()
+	intrinsicName := "llvm.masked.gather." + suffix + ".v" + strconv.Itoa(laneCount) + "p0"
+
+	ptrVecType := ptrs.Type()
+	i32Type := b.ctx.Int32Type()
+	fnType := llvm.FunctionType(vecType, []llvm.Type{ptrVecType, i32Type, mask.Type(), vecType}, false)
+
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+
+	elemSize := b.targetData.TypeAllocSize(vecType.ElementType())
+	align := llvm.ConstInt(i32Type, elemSize, false)
+	passthru := llvm.ConstNull(vecType)
+
+	return b.createCall(fnType, fn, []llvm.Value{ptrs, align, mask, passthru}, "spmd.gather")
+}
+
+// spmdMaskedScatter calls llvm.masked.scatter.<suffix>.v<N>p0 for non-contiguous stores to a vector of pointers.
+func (b *builder) spmdMaskedScatter(val, ptrs, mask llvm.Value) {
+	vecType := val.Type()
+	suffix := spmdVectorTypeSuffix(vecType)
+	laneCount := ptrs.Type().VectorSize()
+	intrinsicName := "llvm.masked.scatter." + suffix + ".v" + strconv.Itoa(laneCount) + "p0"
+
+	ptrVecType := ptrs.Type()
+	i32Type := b.ctx.Int32Type()
+	fnType := llvm.FunctionType(b.ctx.VoidType(), []llvm.Type{vecType, ptrVecType, i32Type, mask.Type()}, false)
+
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+
+	elemSize := b.targetData.TypeAllocSize(vecType.ElementType())
+	align := llvm.ConstInt(i32Type, elemSize, false)
+
+	b.createCall(fnType, fn, []llvm.Value{val, ptrs, align, mask}, "")
+}
+
+// spmdContiguousIndexAddr handles IndexAddr for contiguous SPMD access.
+// Returns a scalar pointer to the base element (for subsequent vector load/store via spmdMaskedLoad/Store).
+// Returns an error if the container type is not supported for contiguous access.
+func (b *builder) spmdContiguousIndexAddr(expr *ssa.IndexAddr, loop *spmdActiveLoop) (llvm.Value, error) {
+	val := b.getValue(expr.X, getPos(expr))
+	scalarIndex := loop.scalarIterVal
+	scalarIndex = b.extendInteger(scalarIndex, expr.Index.Type(), b.uintptrType)
+
+	var ptr llvm.Value
+	switch ptrTyp := expr.X.Type().Underlying().(type) {
+	case *types.Pointer:
+		typ := ptrTyp.Elem().Underlying()
+		switch typ := typ.(type) {
+		case *types.Array:
+			bufType := b.getLLVMType(typ)
+			b.createNilCheck(expr.X, val, "gep")
+			ptr = b.CreateInBoundsGEP(bufType, val, []llvm.Value{
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+				scalarIndex,
+			}, "spmd.contiguous.ptr")
+		default:
+			return llvm.Value{}, b.makeError(expr.Pos(), "unsupported contiguous SPMD indexaddr type: "+typ.String())
+		}
+	case *types.Slice:
+		bufptr := b.CreateExtractValue(val, 0, "indexaddr.ptr")
+		bufType := b.getLLVMType(ptrTyp.Elem())
+		ptr = b.CreateInBoundsGEP(bufType, bufptr, []llvm.Value{scalarIndex}, "spmd.contiguous.ptr")
+	default:
+		return llvm.Value{}, b.makeError(expr.Pos(), "unsupported contiguous SPMD indexaddr type: "+ptrTyp.String())
+	}
+
+	if b.spmdContiguousPtr != nil {
+		b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop}
+	}
+	return ptr, nil
 }

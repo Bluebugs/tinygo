@@ -177,12 +177,15 @@ type builder struct {
 	deferBuiltinFuncs     map[ssa.Value]deferBuiltin
 	runDefersBlock        []llvm.BasicBlock
 	afterDefersBlock      []llvm.BasicBlock
-	spmdLoopState         *spmdLoopState           // SPMD loop analysis results (nil if no SPMD)
-	spmdValueOverride     map[ssa.Value]llvm.Value // SPMD value substitutions (e.g., iter phi -> lane indices)
-	spmdVaryingIfs        map[int]*spmdVaryingIf   // if-block index -> varying if info
-	spmdThenExitRedirects map[int]llvm.BasicBlock  // then-exit block index -> else-entry LLVM block
-	spmdMergeSelects      map[int]*spmdVaryingIf   // merge block index -> varying if info
-	spmdEntryMask         llvm.Value               // SPMD function entry mask (zero if not SPMD function)
+	spmdLoopState         *spmdLoopState                     // SPMD loop analysis results (nil if no SPMD)
+	spmdValueOverride     map[ssa.Value]llvm.Value            // SPMD value substitutions (e.g., iter phi -> lane indices)
+	spmdVaryingIfs        map[int]*spmdVaryingIf              // if-block index -> varying if info
+	spmdThenExitRedirects map[int]llvm.BasicBlock             // then-exit block index -> else-entry LLVM block
+	spmdMergeSelects      map[int]*spmdVaryingIf              // merge block index -> varying if info
+	spmdEntryMask         llvm.Value                          // SPMD function entry mask (zero if not SPMD function)
+	spmdMaskStack         []llvm.Value                        // execution mask stack for nested varying if/else
+	spmdMaskTransitions   map[int]*spmdMaskTransition         // block index -> mask transition to apply
+	spmdContiguousPtr     map[ssa.Value]*spmdContiguousInfo   // IndexAddr SSA value -> contiguous access info
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1382,11 +1385,13 @@ func (b *builder) createFunction() {
 	// SPMD: analyze loops before compiling blocks.
 	b.spmdLoopState = b.analyzeSPMDLoops()
 
-	// SPMD: initialize varying if/else maps.
+	// SPMD: initialize varying if/else maps and Phase 2.8 mask tracking maps.
 	if b.spmdLoopState != nil {
 		b.spmdVaryingIfs = make(map[int]*spmdVaryingIf)
 		b.spmdThenExitRedirects = make(map[int]llvm.BasicBlock)
 		b.spmdMergeSelects = make(map[int]*spmdVaryingIf)
+		b.spmdMaskTransitions = make(map[int]*spmdMaskTransition)
+		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
 	}
 
 	// Fill blocks with instructions.
@@ -1406,6 +1411,32 @@ func (b *builder) createFunction() {
 				// Keep existing overrides for if.then/if.else/if.done inside SPMD body.
 			} else {
 				b.spmdValueOverride = nil
+				b.spmdMaskStack = nil
+			}
+		}
+
+		// SPMD: apply mask transitions at block boundaries.
+		if b.spmdMaskTransitions != nil {
+			if tr, ok := b.spmdMaskTransitions[block.Index]; ok {
+				switch tr.kind {
+				case "pushThen":
+					parentMask := b.spmdCurrentMask()
+					if !parentMask.IsNil() {
+						thenMask := b.CreateAnd(parentMask, tr.cond, "spmd.then.mask")
+						b.spmdPushMask(thenMask)
+					}
+				case "swapElse":
+					// Pop the then-mask, peek at parent, push else-mask.
+					b.spmdPopMask()
+					parentMask := b.spmdCurrentMask()
+					if !parentMask.IsNil() {
+						notCond := b.CreateNot(tr.cond, "")
+						elseMask := b.CreateAnd(parentMask, notCond, "spmd.else.mask")
+						b.spmdPushMask(elseMask)
+					}
+				case "pop":
+					b.spmdPopMask()
+				}
 			}
 		}
 
@@ -1449,6 +1480,8 @@ func (b *builder) createFunction() {
 					if loop, ok := b.spmdLoopState.activeLoops[phi]; ok {
 						b.emitSPMDBodyPrologue(loop)
 						b.spmdValueOverride[phi] = loop.laneIndices
+						// Initialize mask stack with the tail mask for this loop.
+						b.spmdMaskStack = []llvm.Value{loop.tailMask}
 					}
 				}
 			}
@@ -1649,6 +1682,31 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 	case *ssa.Store:
 		llvmAddr := b.getValue(instr.Addr, getPos(instr))
 		llvmVal := b.getValue(instr.Val, getPos(instr))
+
+		// SPMD: contiguous vector store via masked.store intrinsic.
+		// When the address is a contiguous SPMD IndexAddr, store a full vector.
+		if b.spmdContiguousPtr != nil {
+			if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
+				mask := b.spmdCurrentMask()
+				if mask.IsNil() {
+					mask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), ci.loop.laneCount))
+				}
+				b.spmdMaskedStore(llvmVal, ci.scalarPtr, mask)
+				return
+			}
+		}
+
+		// SPMD: non-contiguous scatter to a vector of pointers.
+		if llvmAddr.Type().TypeKind() == llvm.VectorTypeKind {
+			laneCount := llvmAddr.Type().VectorSize()
+			mask := b.spmdCurrentMask()
+			if mask.IsNil() {
+				mask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), laneCount))
+			}
+			b.spmdMaskedScatter(llvmVal, llvmAddr, mask)
+			return
+		}
+
 		b.createNilCheck(instr.Addr, llvmAddr, "store")
 		if b.targetData.TypeAllocSize(llvmVal.Type()) == 0 {
 			// nothing to store
@@ -2334,6 +2392,21 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			panic("unknown *ssa.Index type")
 		}
 	case *ssa.IndexAddr:
+		// SPMD: detect contiguous access (index is the loop iter phi, overridden to lane indices).
+		// When the index SSA value has a vector override, it means this is an SPMD loop index.
+		// We intercept it here to generate a scalar GEP for the base element, then use
+		// masked load/store intrinsics when the result is dereferenced or stored.
+		if b.spmdLoopState != nil && b.spmdValueOverride != nil {
+			if _, isOverridden := b.spmdValueOverride[expr.Index]; isOverridden {
+				if loop, ok := b.spmdLoopState.activeLoops[expr.Index]; ok {
+					if result, err := b.spmdContiguousIndexAddr(expr, loop); err == nil {
+						return result, nil
+					}
+					// If the contiguous detection fails, fall through to the generic path.
+				}
+			}
+		}
+
 		val := b.getValue(expr.X, getPos(expr))
 		index := b.getValue(expr.Index, getPos(expr))
 
@@ -3455,6 +3528,32 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 			return llvm.Value{}, b.makeError(unop.Pos(), "todo: unknown type for negate: "+unop.X.Type().Underlying().String())
 		}
 	case token.MUL: // *x, dereference pointer
+		// SPMD: contiguous vector load via masked.load intrinsic.
+		// When x is detected as a contiguous SPMD IndexAddr, load a full vector.
+		if b.spmdContiguousPtr != nil {
+			if ci, ok := b.spmdContiguousPtr[unop.X]; ok {
+				elemType := b.getLLVMType(unop.X.Type().Underlying().(*types.Pointer).Elem())
+				vecType := llvm.VectorType(elemType, ci.loop.laneCount)
+				mask := b.spmdCurrentMask()
+				if mask.IsNil() {
+					mask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), ci.loop.laneCount))
+				}
+				return b.spmdMaskedLoad(vecType, ci.scalarPtr, mask), nil
+			}
+		}
+
+		// SPMD: non-contiguous gather from a vector of pointers.
+		if x.Type().TypeKind() == llvm.VectorTypeKind {
+			elemType := b.getLLVMType(unop.X.Type().Underlying().(*types.Pointer).Elem())
+			laneCount := x.Type().VectorSize()
+			vecType := llvm.VectorType(elemType, laneCount)
+			mask := b.spmdCurrentMask()
+			if mask.IsNil() {
+				mask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), laneCount))
+			}
+			return b.spmdMaskedGather(vecType, x, mask), nil
+		}
+
 		valueType := b.getLLVMType(unop.X.Type().Underlying().(*types.Pointer).Elem())
 		if b.targetData.TypeAllocSize(valueType) == 0 {
 			// zero-length data
