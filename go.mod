@@ -14,7 +14,6 @@ require (
 	github.com/sigurn/crc16 v0.0.0-20211026045750-20ab5afb07e3
 	github.com/tetratelabs/wazero v1.6.0
 	go.bug.st/serial v1.6.0
-	golang.org/x/net v0.35.0
 	golang.org/x/sys v0.30.0
 	golang.org/x/tools v0.30.0
 	gopkg.in/yaml.v2 v2.4.0
@@ -25,5 +24,6 @@ require (
 	github.com/creack/goselect v0.1.2 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/stretchr/testify v1.8.4 // indirect
-	golang.org/x/text v0.22.0 // indirect
 )
+
+replace golang.org/x/tools v0.30.0 => ../x-tools-spmd
