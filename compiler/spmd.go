@@ -405,42 +405,56 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			continue
 		}
 
-		// Find the successor rangeint.loop block.
+		// Find the loop block containing the increment (iterPhi + 1) and bounds check.
+		// The loop block may be:
+		//   - The body block itself (merged body+loop, simple cases)
+		//   - A direct successor with comment "rangeint.loop" (split case, no body control flow)
+		//   - A predecessor of body (split case with control flow: body → if.then/else → if.done → body)
 		var loopBlock *ssa.BasicBlock
-		for _, succ := range block.Succs {
-			if succ.Comment == "rangeint.loop" {
-				loopBlock = succ
-				break
+		var incrBinOp *ssa.BinOp
+		var boundValue ssa.Value
+
+		// Helper to search a candidate block for increment and bounds check.
+		searchBlock := func(candidate *ssa.BasicBlock) bool {
+			var incr *ssa.BinOp
+			var bound ssa.Value
+			for _, instr := range candidate.Instrs {
+				if binOp, ok := instr.(*ssa.BinOp); ok {
+					if binOp.Op == token.ADD && binOp.X == iterPhi {
+						incr = binOp
+					}
+					if binOp.Op == token.LSS && incr != nil && binOp.X == incr {
+						bound = binOp.Y
+					}
+				}
 			}
+			if incr != nil && bound != nil {
+				loopBlock = candidate
+				incrBinOp = incr
+				boundValue = bound
+				return true
+			}
+			return false
 		}
-		if loopBlock == nil {
-			// Check for merged body+loop block (body loops back to itself).
+
+		// 1. Check the body block itself (merged body+loop).
+		if !searchBlock(block) {
+			// 2. Check direct successors (simple split with "rangeint.loop").
 			for _, succ := range block.Succs {
-				if succ == block {
-					loopBlock = block
+				if searchBlock(succ) {
 					break
 				}
 			}
-			if loopBlock == nil {
-				continue
-			}
 		}
-
-		// Find the increment BinOp (iter + 1) in the loop block.
-		var incrBinOp *ssa.BinOp
-		var boundValue ssa.Value
-		for _, instr := range loopBlock.Instrs {
-			if binOp, ok := instr.(*ssa.BinOp); ok {
-				if binOp.Op == token.ADD && binOp.X == iterPhi {
-					incrBinOp = binOp
-				}
-				// Find the bounds check (incr < N).
-				if binOp.Op == token.LSS && incrBinOp != nil && binOp.X == incrBinOp {
-					boundValue = binOp.Y
+		if loopBlock == nil {
+			// 3. Check predecessors (body has control flow, loop-back comes through if.done).
+			for _, pred := range block.Preds {
+				if searchBlock(pred) {
+					break
 				}
 			}
 		}
-		if incrBinOp == nil || boundValue == nil {
+		if loopBlock == nil {
 			continue
 		}
 
@@ -698,6 +712,21 @@ func (b *builder) isBlockInSPMDBody(block *ssa.BasicBlock) *SPMDLoopInfo {
 	for _, instr := range block.Instrs {
 		if loopInfo := b.isInSPMDLoop(instr.Pos()); loopInfo != nil {
 			return loopInfo
+		}
+	}
+
+	// Fallback: check if any SPMD body block dominates this block.
+	// This handles blocks like if.done whose instructions are synthetic (NoPos)
+	// but are structurally inside the SPMD loop (dominated by the body block).
+	// Note: this may also match post-loop blocks (e.g. rangeint.done) that are
+	// dominated by body. This is safe because spmdValueOverride only maps
+	// loop-local SSA values (iterPhi) which are not referenced after the loop.
+	if b.spmdLoopState != nil {
+		for bodyIdx, loop := range b.spmdLoopState.bodyBlocks {
+			bodyBlock := b.fn.Blocks[bodyIdx]
+			if bodyBlock.Dominates(block) {
+				return loop.info
+			}
 		}
 	}
 

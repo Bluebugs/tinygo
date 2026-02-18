@@ -2356,6 +2356,15 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				if x.Type().TypeKind() != llvm.VectorTypeKind {
 					// Scalar to vector: broadcast (splat) the scalar.
 					changeTypeResult = b.splatScalar(x, llvmType)
+				} else if x.Type().ElementType() == llvmType.ElementType() {
+					// SPMD: both source and dest are vectors of the same element
+					// type (e.g. <4 x i1> to <16 x i1>). This arises when a
+					// comparison result's lane count (set by the operand width,
+					// e.g. i32 => 4 lanes) differs from the SPMDType{bool} lane
+					// count (128/8 = 16). The comparison already carries the
+					// correct lane count -- use the source directly rather than
+					// bitcasting to an incompatible vector size.
+					changeTypeResult = x
 				} else {
 					changeTypeResult = b.CreateBitCast(x, llvmType, "changetype.vec")
 				}
