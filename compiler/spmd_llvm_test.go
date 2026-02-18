@@ -1714,3 +1714,78 @@ func TestSPMDPhiInitOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestSPMDBroadcastMatchVectorWidth(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	t.Run("narrower_wins", func(t *testing.T) {
+		// Create <16 x i8> constant (splatted 97 = 'a') and <4 x i8> constant (splatted 0).
+		wide := llvm.ConstVector(func() []llvm.Value {
+			elts := make([]llvm.Value, 16)
+			for i := range elts {
+				elts[i] = llvm.ConstInt(c.ctx.Int8Type(), 97, false)
+			}
+			return elts
+		}(), false)
+		narrow := llvm.ConstVector(func() []llvm.Value {
+			elts := make([]llvm.Value, 4)
+			for i := range elts {
+				elts[i] = llvm.ConstInt(c.ctx.Int8Type(), 0, false)
+			}
+			return elts
+		}(), false)
+
+		rx, ry := b.spmdBroadcastMatch(wide, narrow)
+		if rx.Type().VectorSize() != 4 {
+			t.Errorf("expected x resized to 4 lanes, got %d", rx.Type().VectorSize())
+		}
+		if ry.Type().VectorSize() != 4 {
+			t.Errorf("expected y unchanged at 4 lanes, got %d", ry.Type().VectorSize())
+		}
+	})
+
+	t.Run("resize_vector_truncate", func(t *testing.T) {
+		// Direct test of spmdResizeVector: truncate <16 x i8> to 4 lanes.
+		wide := llvm.ConstVector(func() []llvm.Value {
+			elts := make([]llvm.Value, 16)
+			for i := range elts {
+				elts[i] = llvm.ConstInt(c.ctx.Int8Type(), uint64(i), false)
+			}
+			return elts
+		}(), false)
+
+		result := b.spmdResizeVector(wide, 4, c.ctx.Int8Type())
+		if result.Type().VectorSize() != 4 {
+			t.Errorf("expected 4 lanes, got %d", result.Type().VectorSize())
+		}
+		if result.Type().ElementType().IntTypeWidth() != 8 {
+			t.Errorf("expected i8 element type, got i%d", result.Type().ElementType().IntTypeWidth())
+		}
+	})
+
+	t.Run("same_width_noop", func(t *testing.T) {
+		// Same width vectors should pass through unchanged.
+		a := llvm.ConstVector(func() []llvm.Value {
+			elts := make([]llvm.Value, 4)
+			for i := range elts {
+				elts[i] = llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false)
+			}
+			return elts
+		}(), false)
+		b2 := llvm.ConstVector(func() []llvm.Value {
+			elts := make([]llvm.Value, 4)
+			for i := range elts {
+				elts[i] = llvm.ConstInt(c.ctx.Int32Type(), uint64(i+10), false)
+			}
+			return elts
+		}(), false)
+
+		rx, ry := b.spmdBroadcastMatch(a, b2)
+		if rx.Type().VectorSize() != 4 || ry.Type().VectorSize() != 4 {
+			t.Errorf("expected both unchanged at 4 lanes")
+		}
+	})
+}

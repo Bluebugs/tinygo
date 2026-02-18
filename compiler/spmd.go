@@ -293,6 +293,7 @@ func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
 
 // spmdBroadcastMatch ensures both operands have matching types for SPMD operations.
 // If one operand is a vector and the other is a scalar, the scalar is splatted.
+// If both are vectors with different lane counts, the wider one is resized to match the narrower.
 func (b *builder) spmdBroadcastMatch(x, y llvm.Value) (llvm.Value, llvm.Value) {
 	xIsVec := x.Type().TypeKind() == llvm.VectorTypeKind
 	yIsVec := y.Type().TypeKind() == llvm.VectorTypeKind
@@ -300,8 +301,39 @@ func (b *builder) spmdBroadcastMatch(x, y llvm.Value) (llvm.Value, llvm.Value) {
 		y = b.splatScalar(y, x.Type())
 	} else if !xIsVec && yIsVec {
 		x = b.splatScalar(x, y.Type())
+	} else if xIsVec && yIsVec && x.Type().VectorSize() != y.Type().VectorSize() {
+		// Both vectors but different lane counts. The narrower width is authoritative
+		// (determined by the SPMD loop's effective lane count). Resize the wider one.
+		xSize := x.Type().VectorSize()
+		ySize := y.Type().VectorSize()
+		if xSize < ySize {
+			y = b.spmdResizeVector(y, xSize, x.Type().ElementType())
+		} else {
+			x = b.spmdResizeVector(x, ySize, y.Type().ElementType())
+		}
 	}
 	return x, y
+}
+
+// spmdResizeVector resizes a vector to the target lane count.
+// Used when two SPMD vectors have mismatched widths (e.g., Varying[byte] constant
+// with 16 lanes vs loop-effective 4 lanes). Truncates wider vectors or re-splats.
+func (b *builder) spmdResizeVector(vec llvm.Value, targetLanes int, elemType llvm.Type) llvm.Value {
+	targetVecType := llvm.VectorType(elemType, targetLanes)
+	// Use shuffle to truncate. LLVM constant-folds shuffles on constant vectors,
+	// so there is no need for a separate constant fast-path.
+	srcLanes := vec.Type().VectorSize()
+	if targetLanes <= srcLanes {
+		mask := make([]llvm.Value, targetLanes)
+		for i := range mask {
+			mask[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+		}
+		maskVec := llvm.ConstVector(mask, false)
+		return b.CreateShuffleVector(vec, llvm.Undef(vec.Type()), maskVec, "spmd.resize")
+	}
+	// Extending (shouldn't happen in practice): splat element 0.
+	elem := b.CreateExtractElement(vec, llvm.ConstInt(b.ctx.Int32Type(), 0, false), "")
+	return b.splatScalar(elem, targetVecType)
 }
 
 // createSPMDConst creates a splatted vector constant for an SPMD varying type.
