@@ -125,6 +125,16 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 	// Resolve alias types: alias types are resolved at compile time.
 	typ = types.Unalias(typ)
 
+	// SPMD: Represent lanes.Varying[T] as [laneCount]T for interface boxing.
+	// All downstream type-switch functions already handle *types.Array, so
+	// redirecting here avoids adding SPMDType cases throughout this file.
+	if spmdType, ok := typ.(*types.SPMDType); ok && spmdType.IsVarying() {
+		elemLLVM := c.getLLVMType(spmdType.Elem())
+		laneCount := c.spmdLaneCount(elemLLVM)
+		arrayType := types.NewArray(spmdType.Elem(), int64(laneCount))
+		return c.getTypeCode(arrayType)
+	}
+
 	ms := c.program.MethodSets.MethodSet(typ)
 	hasMethodSet := ms.Len() != 0
 	_, isInterface := typ.Underlying().(*types.Interface)
@@ -601,6 +611,12 @@ func getTypeCodeName(t types.Type) (string, bool) {
 			}
 		}
 		return "struct:" + "{" + strings.Join(elems, ",") + "}", isLocal
+	case *types.SPMDType:
+		// SPMD: defensive fallback — getTypeCode redirects SPMDType to array
+		// before calling getTypeCodeName, so this case should not normally be
+		// reached. Represent as the element type name to avoid a panic.
+		s, isLocal := getTypeCodeName(t.Elem())
+		return "spmd:" + s, isLocal
 	default:
 		panic("unknown type: " + t.String())
 	}
@@ -988,6 +1004,10 @@ func typestring(t types.Type) string {
 			}
 		}
 		return "struct{" + strings.Join(fields, ";") + "}"
+	case *types.SPMDType:
+		// SPMD: defensive fallback for method signature generation. Represent
+		// as the element type string so method signatures remain valid.
+		return typestring(t.Elem())
 	default:
 		panic("unknown type: " + t.String())
 	}
