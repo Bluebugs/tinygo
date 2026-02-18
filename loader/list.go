@@ -24,17 +24,10 @@ func List(config *compileopts.Config, extraArgs, pkgs []string) (*exec.Cmd, erro
 	args = append(args, pkgs...)
 	cmd := exec.Command(filepath.Join(goenv.Get("GOROOT"), "bin", "go"), args...)
 	cmd.Env = append(os.Environ(), "GOROOT="+goroot, "GOOS="+config.GOOS(), "GOARCH="+config.GOARCH(), "CGO_ENABLED=1")
-	// Always set GOEXPERIMENT explicitly: strip "spmd" which the system Go
-	// binary used for "go list" doesn't recognize, and override any inherited
+	// Always set GOEXPERIMENT explicitly to override any inherited
 	// GOEXPERIMENT from the parent process environment (via os.Environ above).
 	if exp := config.GOExperiment(); exp != "" {
-		var filtered []string
-		for _, e := range strings.Split(exp, ",") {
-			if e != "spmd" && e != "nospmd" {
-				filtered = append(filtered, e)
-			}
-		}
-		cmd.Env = append(cmd.Env, "GOEXPERIMENT="+strings.Join(filtered, ","))
+		cmd.Env = append(cmd.Env, "GOEXPERIMENT="+exp)
 	} else {
 		cmd.Env = append(cmd.Env, "GOEXPERIMENT=")
 	}
