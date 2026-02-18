@@ -3376,6 +3376,39 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 		llvmTypeTo = llvm.VectorType(llvmTypeTo, llvmTypeFrom.VectorSize())
 	}
 
+	// SPMD: handle conversions involving SPMDType before reaching the
+	// Underlying().(type) assertions and isPointer checks below. This is
+	// needed because (1) Underlying().(type) panics on *types.SPMDType, and
+	// (2) SPMDType.Underlying() delegates to the element type, so pointer
+	// conversion guards would misfire on Varying[*T] or Varying[uintptr].
+	//
+	// The recursive calls below strip the SPMD wrapper and re-enter
+	// createConvert with plain element types. The vector-widening guard at
+	// lines 3374-3377 re-fires on the recursive call (since the LLVM value
+	// is still a vector but llvmTypeTo is recomputed as scalar), ensuring
+	// lane-wise LLVM conversions (SExt, ZExt, FPExt, etc.) are produced.
+	if spmdFrom, ok := typeFrom.(*types.SPMDType); ok {
+		if spmdTo, ok := typeTo.(*types.SPMDType); ok {
+			// SPMD-to-SPMD: recurse with element types; vector-widening
+			// guard handles LLVM type consistency on re-entry.
+			return b.createConvert(spmdFrom.Elem(), spmdTo.Elem(), value, pos)
+		}
+		// SPMD-to-scalar: recurse with element type for typeFrom.
+		return b.createConvert(spmdFrom.Elem(), typeTo, value, pos)
+	}
+	if spmdTo, ok := typeTo.(*types.SPMDType); ok {
+		// Scalar-to-SPMD: convert the scalar value first, then splat to vector.
+		if value.Type().TypeKind() == llvm.VectorTypeKind {
+			return llvm.Value{}, b.makeError(pos, "internal error: scalar-to-SPMD convert received a vector value")
+		}
+		converted, err := b.createConvert(typeFrom, spmdTo.Elem(), value, pos)
+		if err != nil {
+			return llvm.Value{}, err
+		}
+		vecType := b.getLLVMType(typeTo)
+		return b.splatScalar(converted, vecType), nil
+	}
+
 	// Conversion between unsafe.Pointer and uintptr.
 	isPtrFrom := isPointer(typeFrom.Underlying())
 	isPtrTo := isPointer(typeTo.Underlying())
