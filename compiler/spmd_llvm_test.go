@@ -117,9 +117,9 @@ func TestSPMDMakeLLVMTypeVarying(t *testing.T) {
 			wantElemKind: llvm.IntegerTypeKind,
 		},
 		{
-			name:         "varying_int32_constrained",
+			name:         "varying_int32_constrained_4",
 			goType:       types.NewVaryingConstrained(types.Typ[types.Int32], 4),
-			wantLanes:    4, // WASM SIMD128 width, constraint ignored at LLVM level
+			wantLanes:    4, // constraint matches SIMD128 width
 			wantElemKind: llvm.IntegerTypeKind,
 		},
 	}
@@ -806,6 +806,18 @@ func TestSPMDMaskType(t *testing.T) {
 			},
 			wantMaskType:  true,
 			wantLaneCount: 4,
+			wantElemWidth: 1,
+		},
+		{
+			name: "constrained_varying_int32_8",
+			createSig: func() *types.Signature {
+				params := types.NewTuple(
+					types.NewVar(token.NoPos, nil, "v", types.NewVaryingConstrained(types.Typ[types.Int32], 8)),
+				)
+				return types.NewSignatureType(nil, nil, nil, params, nil, false)
+			},
+			wantMaskType:  true,
+			wantLaneCount: 8, // constraint overrides SIMD128 width (4)
 			wantElemWidth: 1,
 		},
 	}
@@ -1788,4 +1800,244 @@ func TestSPMDBroadcastMatchVectorWidth(t *testing.T) {
 			t.Errorf("expected both unchanged at 4 lanes")
 		}
 	})
+}
+
+func TestSPMDConstrainedLaneCount(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name         string
+		goType       types.Type
+		wantLanes    int
+		wantElemKind llvm.TypeKind
+	}{
+		{
+			name:         "constrained_int_4",
+			goType:       types.NewVaryingConstrained(types.Typ[types.Int32], 4),
+			wantLanes:    4, // constraint matches SIMD128 width
+			wantElemKind: llvm.IntegerTypeKind,
+		},
+		{
+			name:         "constrained_int_8",
+			goType:       types.NewVaryingConstrained(types.Typ[types.Int32], 8),
+			wantLanes:    8, // constraint exceeds SIMD128 width
+			wantElemKind: llvm.IntegerTypeKind,
+		},
+		{
+			name:         "constrained_byte_4",
+			goType:       types.NewVaryingConstrained(types.Typ[types.Byte], 4),
+			wantLanes:    4, // smaller than SIMD128 (normally 16 for byte)
+			wantElemKind: llvm.IntegerTypeKind,
+		},
+		{
+			name:         "constrained_uint16_2",
+			goType:       types.NewVaryingConstrained(types.Typ[types.Uint16], 2),
+			wantLanes:    2, // smaller than SIMD128 (normally 8 for uint16)
+			wantElemKind: llvm.IntegerTypeKind,
+		},
+		{
+			name:         "constrained_float32_8",
+			goType:       types.NewVaryingConstrained(types.Typ[types.Float32], 8),
+			wantLanes:    8, // double SIMD128 width
+			wantElemKind: llvm.FloatTypeKind,
+		},
+		{
+			name:         "unconstrained_int32",
+			goType:       types.NewVarying(types.Typ[types.Int32]),
+			wantLanes:    4, // default SIMD128 width
+			wantElemKind: llvm.IntegerTypeKind,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			llvmType := c.getLLVMType(tt.goType)
+
+			if llvmType.TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("getLLVMType(%s) TypeKind = %v, want VectorTypeKind", tt.name, llvmType.TypeKind())
+				return
+			}
+
+			gotLanes := llvmType.VectorSize()
+			if gotLanes != tt.wantLanes {
+				t.Errorf("getLLVMType(%s) VectorSize = %d, want %d", tt.name, gotLanes, tt.wantLanes)
+			}
+
+			elemType := llvmType.ElementType()
+			if elemType.TypeKind() != tt.wantElemKind {
+				t.Errorf("getLLVMType(%s) ElementType.TypeKind = %v, want %v", tt.name, elemType.TypeKind(), tt.wantElemKind)
+			}
+		})
+	}
+}
+
+func TestSPMDEffectiveLaneCount(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name      string
+		spmdType  *types.SPMDType
+		elemType  llvm.Type
+		wantLanes int
+	}{
+		{
+			name:      "unconstrained_int32",
+			spmdType:  types.NewVarying(types.Typ[types.Int32]),
+			elemType:  c.ctx.Int32Type(),
+			wantLanes: 4, // SIMD128 default
+		},
+		{
+			name:      "constrained_4",
+			spmdType:  types.NewVaryingConstrained(types.Typ[types.Int32], 4),
+			elemType:  c.ctx.Int32Type(),
+			wantLanes: 4, // constraint matches default
+		},
+		{
+			name:      "constrained_8",
+			spmdType:  types.NewVaryingConstrained(types.Typ[types.Int32], 8),
+			elemType:  c.ctx.Int32Type(),
+			wantLanes: 8, // constraint overrides default
+		},
+		{
+			name:      "constrained_2",
+			spmdType:  types.NewVaryingConstrained(types.Typ[types.Int32], 2),
+			elemType:  c.ctx.Int32Type(),
+			wantLanes: 2, // constraint overrides default
+		},
+		{
+			name:      "constrained_byte_4",
+			spmdType:  types.NewVaryingConstrained(types.Typ[types.Byte], 4),
+			elemType:  c.ctx.Int8Type(),
+			wantLanes: 4, // constraint overrides 16 (SIMD128/8bits)
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := c.spmdEffectiveLaneCount(tt.spmdType, tt.elemType)
+			if got != tt.wantLanes {
+				t.Errorf("spmdEffectiveLaneCount(%s) = %d, want %d", tt.name, got, tt.wantLanes)
+			}
+		})
+	}
+}
+
+func TestSPMDArrayToVector(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name      string
+		elemType  llvm.Type
+		laneCount int
+		vals      []uint64
+	}{
+		{
+			name:      "4xi32",
+			elemType:  c.ctx.Int32Type(),
+			laneCount: 4,
+			vals:      []uint64{10, 20, 30, 40},
+		},
+		{
+			name:      "2xi64",
+			elemType:  c.ctx.Int64Type(),
+			laneCount: 2,
+			vals:      []uint64{100, 200},
+		},
+		{
+			name:      "8xi16",
+			elemType:  c.ctx.Int16Type(),
+			laneCount: 8,
+			vals:      []uint64{1, 2, 3, 4, 5, 6, 7, 8},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build an LLVM array constant [N x T]{vals...}.
+			arrType := llvm.ArrayType(tt.elemType, tt.laneCount)
+			elts := make([]llvm.Value, tt.laneCount)
+			for i, v := range tt.vals {
+				elts[i] = llvm.ConstInt(tt.elemType, v, false)
+			}
+			arr := llvm.ConstArray(tt.elemType, elts)
+
+			// Convert to vector.
+			vecType := llvm.VectorType(tt.elemType, tt.laneCount)
+			result := b.arrayToVector(arr, vecType)
+
+			// Verify result type.
+			if result.IsNil() {
+				t.Fatal("arrayToVector returned nil")
+			}
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
+			}
+			if result.Type().VectorSize() != tt.laneCount {
+				t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), tt.laneCount)
+			}
+			if result.Type().ElementType().C != tt.elemType.C {
+				t.Error("element type mismatch")
+			}
+
+			// Verify the array input type was correct.
+			if arr.Type().TypeKind() != llvm.ArrayTypeKind {
+				t.Errorf("input type = %v, want ArrayTypeKind", arr.Type().TypeKind())
+			}
+			_ = arrType // used to verify
+		})
+	}
+}
+
+func TestSPMDConstrainedConst(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name       string
+		constValue constant.Value
+		goType     *types.SPMDType
+		wantLanes  int
+	}{
+		{
+			name:       "constrained_int32_8_const_42",
+			constValue: constant.MakeInt64(42),
+			goType:     types.NewVaryingConstrained(types.Typ[types.Int32], 8),
+			wantLanes:  8,
+		},
+		{
+			name:       "constrained_byte_4_const_7",
+			constValue: constant.MakeInt64(7),
+			goType:     types.NewVaryingConstrained(types.Typ[types.Byte], 4),
+			wantLanes:  4,
+		},
+		{
+			name:       "unconstrained_int32_const_42",
+			constValue: constant.MakeInt64(42),
+			goType:     types.NewVarying(types.Typ[types.Int32]),
+			wantLanes:  4, // SIMD128 default
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			constExpr := ssa.NewConst(tt.constValue, tt.goType)
+			result := c.createSPMDConst(constExpr, tt.goType, token.NoPos)
+
+			if result.IsNil() {
+				t.Fatal("createSPMDConst returned nil")
+			}
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
+				return
+			}
+			if result.Type().VectorSize() != tt.wantLanes {
+				t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), tt.wantLanes)
+			}
+		})
+	}
 }

@@ -501,7 +501,7 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 	case *types.SPMDType:
 		if typ.IsVarying() {
 			elemType := c.getLLVMType(typ.Elem())
-			laneCount := c.spmdLaneCount(elemType)
+			laneCount := c.spmdEffectiveLaneCount(typ, elemType)
 			return llvm.VectorType(elemType, laneCount)
 		}
 		return c.getLLVMType(typ.Elem())
@@ -716,7 +716,7 @@ func (c *compilerContext) createDIType(typ types.Type) llvm.Metadata {
 	case *types.SPMDType:
 		// SPMD vector type - represent as array in DWARF for debugger display.
 		elemDI := c.getDIType(typ.Elem())
-		laneCount := c.spmdLaneCount(c.getLLVMType(typ.Elem()))
+		laneCount := c.spmdEffectiveLaneCount(typ, c.getLLVMType(typ.Elem()))
 		return c.dibuilder.CreateArrayType(llvm.DIArrayType{
 			SizeInBits:  sizeInBytes * 8,
 			AlignInBits: uint32(c.targetData.ABITypeAlignment(llvmType)) * 8,
@@ -3397,6 +3397,14 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 		return b.createConvert(spmdFrom.Elem(), typeTo, value, pos)
 	}
 	if spmdTo, ok := typeTo.(*types.SPMDType); ok {
+		// Array-to-SPMD: convert [N]T array to <N x T> vector.
+		if value.Type().TypeKind() == llvm.ArrayTypeKind {
+			vecType := b.getLLVMType(typeTo)
+			if value.Type().ArrayLength() != vecType.VectorSize() {
+				return llvm.Value{}, b.makeError(pos, "array length does not match SPMD vector lane count")
+			}
+			return b.arrayToVector(value, vecType), nil
+		}
 		// Scalar-to-SPMD: convert the scalar value first, then splat to vector.
 		if value.Type().TypeKind() == llvm.VectorTypeKind {
 			return llvm.Value{}, b.makeError(pos, "internal error: scalar-to-SPMD convert received a vector value")

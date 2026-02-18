@@ -130,7 +130,7 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 	// redirecting here avoids adding SPMDType cases throughout this file.
 	if spmdType, ok := typ.(*types.SPMDType); ok && spmdType.IsVarying() {
 		elemLLVM := c.getLLVMType(spmdType.Elem())
-		laneCount := c.spmdLaneCount(elemLLVM)
+		laneCount := c.spmdEffectiveLaneCount(spmdType, elemLLVM)
 		arrayType := types.NewArray(spmdType.Elem(), int64(laneCount))
 		return c.getTypeCode(arrayType)
 	}

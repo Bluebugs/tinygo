@@ -282,6 +282,16 @@ func (c *compilerContext) spmdLaneCount(elemType llvm.Type) int {
 	return 16 / int(elemSize) // 128-bit SIMD
 }
 
+// spmdEffectiveLaneCount returns the lane count for an SPMDType, respecting constraints.
+// If the type has an explicit constraint (e.g., Varying[int, 8]), that value is used.
+// Otherwise, the lane count is derived from the SIMD register width.
+func (c *compilerContext) spmdEffectiveLaneCount(spmdType *types.SPMDType, elemLLVM llvm.Type) int {
+	if spmdType.IsConstrained() && spmdType.Constraint() > 0 {
+		return int(spmdType.Constraint())
+	}
+	return c.spmdLaneCount(elemLLVM)
+}
+
 // splatScalar broadcasts a scalar value to fill all lanes of a vector type.
 func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
 	undef := llvm.Undef(vecType)
@@ -289,6 +299,19 @@ func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
 	ins := b.CreateInsertElement(undef, scalar, zero, "")
 	mask := llvm.ConstNull(llvm.VectorType(b.ctx.Int32Type(), vecType.VectorSize()))
 	return b.CreateShuffleVector(ins, undef, mask, "splat")
+}
+
+// arrayToVector converts an LLVM [N x T] array value to a <N x T> vector
+// by extracting each element and inserting it into a vector.
+func (b *builder) arrayToVector(arr llvm.Value, vecType llvm.Type) llvm.Value {
+	n := vecType.VectorSize()
+	vec := llvm.Undef(vecType)
+	for i := 0; i < n; i++ {
+		elem := b.CreateExtractValue(arr, i, "")
+		idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+		vec = b.CreateInsertElement(vec, elem, idx, "")
+	}
+	return vec
 }
 
 // spmdBroadcastMatch ensures both operands have matching types for SPMD operations.
@@ -1044,9 +1067,9 @@ func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
 	for i := 0; i < params.Len(); i++ {
 		param := params.At(i)
 		if spmdType, ok := param.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
-			// Found a varying parameter. Compute lane count from its element type.
+			// Found a varying parameter. Compute lane count respecting constraints.
 			elemType := c.getLLVMType(spmdType.Elem())
-			laneCount := c.spmdLaneCount(elemType)
+			laneCount := c.spmdEffectiveLaneCount(spmdType, elemType)
 			return llvm.VectorType(c.ctx.Int1Type(), laneCount)
 		}
 	}
