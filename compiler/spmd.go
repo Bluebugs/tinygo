@@ -788,9 +788,17 @@ type spmdContiguousInfo struct {
 
 // isBlockInSPMDBody checks if a given SSA block is inside an SPMD loop body.
 // This extends beyond just rangeint.body blocks to include if.then/if.else/if.done.
+// It also returns a non-nil sentinel for SPMD function bodies (functions with varying
+// parameters but no go-for loops), where all blocks are part of the SPMD region.
 func (b *builder) isBlockInSPMDBody(block *ssa.BasicBlock) *SPMDLoopInfo {
 	if b.spmdInfo == nil {
 		return nil
+	}
+
+	// SPMD function body: all blocks belong to the SPMD region.
+	// Return a non-nil sentinel; callers only check nil vs non-nil.
+	if b.spmdFuncIsBody {
+		return &SPMDLoopInfo{}
 	}
 
 	// Check if any instruction position in the block falls inside an SPMD loop body.

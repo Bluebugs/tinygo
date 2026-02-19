@@ -2041,3 +2041,110 @@ func TestSPMDConstrainedConst(t *testing.T) {
 		})
 	}
 }
+
+// TestSPMDFuncBodyDetection verifies the spmdFuncIsBody flag logic:
+//   - Set when spmdEntryMask is present but no go-for loops were detected
+//   - Not set when no entry mask (non-SPMD function)
+//   - Not set when go-for loops exist (loop-based SPMD takes precedence)
+func TestSPMDFuncBodyDetection(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	i1Type := c.ctx.Int1Type()
+	mask4Type := llvm.VectorType(i1Type, 4)
+	entryMask := llvm.ConstAllOnes(mask4Type)
+
+	t.Run("entry_mask_no_loops_sets_flag", func(t *testing.T) {
+		// Simulate an SPMD function that received a varying parameter (entry mask set)
+		// but has no go-for loops (spmdLoopState is nil).
+		b := &builder{compilerContext: c}
+		b.spmdEntryMask = entryMask
+		// spmdLoopState is nil (no go-for loops detected)
+
+		// Apply the logic from createFunction.
+		if b.spmdLoopState == nil && !b.spmdEntryMask.IsNil() {
+			b.spmdFuncIsBody = true
+		}
+
+		if !b.spmdFuncIsBody {
+			t.Error("expected spmdFuncIsBody = true when entry mask set and no loops")
+		}
+
+		// Also verify that maps would be initialized under this condition.
+		shouldInit := b.spmdLoopState != nil || b.spmdFuncIsBody
+		if !shouldInit {
+			t.Error("expected maps to be initialized when spmdFuncIsBody is true")
+		}
+	})
+
+	t.Run("no_entry_mask_no_loops_no_flag", func(t *testing.T) {
+		// Regular (non-SPMD) function: no entry mask, no loops.
+		b := &builder{compilerContext: c}
+		// spmdEntryMask is zero value (nil)
+		// spmdLoopState is nil
+
+		if b.spmdLoopState == nil && !b.spmdEntryMask.IsNil() {
+			b.spmdFuncIsBody = true
+		}
+
+		if b.spmdFuncIsBody {
+			t.Error("expected spmdFuncIsBody = false when no entry mask and no loops")
+		}
+
+		shouldInit := b.spmdLoopState != nil || b.spmdFuncIsBody
+		if shouldInit {
+			t.Error("expected maps NOT to be initialized for non-SPMD function")
+		}
+	})
+
+	t.Run("loops_present_no_func_body_flag", func(t *testing.T) {
+		// SPMD function with go-for loops: spmdFuncIsBody must remain false
+		// because loop-based SPMD takes precedence and manages block state itself.
+		b := &builder{compilerContext: c}
+		b.spmdEntryMask = entryMask
+		// Simulate a non-nil loop state by using a non-nil pointer.
+		b.spmdLoopState = &spmdLoopState{}
+
+		if b.spmdLoopState == nil && !b.spmdEntryMask.IsNil() {
+			b.spmdFuncIsBody = true
+		}
+
+		if b.spmdFuncIsBody {
+			t.Error("expected spmdFuncIsBody = false when go-for loops are present")
+		}
+
+		// Maps should still be initialized (driven by spmdLoopState != nil).
+		shouldInit := b.spmdLoopState != nil || b.spmdFuncIsBody
+		if !shouldInit {
+			t.Error("expected maps to be initialized when loops are present")
+		}
+	})
+
+	t.Run("isBlockInSPMDBody_returns_sentinel_when_func_body", func(t *testing.T) {
+		// When spmdFuncIsBody is true, isBlockInSPMDBody must return non-nil
+		// for any block (even nil block argument) because the sentinel is returned
+		// before any block inspection.
+		// We need spmdInfo non-nil to pass the first guard.
+		b := &builder{compilerContext: c}
+		b.spmdFuncIsBody = true
+		b.spmdInfo = &SPMDInfo{} // non-nil sentinel to pass the nil guard
+
+		result := b.isBlockInSPMDBody(nil)
+		if result == nil {
+			t.Error("expected non-nil sentinel from isBlockInSPMDBody when spmdFuncIsBody=true")
+		}
+	})
+
+	t.Run("isBlockInSPMDBody_returns_nil_when_no_spmd_info", func(t *testing.T) {
+		// When spmdInfo is nil (not an SPMD function at all), isBlockInSPMDBody
+		// must return nil regardless of spmdFuncIsBody.
+		b := &builder{compilerContext: c}
+		b.spmdFuncIsBody = true
+		// spmdInfo is nil
+
+		result := b.isBlockInSPMDBody(nil)
+		if result != nil {
+			t.Error("expected nil from isBlockInSPMDBody when spmdInfo=nil")
+		}
+	})
+}

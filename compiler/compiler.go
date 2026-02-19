@@ -186,6 +186,7 @@ type builder struct {
 	spmdMaskStack         []llvm.Value                        // execution mask stack for nested varying if/else
 	spmdMaskTransitions   map[int]*spmdMaskTransition         // block index -> mask transition to apply
 	spmdContiguousPtr     map[ssa.Value]*spmdContiguousInfo   // IndexAddr SSA value -> contiguous access info
+	spmdFuncIsBody        bool                                // true if entire function body is an SPMD region (varying params, no go-for loops)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1400,8 +1401,15 @@ func (b *builder) createFunction() {
 	// SPMD: analyze loops before compiling blocks.
 	b.spmdLoopState = b.analyzeSPMDLoops()
 
+	// SPMD: if no go-for loops but this is an SPMD function with entry mask,
+	// mark the entire function body as an SPMD region so that varying if/else
+	// linearization and mask stack infrastructure are active for all blocks.
+	if b.spmdLoopState == nil && !b.spmdEntryMask.IsNil() {
+		b.spmdFuncIsBody = true
+	}
+
 	// SPMD: initialize varying if/else maps and Phase 2.8 mask tracking maps.
-	if b.spmdLoopState != nil {
+	if b.spmdLoopState != nil || b.spmdFuncIsBody {
 		b.spmdVaryingIfs = make(map[int]*spmdVaryingIf)
 		b.spmdThenExitRedirects = make(map[int]llvm.BasicBlock)
 		b.spmdMergeSelects = make(map[int]*spmdVaryingIf)
@@ -1434,6 +1442,21 @@ func (b *builder) createFunction() {
 			} else {
 				b.spmdValueOverride = nil
 				b.spmdMaskStack = nil
+			}
+		} else if b.spmdFuncIsBody {
+			// SPMD function body (varying params, no go-for loops): all blocks are
+			// part of the SPMD region. Unlike loop-based SPMD, spmdValueOverride is
+			// never cleared between blocks because there are no loop-specific SSA
+			// values (no iter phi) to scope — all overrides are function-wide.
+			if b.spmdValueOverride == nil {
+				b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
+			}
+			// Seed the mask stack with the entry mask on the first block so that
+			// spmdCurrentMask() returns a valid mask throughout the function body.
+			// The len==0 guard fires only once: mask transitions (pushThen/swapElse/pop)
+			// never fully drain the stack below the entry-mask base element.
+			if len(b.spmdMaskStack) == 0 && !b.spmdEntryMask.IsNil() {
+				b.spmdMaskStack = []llvm.Value{b.spmdEntryMask}
 			}
 		}
 
@@ -1658,7 +1681,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		blockThen := b.blockInfo[block.Succs[0].Index].entry
 		blockElse := b.blockInfo[block.Succs[1].Index].entry
 		// SPMD: linearize varying if/else (vector condition).
-		if b.spmdLoopState != nil && cond.Type().TypeKind() == llvm.VectorTypeKind {
+		if (b.spmdLoopState != nil || b.spmdFuncIsBody) && cond.Type().TypeKind() == llvm.VectorTypeKind {
 			b.spmdDetectVaryingIf(block, cond)
 			b.CreateBr(blockThen)
 		} else {
