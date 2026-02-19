@@ -436,7 +436,7 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 			return c.ctx.Int16Type()
 		case types.Int32, types.Uint32:
 			return c.ctx.Int32Type()
-		case types.Int, types.Uint:
+		case types.Int, types.Uint, types.UntypedInt:
 			return c.intType
 		case types.Int64, types.Uint64:
 			return c.ctx.Int64Type()
