@@ -187,6 +187,8 @@ type builder struct {
 	spmdMaskTransitions   map[int]*spmdMaskTransition         // block index -> mask transition to apply
 	spmdContiguousPtr     map[ssa.Value]*spmdContiguousInfo   // IndexAddr SSA value -> contiguous access info
 	spmdFuncIsBody        bool                                // true if entire function body is an SPMD region (varying params, no go-for loops)
+	spmdForLoops          map[int]*spmdForLoopInfo            // body block index -> for-loop info (SPMD func body only)
+	spmdBreakRedirects    map[int]spmdBreakRedirect           // then-block index -> break redirect info
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1408,6 +1410,30 @@ func (b *builder) createFunction() {
 		b.spmdFuncIsBody = true
 	}
 
+	// SPMD: detect regular for loops in SPMD function bodies (for break mask tracking).
+	if b.spmdFuncIsBody {
+		b.spmdForLoops = b.detectSPMDForLoops()
+		if b.spmdForLoops != nil {
+			// Initialize break mask allocas to all-false.
+			savedBlock := b.GetInsertBlock()
+			for _, loop := range b.spmdForLoops {
+				if !loop.breakMaskAlloca.IsNil() {
+					maskType := llvm.VectorType(b.ctx.Int1Type(), loop.laneCount)
+					zeroMask := llvm.ConstNull(maskType)
+					b.SetInsertPointBefore(loop.breakMaskAlloca)
+					insertAfterAlloca := llvm.NextInstruction(loop.breakMaskAlloca)
+					if !insertAfterAlloca.IsNil() {
+						b.SetInsertPointBefore(insertAfterAlloca)
+					}
+					b.CreateStore(zeroMask, loop.breakMaskAlloca)
+				}
+			}
+			if !savedBlock.IsNil() {
+				b.SetInsertPointAtEnd(savedBlock)
+			}
+		}
+	}
+
 	// SPMD: initialize varying if/else maps and Phase 2.8 mask tracking maps.
 	if b.spmdLoopState != nil || b.spmdFuncIsBody {
 		b.spmdVaryingIfs = make(map[int]*spmdVaryingIf)
@@ -1415,6 +1441,7 @@ func (b *builder) createFunction() {
 		b.spmdMergeSelects = make(map[int]*spmdVaryingIf)
 		b.spmdMaskTransitions = make(map[int]*spmdMaskTransition)
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
+		b.spmdBreakRedirects = make(map[int]spmdBreakRedirect)
 	}
 
 	// Fill blocks with instructions.
@@ -1457,6 +1484,36 @@ func (b *builder) createFunction() {
 			// never fully drain the stack below the entry-mask base element.
 			if len(b.spmdMaskStack) == 0 && !b.spmdEntryMask.IsNil() {
 				b.spmdMaskStack = []llvm.Value{b.spmdEntryMask}
+			}
+		}
+
+		// SPMD: handle loop body entry mask computation (for regular for loops in SPMD function bodies).
+		if b.spmdForLoops != nil {
+			if loopInfo, ok := b.spmdForLoops[block.Index]; ok {
+				// Load break mask and compute active mask for this iteration.
+				maskType := llvm.VectorType(b.ctx.Int1Type(), loopInfo.laneCount)
+				breakMask := b.CreateLoad(maskType, loopInfo.breakMaskAlloca, "break.mask")
+				notBreak := b.CreateNot(breakMask, "not.break")
+
+				// Get the current mask (top of stack). This respects any enclosing
+				// varying-if context, not just the function entry mask.
+				var entryMask llvm.Value
+				if parentMask := b.spmdCurrentMask(); !parentMask.IsNil() {
+					entryMask = parentMask
+				} else if !b.spmdEntryMask.IsNil() {
+					entryMask = b.spmdEntryMask
+				} else {
+					entryMask = llvm.ConstAllOnes(maskType)
+				}
+
+				activeMask := b.CreateAnd(entryMask, notBreak, "spmd.active.mask")
+
+				// Set as the base mask (replace spmdMaskStack[0]).
+				if len(b.spmdMaskStack) > 0 {
+					b.spmdMaskStack[0] = activeMask
+				} else {
+					b.spmdMaskStack = []llvm.Value{activeMask}
+				}
 			}
 		}
 
@@ -1680,6 +1737,32 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		block := instr.Block()
 		blockThen := b.blockInfo[block.Succs[0].Index].entry
 		blockElse := b.blockInfo[block.Succs[1].Index].entry
+		// SPMD: check for varying break pattern before general linearization.
+		if b.spmdFuncIsBody && cond.Type().TypeKind() == llvm.VectorTypeKind {
+			if loopInfo, isBreak := b.spmdIsVaryingBreak(block); isBreak {
+				// Varying break pattern: if diverged { break }
+				// Don't linearize normally — handle with break mask accumulation.
+
+				// Register mask transition for the then-block (break code).
+				thenEntry := block.Succs[0]
+				b.spmdMaskTransitions[thenEntry.Index] = &spmdMaskTransition{kind: "pushThen", cond: cond}
+
+				// Register redirect: then-block's Jump to rangeint.done → else-block (if.done)
+				elseEntry := block.Succs[1] // if.done — the continuation block
+				b.spmdBreakRedirects[thenEntry.Index] = spmdBreakRedirect{
+					loop:   loopInfo,
+					cond:   cond,
+					target: b.blockInfo[elseEntry.Index].entry,
+				}
+
+				// Pop at else-block entry (restores parent mask after then-block's break code)
+				b.spmdMaskTransitions[elseEntry.Index] = &spmdMaskTransition{kind: "pop"}
+
+				// Emit unconditional branch to then-block (linearization — both paths execute)
+				b.CreateBr(blockThen)
+				break
+			}
+		}
 		// SPMD: linearize varying if/else (vector condition).
 		if (b.spmdLoopState != nil || b.spmdFuncIsBody) && cond.Type().TypeKind() == llvm.VectorTypeKind {
 			b.spmdDetectVaryingIf(block, cond)
@@ -1688,7 +1771,20 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			b.CreateCondBr(cond, blockThen, blockElse)
 		}
 	case *ssa.Jump:
-		if target, ok := b.spmdShouldRedirectJump(instr.Block()); ok {
+		// SPMD: check for break redirect first.
+		if redir, ok := b.spmdBreakRedirects[instr.Block().Index]; ok {
+			// This is a break redirect: accumulate break mask and redirect to continuation.
+			mask := b.spmdCurrentMask() // the then-mask (lanes that are breaking)
+
+			// Load current break mask, OR with breaking lanes, store back.
+			maskType := llvm.VectorType(b.ctx.Int1Type(), redir.loop.laneCount)
+			currentBreak := b.CreateLoad(maskType, redir.loop.breakMaskAlloca, "break.mask.cur")
+			newBreak := b.CreateOr(currentBreak, mask, "break.mask.new")
+			b.CreateStore(newBreak, redir.loop.breakMaskAlloca)
+
+			// Redirect to continuation (else) block instead of rangeint.done.
+			b.CreateBr(redir.target)
+		} else if target, ok := b.spmdShouldRedirectJump(instr.Block()); ok {
 			b.CreateBr(target)
 		} else {
 			blockJump := b.blockInfo[instr.Block().Succs[0].Index].entry

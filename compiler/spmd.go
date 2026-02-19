@@ -1522,6 +1522,22 @@ func (b *builder) spmdMaskedScatter(val, ptrs, mask llvm.Value) {
 	b.createCall(fnType, fn, []llvm.Value{val, ptrs, align, mask}, "")
 }
 
+// spmdForLoopInfo tracks a regular for-range loop inside an SPMD function body.
+type spmdForLoopInfo struct {
+	loopBlockIndex  int        // rangeint.loop block index
+	bodyBlockIndex  int        // rangeint.body block index
+	doneBlockIndex  int        // rangeint.done block index
+	breakMaskAlloca llvm.Value // alloca for <N x i1> break mask (persists across iterations)
+	laneCount       int        // SIMD lane count
+}
+
+// spmdBreakRedirect tracks a varying if statement where the then-branch breaks from a loop.
+type spmdBreakRedirect struct {
+	loop   *spmdForLoopInfo
+	cond   llvm.Value      // the varying condition
+	target llvm.BasicBlock // where to redirect (else/continuation block)
+}
+
 // spmdContiguousIndexAddr handles IndexAddr for contiguous SPMD access.
 // Returns a scalar pointer to the base element (for subsequent vector load/store via spmdMaskedLoad/Store).
 // Returns an error if the container type is not supported for contiguous access.
@@ -1557,4 +1573,148 @@ func (b *builder) spmdContiguousIndexAddr(expr *ssa.IndexAddr, loop *spmdActiveL
 		b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop}
 	}
 	return ptr, nil
+}
+
+// detectSPMDForLoops scans for regular for-range loops (rangeint pattern) in an
+// SPMD function body. These loops need break mask tracking when they contain
+// varying if statements with break.
+func (b *builder) detectSPMDForLoops() map[int]*spmdForLoopInfo {
+	if !b.spmdFuncIsBody {
+		return nil
+	}
+
+	result := make(map[int]*spmdForLoopInfo)
+
+	// Scan all blocks for rangeint.body blocks (regular for loops in SPMD function bodies).
+	for _, block := range b.fn.Blocks {
+		if block.Comment != "rangeint.body" {
+			continue
+		}
+
+		// Find the rangeint.loop predecessor.
+		var loopBlock *ssa.BasicBlock
+		for _, pred := range block.Preds {
+			if pred.Comment == "rangeint.loop" {
+				loopBlock = pred
+				break
+			}
+		}
+		if loopBlock == nil {
+			// Not a standard rangeint pattern, skip.
+			continue
+		}
+
+		// Check if this is inside an SPMD go-for loop. If it is, skip it —
+		// SPMD go-for loops are handled by analyzeSPMDLoops(), not here.
+		// We only handle regular for loops in SPMD function bodies.
+		insideSPMDGoFor := false
+		for _, instr := range block.Instrs {
+			if pos := instr.Pos(); pos.IsValid() {
+				if b.isInSPMDLoop(pos) != nil {
+					insideSPMDGoFor = true
+					break
+				}
+			}
+		}
+		if insideSPMDGoFor {
+			continue
+		}
+
+		// Find the rangeint.done block: it's the other successor of loopBlock.
+		var doneBlock *ssa.BasicBlock
+		for _, succ := range loopBlock.Succs {
+			if succ != block {
+				doneBlock = succ
+				break
+			}
+		}
+		if doneBlock == nil {
+			continue
+		}
+
+		// Determine lane count from the loop's iteration variable type.
+		// Find the iter phi in the body block.
+		var iterPhi *ssa.Phi
+		for _, instr := range block.Instrs {
+			if phi, ok := instr.(*ssa.Phi); ok && phi.Comment == "rangeint.iter" {
+				iterPhi = phi
+				break
+			}
+		}
+		if iterPhi == nil {
+			continue
+		}
+
+		elemType := b.getLLVMType(iterPhi.Type())
+		laneCount := b.spmdLaneCount(elemType)
+
+		// Create alloca for the break mask at the function entry block.
+		// We'll initialize it to all-false later in createFunction().
+		maskType := llvm.VectorType(b.ctx.Int1Type(), laneCount)
+
+		// Save current insert point, create alloca at function entry.
+		savedBlock := b.GetInsertBlock()
+		entryBlock := b.llvmFn.EntryBasicBlock()
+		if !entryBlock.IsNil() {
+			// Insert at the beginning of the entry block.
+			firstInstr := entryBlock.FirstInstruction()
+			if !firstInstr.IsNil() {
+				b.SetInsertPointBefore(firstInstr)
+			} else {
+				b.SetInsertPointAtEnd(entryBlock)
+			}
+		}
+
+		breakMaskAlloca := b.CreateAlloca(maskType, "spmd.break.mask")
+
+		// Restore insert point.
+		if !savedBlock.IsNil() {
+			b.SetInsertPointAtEnd(savedBlock)
+		}
+
+		info := &spmdForLoopInfo{
+			loopBlockIndex:  loopBlock.Index,
+			bodyBlockIndex:  block.Index,
+			doneBlockIndex:  doneBlock.Index,
+			breakMaskAlloca: breakMaskAlloca,
+			laneCount:       laneCount,
+		}
+
+		result[block.Index] = info
+	}
+
+	return result
+}
+
+// spmdIsVaryingBreak checks if a varying if's then-successor jumps directly to a loop exit.
+// Returns (loopInfo, true) if this is a varying-break pattern.
+func (b *builder) spmdIsVaryingBreak(ifBlock *ssa.BasicBlock) (*spmdForLoopInfo, bool) {
+	if b.spmdForLoops == nil {
+		return nil, false
+	}
+
+	// Check if the then-branch (Succs[0]) has a single Jump instruction.
+	thenBlock := ifBlock.Succs[0]
+	if len(thenBlock.Instrs) == 0 {
+		return nil, false
+	}
+
+	lastInstr := thenBlock.Instrs[len(thenBlock.Instrs)-1]
+	if _, ok := lastInstr.(*ssa.Jump); !ok {
+		return nil, false
+	}
+
+	// Check if the Jump targets a loop done block.
+	if len(thenBlock.Succs) != 1 {
+		return nil, false
+	}
+
+	jumpTarget := thenBlock.Succs[0]
+	for _, loop := range b.spmdForLoops {
+		if jumpTarget.Index == loop.doneBlockIndex {
+			return loop, true
+		}
+	}
+
+	return nil, false
 }
