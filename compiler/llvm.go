@@ -365,7 +365,7 @@ func (c *compilerContext) createObjectLayout(t llvm.Type, pos token.Pos) llvm.Va
 func (c *compilerContext) getPointerBitmap(typ llvm.Type, pos token.Pos) *big.Int {
 	alignment := c.targetData.PrefTypeAlignment(c.dataPtrType)
 	switch typ.TypeKind() {
-	case llvm.IntegerTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind:
+	case llvm.IntegerTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind, llvm.VectorTypeKind:
 		return big.NewInt(0)
 	case llvm.PointerTypeKind:
 		return big.NewInt(1)
