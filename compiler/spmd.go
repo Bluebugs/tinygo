@@ -427,6 +427,18 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		loopBlocks:  make(map[int]*spmdActiveLoop),
 	}
 
+	// seenLoopInfo tracks which SPMDLoopInfo pointers have already been assigned
+	// to a body block in either pass (rangeint or rangeindex). Since go/ssa
+	// creates blocks via append in AST traversal order, the outer SPMD go for
+	// body block always has a lower index than any nested for loop body blocks.
+	// Only the first (lowest-index) body block per SPMD loop is the actual SPMD
+	// body; subsequent matches are nested regular for-range loops whose body
+	// block instructions fall positionally inside the parent SPMD loop body,
+	// causing isInSPMDLoop to return the parent's info. A single unified map
+	// handles cross-pattern nesting (rangeint outer + rangeindex inner, or
+	// vice versa).
+	seenLoopInfo := make(map[*SPMDLoopInfo]bool)
+
 	// Iterate over ALL blocks (not just DomPreorder) to find rangeint patterns.
 	for _, block := range b.fn.Blocks {
 		// Look for rangeint.body blocks.
@@ -459,6 +471,13 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		if loopInfo == nil {
 			continue
 		}
+
+		// Deduplicate: if this SPMDLoopInfo was already claimed (by either
+		// pass), the current block is a nested regular loop — skip it.
+		if seenLoopInfo[loopInfo] {
+			continue
+		}
+		seenLoopInfo[loopInfo] = true
 
 		// Find the loop block containing the increment (iterPhi + 1) and bounds check.
 		// The loop block may be:
@@ -518,7 +537,7 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		elemType := b.getLLVMType(iterPhi.Type())
 		laneCount := b.spmdLaneCount(elemType)
 
-			// Create the active loop entry.
+		// Create the active loop entry.
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
 			iterPhi:       iterPhi,
@@ -545,6 +564,10 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 	//   rangeindex.body: (no iter phi here; body uses incr from loop block)
 	//                    ptr = IndexAddr(slice, incr)
 	//                    ...
+	//
+	// Pass 2 uses the same seenLoopInfo map to handle cross-pattern nesting
+	// (e.g., rangeint outer + rangeindex inner).
+
 	for _, block := range b.fn.Blocks {
 		if block.Comment != "rangeindex.body" {
 			continue
@@ -593,6 +616,13 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			continue
 		}
 
+		// Deduplicate: if this SPMDLoopInfo was already claimed (by either
+		// pass), the current block is a nested regular loop — skip it.
+		if seenLoopInfo[loopInfo] {
+			continue
+		}
+		seenLoopInfo[loopInfo] = true
+
 		// Find the increment BinOp (loopPhi + 1) and the bounds check (incr < len) in the loop block.
 		var incrBinOp *ssa.BinOp
 		var boundValue ssa.Value
@@ -629,12 +659,12 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
-			iterPhi:       nil,  // rangeindex has no iter phi in body
+			iterPhi:       nil, // rangeindex has no iter phi in body
 			laneCount:     laneCount,
 			boundValue:    boundValue,
 			incrBinOp:     incrBinOp,
 			isRangeIndex:  true,
-			bodyIterValue: incrBinOp,  // rangeindex: body uses the incr BinOp
+			bodyIterValue: incrBinOp, // rangeindex: body uses the incr BinOp
 			initEdgeIndex: initEdgeIndex,
 		}
 
