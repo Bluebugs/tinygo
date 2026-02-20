@@ -190,6 +190,7 @@ type builder struct {
 	spmdForLoops          map[int]*spmdForLoopInfo            // body block index -> for-loop info (SPMD func body only)
 	spmdBreakRedirects    map[int]spmdBreakRedirect           // then-block index -> break redirect info
 	spmdBreakPhiOverrides map[*ssa.Phi]llvm.Value             // phi -> final value (for break result phis at rangeint.done)
+	spmdMergePhiOverrides map[*ssa.Phi]spmdMergePhiOverride   // phi -> override info (for multi-predecessor merge phis)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1479,6 +1480,13 @@ func (b *builder) createFunction() {
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
 		b.spmdBreakRedirects = make(map[int]spmdBreakRedirect)
 		b.spmdBreakPhiOverrides = make(map[*ssa.Phi]llvm.Value)
+		b.spmdMergePhiOverrides = make(map[*ssa.Phi]spmdMergePhiOverride)
+
+		// SPMD: pre-detect varying ifs before compiling blocks.
+		// This is necessary so that phis at merge blocks can be converted to
+		// selects when they're compiled. Without this, phis would be compiled
+		// before spmdMergeSelects is populated.
+		b.preDetectVaryingIfs()
 	}
 
 	// Fill blocks with instructions.
@@ -1684,6 +1692,45 @@ func (b *builder) createFunction() {
 			}
 			if skipEdge {
 				continue
+			}
+
+			// SPMD: handle multi-predecessor merge phi overrides.
+			if override, ok := b.spmdMergePhiOverrides[phi.ssa]; ok {
+				if i == override.thenEdgeIdx {
+					continue // skip then-edge — merged into selected value at else-edge
+				}
+				if i == override.elseEdgeIdx {
+					// Create select in the else-exit block, just before its terminator.
+					// We can't put it in the loop header (phi's block) because the then/else
+					// values are defined in blocks that come after the loop header in the CFG,
+					// and LLVM requires instructions to dominate all their uses.
+					elseExitBB := override.llvmBlock
+					elseExitTerm := elseExitBB.LastInstruction()
+					if !elseExitTerm.IsNil() {
+						b.SetInsertPointBefore(elseExitTerm)
+					} else {
+						b.SetInsertPointAtEnd(elseExitBB)
+					}
+
+					// Create select for the then/else pair.
+					thenValue := b.getValue(phi.ssa.Edges[override.thenEdgeIdx], getPos(phi.ssa))
+					elseValue := b.getValue(phi.ssa.Edges[override.elseEdgeIdx], getPos(phi.ssa))
+					thenValue, elseValue = b.spmdBroadcastMatch(thenValue, elseValue)
+
+					// Use masked select (handles WASM i32 masks).
+					thenIsVec := thenValue.Type().TypeKind() == llvm.VectorTypeKind
+					elseIsVec := elseValue.Type().TypeKind() == llvm.VectorTypeKind
+					var selected llvm.Value
+					if thenIsVec || elseIsVec {
+						selected = b.spmdMaskSelect(override.info.cond, thenValue, elseValue)
+					} else {
+						scalarCond := b.spmdVectorAnyTrue(override.info.cond)
+						selected = b.CreateSelect(scalarCond, thenValue, elseValue, "")
+					}
+
+					phi.llvm.AddIncoming([]llvm.Value{selected}, []llvm.BasicBlock{elseExitBB})
+					continue
+				}
 			}
 
 			llvmVal := b.getValue(edge, getPos(phi.ssa))
@@ -1925,6 +1972,12 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		} else if target, ok := b.spmdShouldRedirectJump(instr.Block()); ok {
 			b.CreateBr(target)
 		} else {
+			// SPMD: pop mask stack before jumping to a loop-header merge.
+			// This handles varying if/else inside loops where the merge is the
+			// loop header — the pop can't be at the merge block entry.
+			if b.spmdShouldPopBeforeJump(instr.Block()) {
+				b.spmdPopMask()
+			}
 			blockJump := b.blockInfo[instr.Block().Succs[0].Index].entry
 			b.CreateBr(blockJump)
 		}

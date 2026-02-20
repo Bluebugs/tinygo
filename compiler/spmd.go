@@ -794,6 +794,18 @@ type spmdVaryingIf struct {
 	hasElse        bool       // true if then/else are distinct from merge
 }
 
+// spmdMergePhiOverride tracks a phi at a multi-predecessor merge block
+// where a then/else pair of edges has been combined via select.
+// This handles cases like varying if/else inside loop bodies where the merge
+// is the loop header with 3+ predecessors (entry, then-exit, else-exit).
+// The select is created during phi resolution, not during phi creation.
+type spmdMergePhiOverride struct {
+	thenEdgeIdx int           // phi edge index for the then-branch
+	elseEdgeIdx int           // phi edge index for the else-branch
+	info        *spmdVaryingIf // varying if info (for condition)
+	llvmBlock   llvm.BasicBlock // LLVM block to use as predecessor for the selected value
+}
+
 // spmdMaskTransition describes how the execution mask changes at a block boundary.
 type spmdMaskTransition struct {
 	kind string     // "pushThen", "swapElse", "pop"
@@ -846,15 +858,43 @@ func (b *builder) isBlockInSPMDBody(block *ssa.BasicBlock) *SPMDLoopInfo {
 	return nil
 }
 
-// spmdDetectVaryingIf detects and analyzes a varying if/else construct at ifBlock.
-// The condition is a vector (<N x i1>), so both branches must execute for their
-// respective lanes. Populates spmdVaryingIfs, spmdThenExitRedirects, and spmdMergeSelects.
-func (b *builder) spmdDetectVaryingIf(ifBlock *ssa.BasicBlock, cond llvm.Value) {
+// preDetectVaryingIfs scans all blocks in the function for If instructions
+// with varying conditions and calls spmdAnalyzeVaryingIf to populate the
+// spmdMergeSelects map. This must be done before compiling blocks so that
+// phis at merge blocks can be converted to selects.
+func (b *builder) preDetectVaryingIfs() {
+	for _, block := range b.fn.Blocks {
+		// Check if block is in SPMD context using the same logic as isBlockInSPMDBody.
+		if b.isBlockInSPMDBody(block) == nil {
+			continue
+		}
+
+		// Check if last instruction is an If.
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If)
+		if !ok {
+			continue
+		}
+
+		// Check if condition is varying (SPMDType).
+		if _, ok := ifInstr.Cond.Type().(*types.SPMDType); ok {
+			b.spmdAnalyzeVaryingIf(block)
+		}
+	}
+}
+
+// spmdAnalyzeVaryingIf analyzes a varying if/else construct at ifBlock and populates
+// spmdVaryingIfs, spmdThenExitRedirects, and spmdMergeSelects maps. This is the
+// analysis-only version called during pre-detection. The condition LLVM value will
+// be filled in later when the If instruction is actually compiled.
+func (b *builder) spmdAnalyzeVaryingIf(ifBlock *ssa.BasicBlock) {
 	thenEntry := ifBlock.Succs[0]
 	elseEntry := ifBlock.Succs[1]
 
 	// Find the merge block (common successor).
-	merge := b.spmdFindMerge(thenEntry, elseEntry)
+	merge := b.spmdFindMerge(ifBlock, thenEntry, elseEntry)
 	if merge == nil {
 		// No merge found (possibly unreachable code or exit branches).
 		return
@@ -865,7 +905,7 @@ func (b *builder) spmdDetectVaryingIf(ifBlock *ssa.BasicBlock, cond llvm.Value) 
 	hasElse := (elseEntry != merge)
 
 	info := &spmdVaryingIf{
-		cond:           cond,
+		cond:           llvm.Value{}, // Will be filled in during compilation
 		ifBlockIndex:   ifBlock.Index,
 		thenEntryIndex: thenEntry.Index,
 		elseEntryIndex: elseEntry.Index,
@@ -878,7 +918,58 @@ func (b *builder) spmdDetectVaryingIf(ifBlock *ssa.BasicBlock, cond llvm.Value) 
 	b.spmdMergeSelects[merge.Index] = info
 
 	if hasElse {
-		// For if-with-else: redirect then-exit blocks to else-entry.
+		// For if-with-else: record that then-exit blocks need to be redirected.
+		// We'll populate the LLVM blocks later during compilation.
+		// For now, just find the then-exit blocks.
+		_ = b.spmdFindThenExits(thenEntry, merge)
+	}
+
+	// Record mask transitions for block-level mask stack management.
+	if b.spmdMaskTransitions != nil {
+		// Condition will be filled in during compilation.
+		b.spmdMaskTransitions[thenEntry.Index] = &spmdMaskTransition{kind: "pushThen", cond: llvm.Value{}}
+		if hasElse {
+			b.spmdMaskTransitions[elseEntry.Index] = &spmdMaskTransition{kind: "swapElse", cond: llvm.Value{}}
+		}
+		// When merge is a loop header, don't register "pop" at merge (it would
+		// fire on every loop iteration, including from the entry edge). Instead,
+		// mark the varying-if info so the Jump handler pops the mask when jumping
+		// from the else-exit to the loop header.
+		isLoopHeader := false
+		if b.spmdLoopState != nil {
+			_, isLoopHeader = b.spmdLoopState.loopBlocks[merge.Index]
+		}
+		if !isLoopHeader {
+			b.spmdMaskTransitions[merge.Index] = &spmdMaskTransition{kind: "pop"}
+		}
+		// For loop-header merges, the pop is handled by spmdShouldPopBeforeJump.
+	}
+}
+
+// spmdDetectVaryingIf detects and analyzes a varying if/else construct at ifBlock.
+// The condition is a vector (<N x i1>), so both branches must execute for their
+// respective lanes. Updates the pre-detected info with the actual LLVM condition value
+// and creates the then-exit redirects.
+func (b *builder) spmdDetectVaryingIf(ifBlock *ssa.BasicBlock, cond llvm.Value) {
+	// Look up the pre-detected info.
+	info, ok := b.spmdVaryingIfs[ifBlock.Index]
+	if !ok {
+		// Not pre-detected (shouldn't happen, but handle gracefully).
+		b.spmdAnalyzeVaryingIf(ifBlock)
+		info = b.spmdVaryingIfs[ifBlock.Index]
+		if info == nil {
+			return
+		}
+	}
+
+	// Fill in the LLVM condition.
+	info.cond = cond
+
+	// Fill in LLVM blocks for then-exit redirects.
+	if info.hasElse {
+		thenEntry := b.fn.Blocks[info.thenEntryIndex]
+		elseEntry := b.fn.Blocks[info.elseEntryIndex]
+		merge := b.fn.Blocks[info.mergeIndex]
 		thenExits := b.spmdFindThenExits(thenEntry, merge)
 		elseLLVMBlock := b.blockInfo[elseEntry.Index].entry
 		for _, exitBlock := range thenExits {
@@ -886,30 +977,34 @@ func (b *builder) spmdDetectVaryingIf(ifBlock *ssa.BasicBlock, cond llvm.Value) 
 		}
 	}
 
-	// Record mask transitions for block-level mask stack management.
+	// Update mask transitions with actual condition.
 	if b.spmdMaskTransitions != nil {
-		b.spmdMaskTransitions[thenEntry.Index] = &spmdMaskTransition{kind: "pushThen", cond: cond}
-		if hasElse {
-			b.spmdMaskTransitions[elseEntry.Index] = &spmdMaskTransition{kind: "swapElse", cond: cond}
+		if trans, ok := b.spmdMaskTransitions[info.thenEntryIndex]; ok {
+			trans.cond = cond
 		}
-		b.spmdMaskTransitions[merge.Index] = &spmdMaskTransition{kind: "pop"}
+		if info.hasElse {
+			if trans, ok := b.spmdMaskTransitions[info.elseEntryIndex]; ok {
+				trans.cond = cond
+			}
+		}
 	}
 }
 
 // spmdFindMerge finds the merge block (common successor) of then and else branches.
-// Uses a simple approach: walk from thenEntry through Jump successors until finding
-// a block that is also reachable from elseEntry.
-func (b *builder) spmdFindMerge(thenEntry, elseEntry *ssa.BasicBlock) *ssa.BasicBlock {
+// Uses ifBlock as a barrier to prevent DFS from following loop back-edges through the if-block.
+// This is critical for varying if/else inside loop bodies where both branches jump back to
+// the loop header: without the barrier, we'd incorrectly detect else-entry as the merge.
+func (b *builder) spmdFindMerge(ifBlock, thenEntry, elseEntry *ssa.BasicBlock) *ssa.BasicBlock {
 	// Handle if-without-else: elseEntry itself is the merge.
-	if b.spmdIsReachableFrom(thenEntry, elseEntry, nil) {
+	if b.spmdIsReachableFrom(thenEntry, elseEntry, ifBlock) {
 		return elseEntry
 	}
 
-	// Build reachable set from thenEntry (excluding elseEntry subtree).
+	// Build reachable set from thenEntry (excluding elseEntry subtree and ifBlock barrier).
 	visited := make(map[int]bool)
 	var walkThen func(*ssa.BasicBlock)
 	walkThen = func(block *ssa.BasicBlock) {
-		if visited[block.Index] || block == elseEntry {
+		if visited[block.Index] || block == elseEntry || block == ifBlock {
 			return
 		}
 		visited[block.Index] = true
@@ -920,10 +1015,11 @@ func (b *builder) spmdFindMerge(thenEntry, elseEntry *ssa.BasicBlock) *ssa.Basic
 	walkThen(thenEntry)
 
 	// Find first block reachable from elseEntry that's also in thenEntry's reachable set.
+	// Use ifBlock as barrier to prevent walking back through it.
 	var findIntersection func(*ssa.BasicBlock) *ssa.BasicBlock
 	elseVisited := make(map[int]bool)
 	findIntersection = func(block *ssa.BasicBlock) *ssa.BasicBlock {
-		if elseVisited[block.Index] {
+		if elseVisited[block.Index] || block == ifBlock {
 			return nil
 		}
 		elseVisited[block.Index] = true
@@ -976,6 +1072,29 @@ func (b *builder) spmdFindThenExits(thenEntry, merge *ssa.BasicBlock) []*ssa.Bas
 	return exits
 }
 
+// spmdShouldPopBeforeJump checks if a Jump from this block needs to pop the mask
+// stack before branching. This handles the case where a varying if/else inside a
+// loop has the loop header as its merge: the "pop" can't be at the merge (it would
+// fire on every loop entry), so instead the else-exit block pops before jumping.
+func (b *builder) spmdShouldPopBeforeJump(block *ssa.BasicBlock) bool {
+	if b.spmdMergeSelects == nil || b.spmdLoopState == nil {
+		return false
+	}
+	// Check if this block's Jump target is a merge block that's also a loop header.
+	if len(block.Succs) != 1 {
+		return false
+	}
+	target := block.Succs[0]
+	if _, isMerge := b.spmdMergeSelects[target.Index]; !isMerge {
+		return false
+	}
+	if _, isLoop := b.spmdLoopState.loopBlocks[target.Index]; !isLoop {
+		return false
+	}
+	// This block is an else-exit jumping to a loop-header merge. Pop before jump.
+	return true
+}
+
 // spmdShouldRedirectJump checks if a Jump instruction at the given block should
 // be redirected to the else-entry (for then-exit blocks in if-with-else).
 // Returns (elseLLVMBlock, true) if redirect is needed, (zero, false) otherwise.
@@ -1000,8 +1119,14 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 		return llvm.Value{}, false
 	}
 
-	// Phi must have exactly 2 edges for merge.
+	// Phi must have exactly 2 edges for standard merge.
 	if len(phi.Edges) != 2 {
+		// Multi-predecessor merge (e.g., loop header with if/else back-edges).
+		// Find the then and else edge indices, merge them with select,
+		// and let the remaining edges go through normal phi resolution.
+		if len(phi.Edges) > 2 && info.hasElse {
+			return b.spmdCreateMultiPredMergeSelect(phi, info)
+		}
 		return llvm.Value{}, false
 	}
 
@@ -1063,6 +1188,56 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 	// uniform variables, so both edges carry the same value in practice.
 	scalarCond := b.spmdVectorAnyTrue(info.cond)
 	return b.CreateSelect(scalarCond, thenValue, elseValue, ""), true
+}
+
+// spmdCreateMultiPredMergeSelect handles phis at merge blocks with >2 predecessors,
+// such as loop headers where an if/else merges back along with the entry edge.
+// It creates an LLVM phi and records override info so that phi resolution can
+// create the select and add edges properly. The select creation is deferred until
+// phi resolution to avoid circular dependencies when edge values reference the phi itself.
+func (b *builder) spmdCreateMultiPredMergeSelect(phi *ssa.Phi, info *spmdVaryingIf) (llvm.Value, bool) {
+	block := phi.Block()
+	preds := block.Preds
+
+	// Find then and else edge indices by checking reachability.
+	thenEntry := b.fn.Blocks[info.thenEntryIndex]
+	elseEntry := b.fn.Blocks[info.elseEntryIndex]
+	thenIdx := -1
+	elseIdx := -1
+
+	for i, pred := range preds {
+		if pred.Index == info.thenEntryIndex || b.spmdIsReachableFrom(thenEntry, pred, block) {
+			if thenIdx < 0 {
+				thenIdx = i
+			}
+		}
+		if pred.Index == info.elseEntryIndex || b.spmdIsReachableFrom(elseEntry, pred, block) {
+			if elseIdx < 0 {
+				elseIdx = i
+			}
+		}
+	}
+
+	if thenIdx < 0 || elseIdx < 0 {
+		return llvm.Value{}, false
+	}
+
+	// Create LLVM phi for normal resolution of non-then/else edges.
+	phiType := b.getLLVMType(phi.Type())
+	llvmPhi := b.CreatePHI(phiType, "")
+	b.phis = append(b.phis, phiNode{phi, llvmPhi})
+
+	// Record override: during phi resolution, skip then-edge and replace else-edge
+	// with a select(cond, thenVal, elseVal). Use the else-block's LLVM exit as the
+	// predecessor because after linearization, if.then jumps to if.else.
+	b.spmdMergePhiOverrides[phi] = spmdMergePhiOverride{
+		thenEdgeIdx: thenIdx,
+		elseEdgeIdx: elseIdx,
+		info:        info,
+		llvmBlock:   b.blockInfo[preds[elseIdx].Index].exit,
+	}
+
+	return llvmPhi, true
 }
 
 // spmdVectorAnyTrue reduces an SPMD mask vector to a scalar i1.
