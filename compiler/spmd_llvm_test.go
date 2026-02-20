@@ -551,6 +551,8 @@ func TestSPMDVectorAnyTrue(t *testing.T) {
 
 	// The test context is WASM, so masks use the <N x i32> format where
 	// all-ones (0xFFFFFFFF) means active and all-zeros means inactive.
+	// On WASM, spmdVectorAnyTrue uses the native @llvm.wasm.anytrue intrinsic
+	// (v128.any_true) and still returns a scalar i1.
 	maskElemType := c.spmdMaskElemType() // i32 on WASM
 	allOnes := llvm.ConstAllOnes(maskElemType)
 	allZeros := llvm.ConstNull(maskElemType)
@@ -2370,6 +2372,8 @@ func TestSPMDVectorAllTrue(t *testing.T) {
 
 	// The test context is WASM, so masks use the <N x i32> format where
 	// all-ones (0xFFFFFFFF) means active and all-zeros means inactive.
+	// On WASM, spmdVectorAllTrue uses the native @llvm.wasm.alltrue intrinsic
+	// (i32x4.all_true) and still returns a scalar i1.
 	maskType := llvm.VectorType(c.spmdMaskElemType(), 4) // <4 x i32> on WASM
 
 	t.Run("all_true", func(t *testing.T) {
@@ -2537,7 +2541,8 @@ func TestSPMDMaskSelectWASM(t *testing.T) {
 }
 
 // TestSPMDVectorAnyTrueWASM verifies that spmdVectorAnyTrue handles <N x i32> masks
-// (WASM format) by bitcasting to i128 and comparing != 0.
+// (WASM format) by calling the @llvm.wasm.anytrue intrinsic (v128.any_true)
+// and comparing the i32 result != 0, returning a scalar i1.
 func TestSPMDVectorAnyTrueWASM(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
@@ -2584,6 +2589,76 @@ func TestSPMDNormalizeBoolVecToI1(t *testing.T) {
 	}
 	if i1Vec.Type().ElementType().IntTypeWidth() != 1 {
 		t.Errorf("i1Vec elem width = %d, want 1", i1Vec.Type().ElementType().IntTypeWidth())
+	}
+}
+
+// TestSPMDWasmAnyTrueIntrinsic verifies that spmdWasmAnyTrue calls @llvm.wasm.anytrue
+// and returns an i32. Also checks the intrinsic declaration is present in the module.
+func TestSPMDWasmAnyTrueIntrinsic(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	// Build a <4 x i32> mask (WASM format, all-ones = all active).
+	maskType := llvm.VectorType(c.ctx.Int32Type(), laneCount)
+	mask := llvm.ConstAllOnes(maskType)
+
+	// Call the helper — it should return i32.
+	result := b.spmdWasmAnyTrue(mask)
+
+	if result.IsNil() {
+		t.Fatal("spmdWasmAnyTrue returned nil")
+	}
+	if result.Type().TypeKind() != llvm.IntegerTypeKind {
+		t.Fatalf("spmdWasmAnyTrue result type kind = %v, want IntegerTypeKind",
+			result.Type().TypeKind())
+	}
+	if result.Type().IntTypeWidth() != 32 {
+		t.Errorf("spmdWasmAnyTrue result width = %d, want 32 (i32)", result.Type().IntTypeWidth())
+	}
+
+	// The @llvm.wasm.anytrue.v4i32 intrinsic must now be present in the module.
+	intrinsicName := "llvm.wasm.anytrue.v4i32"
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		t.Errorf("intrinsic %q not found in module after spmdWasmAnyTrue call", intrinsicName)
+	}
+}
+
+// TestSPMDWasmAllTrueIntrinsic verifies that spmdWasmAllTrue calls @llvm.wasm.alltrue
+// and returns an i32. Also checks the intrinsic declaration is present in the module.
+func TestSPMDWasmAllTrueIntrinsic(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	// Build a <4 x i32> mask (WASM format, all-ones = all active).
+	maskType := llvm.VectorType(c.ctx.Int32Type(), laneCount)
+	mask := llvm.ConstAllOnes(maskType)
+
+	// Call the helper — it should return i32.
+	result := b.spmdWasmAllTrue(mask)
+
+	if result.IsNil() {
+		t.Fatal("spmdWasmAllTrue returned nil")
+	}
+	if result.Type().TypeKind() != llvm.IntegerTypeKind {
+		t.Fatalf("spmdWasmAllTrue result type kind = %v, want IntegerTypeKind",
+			result.Type().TypeKind())
+	}
+	if result.Type().IntTypeWidth() != 32 {
+		t.Errorf("spmdWasmAllTrue result width = %d, want 32 (i32)", result.Type().IntTypeWidth())
+	}
+
+	// The @llvm.wasm.alltrue.v4i32 intrinsic must now be present in the module.
+	intrinsicName := "llvm.wasm.alltrue.v4i32"
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		t.Errorf("intrinsic %q not found in module after spmdWasmAllTrue call", intrinsicName)
 	}
 }
 

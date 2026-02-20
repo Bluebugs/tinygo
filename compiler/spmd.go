@@ -1050,39 +1050,72 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 
 // spmdVectorAnyTrue reduces an SPMD mask vector to a scalar i1.
 // Returns true if any lane is active.
-// On WASM the mask is <N x i32> (all-ones/all-zeros), so we bitcast to i128
-// (4 × 32 bits) and compare != 0.
+// On WASM targets, uses the native v128.any_true instruction via the
+// @llvm.wasm.anytrue LLVM intrinsic (single WASM instruction, no bitcast).
 // On other targets the mask is <N x i1>, so we bitcast to iN and compare != 0.
 func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
-	vecSize := mask.Type().VectorSize()
-	var intType llvm.Type
 	if b.spmdIsWASM() {
-		// <4 x i32> → i128 (N lanes × 32 bits each)
-		intType = b.ctx.IntType(vecSize * 32)
-	} else {
-		// <N x i1> → iN
-		intType = b.ctx.IntType(vecSize)
+		// Use native WASM v128.any_true instruction.
+		i32Result := b.spmdWasmAnyTrue(mask)
+		zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+		return b.CreateICmp(llvm.IntNE, i32Result, zero, "")
 	}
+	// Non-WASM: <N x i1> → iN bitcast, compare != 0.
+	vecSize := mask.Type().VectorSize()
+	intType := b.ctx.IntType(vecSize)
 	intVal := b.CreateBitCast(mask, intType, "")
 	zero := llvm.ConstNull(intType)
 	return b.CreateICmp(llvm.IntNE, intVal, zero, "")
 }
 
 // spmdVectorAllTrue reduces an SPMD mask vector to a scalar i1.
-// Returns true if all lanes are active (complement of spmdVectorAnyTrue).
-// On WASM the mask is <N x i32> (all-ones = active, all-zeros = inactive).
+// Returns true only when every lane is active (stronger than spmdVectorAnyTrue).
+// On WASM targets, uses the native v128.alltrue instruction via the
+// @llvm.wasm.alltrue LLVM intrinsic (single WASM instruction, no bitcast).
 // On other targets the mask is <N x i1>.
 func (b *builder) spmdVectorAllTrue(mask llvm.Value) llvm.Value {
-	vecSize := mask.Type().VectorSize()
-	var intType llvm.Type
 	if b.spmdIsWASM() {
-		intType = b.ctx.IntType(vecSize * 32)
-	} else {
-		intType = b.ctx.IntType(vecSize)
+		// Use native WASM i32x4.all_true instruction.
+		i32Result := b.spmdWasmAllTrue(mask)
+		zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+		return b.CreateICmp(llvm.IntNE, i32Result, zero, "")
 	}
+	// Non-WASM: <N x i1> → iN bitcast, compare == all-ones.
+	vecSize := mask.Type().VectorSize()
+	intType := b.ctx.IntType(vecSize)
 	intVal := b.CreateBitCast(mask, intType, "")
 	allOnes := llvm.ConstAllOnes(intType)
 	return b.CreateICmp(llvm.IntEQ, intVal, allOnes, "")
+}
+
+// spmdWasmAnyTrue calls @llvm.wasm.anytrue on a vector.
+// Returns i32 (0 or 1). Only valid for WASM targets.
+func (b *builder) spmdWasmAnyTrue(mask llvm.Value) llvm.Value {
+	vecType := mask.Type()
+	suffix := spmdVectorTypeSuffix(vecType)
+	intrinsicName := "llvm.wasm.anytrue." + suffix
+	i32Type := b.ctx.Int32Type()
+	fnType := llvm.FunctionType(i32Type, []llvm.Type{vecType}, false)
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	return b.createCall(fnType, fn, []llvm.Value{mask}, "")
+}
+
+// spmdWasmAllTrue calls @llvm.wasm.alltrue on a vector.
+// Returns i32 (0 or 1). Only valid for WASM targets.
+func (b *builder) spmdWasmAllTrue(mask llvm.Value) llvm.Value {
+	vecType := mask.Type()
+	suffix := spmdVectorTypeSuffix(vecType)
+	intrinsicName := "llvm.wasm.alltrue." + suffix
+	i32Type := b.ctx.Int32Type()
+	fnType := llvm.FunctionType(i32Type, []llvm.Type{vecType}, false)
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	return b.createCall(fnType, fn, []llvm.Value{mask}, "")
 }
 
 // spmdIsReachableFrom checks if target is reachable from start without going
