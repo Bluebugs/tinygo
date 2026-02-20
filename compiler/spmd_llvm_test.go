@@ -2344,3 +2344,59 @@ func TestSPMDBreakMaskInstructions(t *testing.T) {
 		}
 	})
 }
+
+func TestSPMDVectorAllTrue(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+
+	t.Run("all_true", func(t *testing.T) {
+		maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
+		allOnes := llvm.ConstAllOnes(maskType)
+		result := b.spmdVectorAllTrue(allOnes)
+		if result.IsNil() {
+			t.Fatal("expected non-nil result")
+		}
+		if result.Type().TypeKind() != llvm.IntegerTypeKind || result.Type().IntTypeWidth() != 1 {
+			t.Error("expected i1 result type")
+		}
+	})
+
+	t.Run("not_all_true", func(t *testing.T) {
+		maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
+		allZeros := llvm.ConstNull(maskType)
+		result := b.spmdVectorAllTrue(allZeros)
+		if result.IsNil() {
+			t.Fatal("expected non-nil result")
+		}
+	})
+}
+
+func TestSPMDCallMaskNarrowedByVaryingIf(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+
+	// Set up SPMD function body context.
+	maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
+	entryMask := llvm.ConstAllOnes(maskType)
+	b.spmdEntryMask = entryMask
+	b.spmdMaskStack = []llvm.Value{entryMask}
+
+	// Create a narrowed mask (simulating varying if).
+	narrowedMask := b.CreateAnd(entryMask, llvm.ConstNull(maskType), "narrowed")
+	b.spmdPushMask(narrowedMask)
+
+	// spmdCallMask should return the narrowed mask, not the entry mask.
+	// We can't call spmdCallMask directly since it needs an ssa.Function,
+	// but we can verify spmdCurrentMask returns the narrowed mask.
+	currentMask := b.spmdCurrentMask()
+	if currentMask.C != narrowedMask.C {
+		t.Error("spmdCurrentMask should return narrowed mask when inside varying-if")
+	}
+
+	// Verify stack depth.
+	if len(b.spmdMaskStack) != 2 {
+		t.Errorf("expected stack depth 2, got %d", len(b.spmdMaskStack))
+	}
+}

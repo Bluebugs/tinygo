@@ -1056,6 +1056,16 @@ func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
 	return b.CreateICmp(llvm.IntNE, intVal, zero, "")
 }
 
+// spmdVectorAllTrue reduces a vector condition <N x i1> to a scalar i1.
+// Returns true if all lanes are true (the complement of spmdVectorAnyTrue).
+func (b *builder) spmdVectorAllTrue(mask llvm.Value) llvm.Value {
+	vecSize := mask.Type().VectorSize()
+	intType := b.ctx.IntType(vecSize)
+	intVal := b.CreateBitCast(mask, intType, "")
+	allOnes := llvm.ConstAllOnes(intType)
+	return b.CreateICmp(llvm.IntEQ, intVal, allOnes, "")
+}
+
 // spmdIsReachableFrom checks if target is reachable from start without going
 // through barrier. Returns true if a path exists from start to target.
 func (b *builder) spmdIsReachableFrom(start, target, barrier *ssa.BasicBlock) bool {
@@ -1115,7 +1125,8 @@ func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
 }
 
 // spmdCallMask returns the mask value to pass when calling an SPMD function.
-// The mask is determined by the current execution context:
+// The mask is determined by the current execution context, narrowest first:
+// - If inside a varying-if block: use the current narrowed mask (from mask stack)
 // - If inside an SPMD loop: use the loop's tail mask
 // - If inside an SPMD function: use the entry mask
 // - Otherwise: all lanes active (all-ones mask)
@@ -1124,6 +1135,11 @@ func (b *builder) spmdCallMask(fn *ssa.Function) llvm.Value {
 	if maskType == (llvm.Type{}) {
 		// Not an SPMD function, no mask needed.
 		return llvm.Value{}
+	}
+
+	// Use current narrowed mask if inside varying-if context.
+	if mask := b.spmdCurrentMask(); !mask.IsNil() {
+		return mask
 	}
 
 	// Check if we're inside an SPMD loop.
@@ -1534,12 +1550,13 @@ type spmdBreakResult struct {
 
 // spmdForLoopInfo tracks a regular for-range loop inside an SPMD function body.
 type spmdForLoopInfo struct {
-	loopBlockIndex  int                // rangeint.loop block index (or bodyBlockIndex for merged pattern)
-	bodyBlockIndex  int                // rangeint.body block index
-	doneBlockIndex  int                // rangeint.done block index
-	breakMaskAlloca llvm.Value         // alloca for <N x i1> break mask (persists across iterations)
-	laneCount       int                // SIMD lane count
-	breakResults    []spmdBreakResult  // phis at done block with break values
+	loopBlockIndex  int                  // rangeint.loop block index (or bodyBlockIndex for merged pattern)
+	bodyBlockIndex  int                  // rangeint.body block index
+	doneBlockIndex  int                  // rangeint.done block index
+	breakMaskAlloca llvm.Value           // alloca for <N x i1> break mask (persists across iterations)
+	laneCount       int                  // SIMD lane count
+	breakResults    []spmdBreakResult    // phis at done block with break values
+	earlyExitBlocks []llvm.BasicBlock    // blocks that jump to done on all-lanes-broken
 }
 
 // spmdBreakRedirect tracks a varying if statement where the then-branch breaks from a loop.
@@ -1549,12 +1566,65 @@ type spmdBreakRedirect struct {
 	target llvm.BasicBlock // where to redirect (else/continuation block)
 }
 
+// spmdAnalyzeContiguousIndex checks if an SSA index value is a linear
+// expression of a known SPMD loop iterator: base + iter_phi, where base
+// is a scalar (uniform) expression. Returns the loop and scalar base offset.
+// This generalizes contiguous detection beyond just the raw loop iter phi
+// to cover patterns like output[j*width + i] where j*width is scalar.
+func (b *builder) spmdAnalyzeContiguousIndex(index ssa.Value) (*spmdActiveLoop, llvm.Value, bool) {
+	// Direct iter phi match (existing fast path).
+	if loop, ok := b.spmdLoopState.activeLoops[index]; ok {
+		return loop, loop.scalarIterVal, true
+	}
+
+	// Check BinOp: scalar + iter or iter + scalar.
+	binop, ok := index.(*ssa.BinOp)
+	if !ok || binop.Op != token.ADD {
+		return nil, llvm.Value{}, false
+	}
+
+	// Try X=iter, Y=scalar.
+	if loop, ok := b.spmdLoopState.activeLoops[binop.X]; ok {
+		if _, isVec := b.spmdValueOverride[binop.Y]; !isVec {
+			scalarY := b.getValue(binop.Y, getPos(binop))
+			if scalarY.Type().TypeKind() != llvm.VectorTypeKind {
+				scalarBase := b.CreateAdd(scalarY, loop.scalarIterVal, "spmd.contiguous.base")
+				return loop, scalarBase, true
+			}
+		}
+	}
+	// Try X=scalar, Y=iter.
+	if loop, ok := b.spmdLoopState.activeLoops[binop.Y]; ok {
+		if _, isVec := b.spmdValueOverride[binop.X]; !isVec {
+			scalarX := b.getValue(binop.X, getPos(binop))
+			if scalarX.Type().TypeKind() != llvm.VectorTypeKind {
+				scalarBase := b.CreateAdd(scalarX, loop.scalarIterVal, "spmd.contiguous.base")
+				return loop, scalarBase, true
+			}
+		}
+	}
+
+	return nil, llvm.Value{}, false
+}
+
+// spmdContiguousIndexAddrWithBase handles IndexAddr for contiguous SPMD access
+// using a pre-computed scalar base index (from spmdAnalyzeContiguousIndex).
+// Returns a scalar pointer to the base element for subsequent vector load/store.
+func (b *builder) spmdContiguousIndexAddrWithBase(expr *ssa.IndexAddr, loop *spmdActiveLoop, scalarBase llvm.Value) (llvm.Value, error) {
+	return b.spmdContiguousIndexAddrCore(expr, loop, scalarBase)
+}
+
 // spmdContiguousIndexAddr handles IndexAddr for contiguous SPMD access.
-// Returns a scalar pointer to the base element (for subsequent vector load/store via spmdMaskedLoad/Store).
-// Returns an error if the container type is not supported for contiguous access.
+// Uses the loop's scalar iter value as the index.
 func (b *builder) spmdContiguousIndexAddr(expr *ssa.IndexAddr, loop *spmdActiveLoop) (llvm.Value, error) {
+	return b.spmdContiguousIndexAddrCore(expr, loop, loop.scalarIterVal)
+}
+
+// spmdContiguousIndexAddrCore is the shared implementation for contiguous SPMD IndexAddr.
+// It generates a scalar GEP for the base element, registering the result in spmdContiguousPtr
+// so that subsequent loads/stores use masked vector intrinsics.
+func (b *builder) spmdContiguousIndexAddrCore(expr *ssa.IndexAddr, loop *spmdActiveLoop, scalarIndex llvm.Value) (llvm.Value, error) {
 	val := b.getValue(expr.X, getPos(expr))
-	scalarIndex := loop.scalarIterVal
 	scalarIndex = b.extendInteger(scalarIndex, expr.Index.Type(), b.uintptrType)
 
 	var ptr llvm.Value

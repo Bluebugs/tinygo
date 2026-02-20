@@ -1246,6 +1246,15 @@ func (b *builder) createFunctionStart(intrinsic bool) {
 		// Add LLVM attribute to always avoid inlining this function.
 		noinline := b.ctx.CreateEnumAttribute(llvm.AttributeKindID("noinline"), 0)
 		b.llvmFn.AddFunctionAttr(noinline)
+	case inlineDefault:
+		// SPMD: encourage inlining of SPMD function bodies so LLVM can
+		// constant-fold mask operations when the caller passes all-true masks.
+		// Note: inlinehint is advisory — LLVM may still reject large functions.
+		// A size threshold could be added here if code bloat becomes an issue.
+		if b.isSPMDFunction(b.fn) {
+			inline := b.ctx.CreateEnumAttribute(llvm.AttributeKindID("inlinehint"), 0)
+			b.llvmFn.AddFunctionAttr(inline)
+		}
 	}
 
 	if b.info.interrupt {
@@ -1689,6 +1698,32 @@ func (b *builder) createFunction() {
 			llvmBlock := b.blockInfo[block.Preds[i].Index].exit
 			phi.llvm.AddIncoming([]llvm.Value{llvmVal}, []llvm.BasicBlock{llvmBlock})
 		}
+
+		// SPMD: add incoming values for early-exit blocks at rangeint.done.
+		// These blocks are LLVM-only (not in SSA), so they weren't handled above.
+		// Skip phis that are break results — those already get early-exit incoming
+		// values in the break result phi handler (createExpr *ssa.Phi case).
+		if b.spmdForLoops != nil {
+			for _, loop := range b.spmdForLoops {
+				if block.Index == loop.doneBlockIndex && len(loop.earlyExitBlocks) > 0 {
+					isBreakResult := false
+					for _, br := range loop.breakResults {
+						if br.phi == phi.ssa {
+							isBreakResult = true
+							break
+						}
+					}
+					if !isBreakResult {
+						phiType := phi.llvm.Type()
+						placeholder := llvm.ConstNull(phiType)
+						for _, exitBB := range loop.earlyExitBlocks {
+							phi.llvm.AddIncoming([]llvm.Value{placeholder}, []llvm.BasicBlock{exitBB})
+						}
+					}
+					break
+				}
+			}
+		}
 	}
 
 	if b.NeedsStackObjects {
@@ -1858,6 +1893,32 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 				newResult := b.CreateSelect(mask, breakVal, oldResult, "break.result.new")
 				b.CreateStore(newResult, br.alloca)
 			}
+
+			// Early exit: if all active lanes have broken, jump to loop done.
+			// We create an intermediate block with proper phi incoming values
+			// to avoid breaking the existing rangeint.done phi resolution.
+			entryMask := b.spmdEntryMask
+			if entryMask.IsNil() {
+				entryMask = llvm.ConstAllOnes(newBreak.Type())
+			}
+			remaining := b.CreateAnd(b.CreateNot(newBreak, ""), entryMask, "remaining.lanes")
+			allBroken := b.CreateNot(b.spmdVectorAnyTrue(remaining), "all.broken")
+
+			// Record the early-exit block for phi resolution later.
+			exitBlock := b.insertBasicBlock("spmd.early.exit")
+			contBlock := b.insertBasicBlock("spmd.break.cont")
+			b.CreateCondBr(allBroken, exitBlock, contBlock)
+
+			// Build the early exit block: jump to done with correct phi values.
+			b.SetInsertPointAtEnd(exitBlock)
+			doneBlock := b.blockInfo[redir.loop.doneBlockIndex].entry
+			b.CreateBr(doneBlock)
+
+			// Record this early-exit block so phi resolution can add incoming values.
+			redir.loop.earlyExitBlocks = append(redir.loop.earlyExitBlocks, exitBlock)
+
+			// Continue with the normal path.
+			b.SetInsertPointAtEnd(contBlock)
 
 			// Redirect to continuation (else) block instead of rangeint.done.
 			b.CreateBr(redir.target)
@@ -2666,17 +2727,22 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			panic("unknown *ssa.Index type")
 		}
 	case *ssa.IndexAddr:
-		// SPMD: detect contiguous access (index is the loop iter phi, overridden to lane indices).
-		// When the index SSA value has a vector override, it means this is an SPMD loop index.
-		// We intercept it here to generate a scalar GEP for the base element, then use
-		// masked load/store intrinsics when the result is dereferenced or stored.
+		// SPMD: detect contiguous access patterns for vector load/store optimization.
+		// When the index is a known SPMD loop iterator (or a scalar+iter expression),
+		// generate a scalar GEP for masked load/store instead of per-lane gather/scatter.
 		if b.spmdLoopState != nil && b.spmdValueOverride != nil {
+			// Fast path: index is directly the loop iter phi (overridden to lane indices).
 			if _, isOverridden := b.spmdValueOverride[expr.Index]; isOverridden {
 				if loop, ok := b.spmdLoopState.activeLoops[expr.Index]; ok {
 					if result, err := b.spmdContiguousIndexAddr(expr, loop); err == nil {
 						return result, nil
 					}
-					// If the contiguous detection fails, fall through to the generic path.
+				}
+			}
+			// Generalized path: index is scalar_expr + iter (e.g., j*width + i).
+			if loop, scalarBase, ok := b.spmdAnalyzeContiguousIndex(expr.Index); ok {
+				if result, err := b.spmdContiguousIndexAddrWithBase(expr, loop, scalarBase); err == nil {
+					return result, nil
 				}
 			}
 		}
@@ -2902,6 +2968,17 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 						phiType := b.getLLVMType(expr.Type())
 						phi := b.CreatePHI(phiType, "")
 						b.phis = append(b.phis, phiNode{expr, phi})
+
+						// Add incoming values for early-exit blocks.
+						// When all lanes have broken, the break result alloca has the
+						// correct value, so the phi value is unused (the select below
+						// always picks break result). Use zero as a placeholder.
+						if len(loop.earlyExitBlocks) > 0 {
+							placeholder := llvm.ConstNull(phiType)
+							for _, exitBB := range loop.earlyExitBlocks {
+								phi.AddIncoming([]llvm.Value{placeholder}, []llvm.BasicBlock{exitBB})
+							}
+						}
 
 						// Load break result and break mask.
 						breakResult := b.CreateLoad(phiType, br.alloca, "break.result")
