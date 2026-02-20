@@ -1428,7 +1428,7 @@ func (b *builder) createFunction() {
 			savedBlock := b.GetInsertBlock()
 			for _, loop := range b.spmdForLoops {
 				if !loop.breakMaskAlloca.IsNil() {
-					maskType := llvm.VectorType(b.ctx.Int1Type(), loop.laneCount)
+					maskType := llvm.VectorType(b.spmdMaskElemType(), loop.laneCount)
 					zeroMask := llvm.ConstNull(maskType)
 					b.SetInsertPointBefore(loop.breakMaskAlloca)
 					insertAfterAlloca := llvm.NextInstruction(loop.breakMaskAlloca)
@@ -1613,7 +1613,7 @@ func (b *builder) createFunction() {
 				if phi, ok := instr.(*ssa.Phi); ok && phi.Comment == "rangeint.iter" {
 					if loopInfo, ok := b.spmdForLoops[block.Index]; ok {
 						// Load break mask and compute active mask for this iteration.
-						maskType := llvm.VectorType(b.ctx.Int1Type(), loopInfo.laneCount)
+						maskType := llvm.VectorType(b.spmdMaskElemType(), loopInfo.laneCount)
 						breakMask := b.CreateLoad(maskType, loopInfo.breakMaskAlloca, "break.mask")
 						notBreak := b.CreateNot(breakMask, "not.break")
 
@@ -1877,7 +1877,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			mask := b.spmdCurrentMask() // the then-mask (lanes that are breaking)
 
 			// Load current break mask, OR with breaking lanes, store back.
-			maskType := llvm.VectorType(b.ctx.Int1Type(), redir.loop.laneCount)
+			maskType := llvm.VectorType(b.spmdMaskElemType(), redir.loop.laneCount)
 			currentBreak := b.CreateLoad(maskType, redir.loop.breakMaskAlloca, "break.mask.cur")
 			newBreak := b.CreateOr(currentBreak, mask, "break.mask.new")
 			b.CreateStore(newBreak, redir.loop.breakMaskAlloca)
@@ -1890,7 +1890,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 				// Load current result, select based on mask, store back.
 				resultType := b.getLLVMType(br.phi.Type())
 				oldResult := b.CreateLoad(resultType, br.alloca, "break.result.old")
-				newResult := b.CreateSelect(mask, breakVal, oldResult, "break.result.new")
+				newResult := b.spmdMaskSelect(mask, breakVal, oldResult)
 				b.CreateStore(newResult, br.alloca)
 			}
 
@@ -1976,7 +1976,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
 				mask := b.spmdCurrentMask()
 				if mask.IsNil() {
-					mask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), ci.loop.laneCount))
+					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(), ci.loop.laneCount))
 				}
 				// Splat scalar values to vector for masked store.
 				if llvmVal.Type().TypeKind() != llvm.VectorTypeKind {
@@ -1993,7 +1993,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			laneCount := llvmAddr.Type().VectorSize()
 			mask := b.spmdCurrentMask()
 			if mask.IsNil() {
-				mask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), laneCount))
+				mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(), laneCount))
 			}
 			b.spmdMaskedScatter(llvmVal, llvmAddr, mask)
 			return
@@ -2568,7 +2568,23 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				}
 			}
 		}
-		return b.createBinOp(expr.Op, expr.X.Type(), expr.Y.Type(), x, y, expr.Pos())
+		result, err := b.createBinOp(expr.Op, expr.X.Type(), expr.Y.Type(), x, y, expr.Pos())
+		if err != nil {
+			return result, err
+		}
+		// SPMD: on WASM, sign-extend <N x i1> comparison results to <N x i32>.
+		// LLVM's WASM backend folds sext(cmp) into the comparison instruction (no
+		// runtime cost), and downstream uses (bitselect mask, any_true, mask stack)
+		// work directly on <N x i32> without additional conversions.
+		// Note: UnOp NOT on Varying[bool] (token.NOT case in createUnOp) is not yet
+		// wrapped here — that is a known gap for future work.
+		if b.spmdIsWASM() &&
+			result.Type().TypeKind() == llvm.VectorTypeKind &&
+			result.Type().ElementType() == b.ctx.Int1Type() {
+			laneCount := result.Type().VectorSize()
+			result = b.spmdWrapMask(result, laneCount)
+		}
+		return result, nil
 	case *ssa.Call:
 		return b.createFunctionCall(expr.Common())
 	case *ssa.ChangeInterface:
@@ -2621,6 +2637,13 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					// count (128/8 = 16). The comparison already carries the
 					// correct lane count -- use the source directly rather than
 					// bitcasting to an incompatible vector size.
+					changeTypeResult = x
+				} else if b.spmdIsWASM() && x.Type().ElementType() == b.ctx.Int32Type() &&
+					llvmType.ElementType() == b.ctx.Int1Type() {
+					// SPMD on WASM: source is <N x i32> (wrapped comparison result)
+					// and target is <M x i1> (Varying[bool] computed from bit width).
+					// These represent the same logical bool vector — use the source
+					// directly to avoid an invalid bitcast between differently-sized vectors.
 					changeTypeResult = x
 				} else {
 					changeTypeResult = b.CreateBitCast(x, llvmType, "changetype.vec")
@@ -2982,11 +3005,11 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 
 						// Load break result and break mask.
 						breakResult := b.CreateLoad(phiType, br.alloca, "break.result")
-						maskType := llvm.VectorType(b.ctx.Int1Type(), loop.laneCount)
+						maskType := llvm.VectorType(b.spmdMaskElemType(), loop.laneCount)
 						breakMask := b.CreateLoad(maskType, loop.breakMaskAlloca, "break.mask")
 
 						// Select between break result and phi result based on break mask.
-						finalResult := b.CreateSelect(breakMask, breakResult, phi, "phi.with.break")
+						finalResult := b.spmdMaskSelect(breakMask, breakResult, phi)
 						return finalResult, nil
 					}
 				}
@@ -4036,7 +4059,7 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 				vecType := llvm.VectorType(elemType, ci.loop.laneCount)
 				mask := b.spmdCurrentMask()
 				if mask.IsNil() {
-					mask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), ci.loop.laneCount))
+					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(), ci.loop.laneCount))
 				}
 				return b.spmdMaskedLoad(vecType, ci.scalarPtr, mask), nil
 			}
@@ -4049,7 +4072,7 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 			vecType := llvm.VectorType(elemType, laneCount)
 			mask := b.spmdCurrentMask()
 			if mask.IsNil() {
-				mask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), laneCount))
+				mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(), laneCount))
 			}
 			return b.spmdMaskedGather(vecType, x, mask), nil
 		}

@@ -737,7 +737,10 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 
 	// Compute tail mask: laneIndices < bound (per-lane comparison).
 	// Use IntSLT for signed comparison since Go's int is signed.
-	tailMask := b.CreateICmp(llvm.IntSLT, laneIndices, boundVec, "spmd.tail.mask")
+	// On WASM, sign-extend the <N x i1> result to <N x i32> so that downstream
+	// uses (bitselect, mask stack AND/NOT) work without redundant conversions.
+	tailMaskI1 := b.CreateICmp(llvm.IntSLT, laneIndices, boundVec, "spmd.tail.mask")
+	tailMask := b.spmdWrapMask(tailMaskI1, loop.laneCount)
 
 	// Store the results in the loop state.
 	loop.laneIndices = laneIndices
@@ -766,7 +769,7 @@ func (b *builder) spmdCurrentMask() llvm.Value {
 
 // spmdVaryingIf holds analysis results for a varying (vector) if/else construct.
 type spmdVaryingIf struct {
-	cond           llvm.Value // vector condition (<N x i1>)
+	cond           llvm.Value // vector condition: <N x i1> on non-WASM, <N x i32> on WASM
 	ifBlockIndex   int        // block with the If instruction
 	thenEntryIndex int        // Succs[0] of if-block
 	elseEntryIndex int        // Succs[1] of if-block (or merge for if-without-else)
@@ -1030,8 +1033,10 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 	elseIsVec := elseValue.Type().TypeKind() == llvm.VectorTypeKind
 
 	if thenIsVec || elseIsVec {
-		// At least one operand is a vector → vector select.
-		return b.CreateSelect(info.cond, thenValue, elseValue, ""), true
+		// At least one operand is a vector → vector masked select.
+		// On WASM the mask is <N x i32> so use spmdMaskSelect instead of CreateSelect
+		// (which requires an <N x i1> condition).
+		return b.spmdMaskSelect(info.cond, thenValue, elseValue), true
 	}
 
 	// Both are scalars → reduce condition to scalar boolean and use scalar select.
@@ -1043,24 +1048,38 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 	return b.CreateSelect(scalarCond, thenValue, elseValue, ""), true
 }
 
-// spmdVectorAnyTrue reduces a vector condition <N x i1> to a scalar i1.
-// Returns true if any lane is true.
+// spmdVectorAnyTrue reduces an SPMD mask vector to a scalar i1.
+// Returns true if any lane is active.
+// On WASM the mask is <N x i32> (all-ones/all-zeros), so we bitcast to i128
+// (4 × 32 bits) and compare != 0.
+// On other targets the mask is <N x i1>, so we bitcast to iN and compare != 0.
 func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
-	// Bitcast <N x i1> to iN (e.g., <4 x i1> → i4).
 	vecSize := mask.Type().VectorSize()
-	intType := b.ctx.IntType(vecSize)
+	var intType llvm.Type
+	if b.spmdIsWASM() {
+		// <4 x i32> → i128 (N lanes × 32 bits each)
+		intType = b.ctx.IntType(vecSize * 32)
+	} else {
+		// <N x i1> → iN
+		intType = b.ctx.IntType(vecSize)
+	}
 	intVal := b.CreateBitCast(mask, intType, "")
-
-	// Compare intVal != 0.
 	zero := llvm.ConstNull(intType)
 	return b.CreateICmp(llvm.IntNE, intVal, zero, "")
 }
 
-// spmdVectorAllTrue reduces a vector condition <N x i1> to a scalar i1.
-// Returns true if all lanes are true (the complement of spmdVectorAnyTrue).
+// spmdVectorAllTrue reduces an SPMD mask vector to a scalar i1.
+// Returns true if all lanes are active (complement of spmdVectorAnyTrue).
+// On WASM the mask is <N x i32> (all-ones = active, all-zeros = inactive).
+// On other targets the mask is <N x i1>.
 func (b *builder) spmdVectorAllTrue(mask llvm.Value) llvm.Value {
 	vecSize := mask.Type().VectorSize()
-	intType := b.ctx.IntType(vecSize)
+	var intType llvm.Type
+	if b.spmdIsWASM() {
+		intType = b.ctx.IntType(vecSize * 32)
+	} else {
+		intType = b.ctx.IntType(vecSize)
+	}
 	intVal := b.CreateBitCast(mask, intType, "")
 	allOnes := llvm.ConstAllOnes(intType)
 	return b.CreateICmp(llvm.IntEQ, intVal, allOnes, "")
@@ -1098,6 +1117,25 @@ func (b *builder) spmdIsReachableFrom(start, target, barrier *ssa.BasicBlock) bo
 	return dfs(start)
 }
 
+// spmdIsWASM returns true when the compiler target is a WebAssembly target.
+// On WASM, SIMD comparisons natively produce <N x i32> (all-ones/all-zeros),
+// so we use i32 as the internal mask element type to avoid the redundant
+// shl/shr_s sign-extension that LLVM inserts when converting <N x i1> to i32
+// for v128.bitselect.
+func (c *compilerContext) spmdIsWASM() bool {
+	return strings.HasPrefix(c.Triple, "wasm")
+}
+
+// spmdMaskElemType returns the LLVM element type used for SPMD mask vectors.
+// On WASM targets this is i32 (all-ones = active, all-zeros = inactive).
+// On other targets this is i1 (the native LLVM boolean vector element type).
+func (c *compilerContext) spmdMaskElemType() llvm.Type {
+	if c.spmdIsWASM() {
+		return c.ctx.Int32Type()
+	}
+	return c.ctx.Int1Type()
+}
+
 // spmdMaskType returns the LLVM mask type for an SPMD function's implicit first parameter.
 // Returns zero-value llvm.Type{} if the function has no varying parameters.
 func (c *compilerContext) spmdMaskType(fn *ssa.Function) llvm.Type {
@@ -1105,7 +1143,8 @@ func (c *compilerContext) spmdMaskType(fn *ssa.Function) llvm.Type {
 }
 
 // spmdMaskTypeFromSig returns the LLVM mask type for an SPMD signature's implicit mask parameter.
-// The mask is a <N x i1> vector where N is determined by the first varying parameter's element type.
+// On WASM the mask is <N x i32>; on other targets it is <N x i1>.
+// N is determined by the first varying parameter's element type.
 // Returns zero-value llvm.Type{} if the signature has no varying parameters.
 func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
 	if sig == nil {
@@ -1118,10 +1157,95 @@ func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
 			// Found a varying parameter. Compute lane count respecting constraints.
 			elemType := c.getLLVMType(spmdType.Elem())
 			laneCount := c.spmdEffectiveLaneCount(spmdType, elemType)
-			return llvm.VectorType(c.ctx.Int1Type(), laneCount)
+			return llvm.VectorType(c.spmdMaskElemType(), laneCount)
 		}
 	}
 	return llvm.Type{} // No varying parameters
+}
+
+// spmdWrapMask sign-extends an <N x i1> comparison result to <N x i32> on WASM.
+// On non-WASM targets this is a no-op. LLVM's WASM backend folds sext(cmp)
+// into a single WASM comparison instruction, so there is no runtime cost.
+func (b *builder) spmdWrapMask(cmp llvm.Value, laneCount int) llvm.Value {
+	if !b.spmdIsWASM() {
+		return cmp
+	}
+	maskType := llvm.VectorType(b.ctx.Int32Type(), laneCount)
+	return b.CreateSExt(cmp, maskType, "")
+}
+
+// spmdUnwrapMaskForIntrinsic truncates <N x i32> back to <N x i1> for LLVM masked
+// memory intrinsics (masked.load, masked.store, masked.gather, masked.scatter).
+// These intrinsics require an <N x i1> mask regardless of the target.
+// On non-WASM targets the mask is already <N x i1> and this is a no-op.
+func (b *builder) spmdUnwrapMaskForIntrinsic(mask llvm.Value, laneCount int) llvm.Value {
+	if !b.spmdIsWASM() {
+		return mask
+	}
+	i1MaskType := llvm.VectorType(b.ctx.Int1Type(), laneCount)
+	return b.CreateTrunc(mask, i1MaskType, "")
+}
+
+// spmdMaskSelect emits a masked select for SPMD value merging.
+// On non-WASM targets this calls CreateSelect directly (mask is <N x i1>).
+// On WASM targets the mask is <N x i32> (all-ones / all-zeros), so we use
+// bitwise AND/OR: result = (mask & trueVal) | (~mask & falseVal).
+// Float vector types are bitcast to the matching integer type for the bitwise ops.
+//
+// The bitwise path is only valid when mask and data have the same total bit
+// width (e.g., <4 x i32> mask with <4 x i32> or <4 x f32> data). For types
+// with a different total bit width (e.g., <2 x i32> mask with <2 x i64> data),
+// we fall back to truncating the mask to <N x i1> and using LLVM's native
+// CreateSelect, which handles arbitrary widths correctly.
+func (b *builder) spmdMaskSelect(mask, trueVal, falseVal llvm.Value) llvm.Value {
+	if !b.spmdIsWASM() {
+		return b.CreateSelect(mask, trueVal, falseVal, "")
+	}
+
+	valType := trueVal.Type()
+	maskType := mask.Type() // <N x i32>
+
+	// Efficient bitwise select only when mask and data have equal total bit width
+	// (e.g., <4 x i32> mask with <4 x i32> or <4 x f32> data).
+	// For mismatched widths (e.g., <2 x i32> mask with <2 x i64> data),
+	// fall back to trunc+CreateSelect which LLVM handles correctly.
+	if b.targetData.TypeAllocSize(maskType) == b.targetData.TypeAllocSize(valType) {
+		var aBits, bBits llvm.Value
+		needBitcast := valType != maskType
+		if needBitcast {
+			aBits = b.CreateBitCast(trueVal, maskType, "")
+			bBits = b.CreateBitCast(falseVal, maskType, "")
+		} else {
+			aBits = trueVal
+			bBits = falseVal
+		}
+		notMask := b.CreateNot(mask, "")
+		and1 := b.CreateAnd(mask, aBits, "")
+		and2 := b.CreateAnd(notMask, bBits, "")
+		result := b.CreateOr(and1, and2, "")
+		if needBitcast {
+			result = b.CreateBitCast(result, valType, "")
+		}
+		return result
+	}
+
+	// Fallback: truncate i32 mask to i1 and use LLVM's native select.
+	laneCount := maskType.VectorSize()
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+	return b.CreateSelect(i1Mask, trueVal, falseVal, "")
+}
+
+// spmdNormalizeBoolVecToI1 converts an SPMD bool vector to <N x i1> regardless
+// of whether the input is already <N x i1> or <N x i32> (WASM format).
+// Used by reduce.All/Count/FindFirstSet/Mask which need a compact bit representation.
+func (b *builder) spmdNormalizeBoolVecToI1(vec llvm.Value) llvm.Value {
+	if !b.spmdIsWASM() {
+		return vec // already <N x i1>
+	}
+	// WASM: vec is <N x i32> (all-ones/all-zeros). Truncate to <N x i1>.
+	laneCount := vec.Type().VectorSize()
+	i1Type := llvm.VectorType(b.ctx.Int1Type(), laneCount)
+	return b.CreateTrunc(vec, i1Type, "")
 }
 
 // spmdCallMask returns the mask value to pass when calling an SPMD function.
@@ -1316,17 +1440,20 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		return b.spmdCallVectorReduce("mul", vec), nil
 
 	case name == "reduce.All":
-		// reduce.All(v Varying[bool]) bool — true if all lanes are true
-		// Bitcast <N x i1> to iN, compare == -1 (all bits set)
+		// reduce.All(v Varying[bool]) bool — true if all lanes are true.
+		// Normalize to <N x i1> first (on WASM bool vectors are <N x i32>),
+		// then bitcast to iN and compare == all-ones.
 		vec := b.getValue(instr.Args[0], getPos(instr))
-		vecSize := vec.Type().VectorSize()
+		i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+		vecSize := i1Vec.Type().VectorSize()
 		intType := b.ctx.IntType(vecSize)
-		intVal := b.CreateBitCast(vec, intType, "")
+		intVal := b.CreateBitCast(i1Vec, intType, "")
 		allOnes := llvm.ConstAllOnes(intType)
 		return b.CreateICmp(llvm.IntEQ, intVal, allOnes, ""), nil
 
 	case name == "reduce.Any":
-		// reduce.Any(v Varying[bool]) bool — true if any lane is true
+		// reduce.Any(v Varying[bool]) bool — true if any lane is true.
+		// spmdVectorAnyTrue handles both <N x i1> and <N x i32> (WASM) formats.
 		vec := b.getValue(instr.Args[0], getPos(instr))
 		return b.spmdVectorAnyTrue(vec), nil
 
@@ -1405,11 +1532,14 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		return slice, nil
 
 	case name == "reduce.Count":
-		// reduce.Count(v Varying[bool]) int — count of true lanes
+		// reduce.Count(v Varying[bool]) int — count of true lanes.
+		// Normalize to <N x i1> first (on WASM bool vectors are <N x i32>),
+		// then bitcast to iN and use llvm.ctpop.
 		vec := b.getValue(instr.Args[0], getPos(instr))
-		vecSize := vec.Type().VectorSize()
+		i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+		vecSize := i1Vec.Type().VectorSize()
 		intType := b.ctx.IntType(vecSize)
-		intVal := b.CreateBitCast(vec, intType, "")
+		intVal := b.CreateBitCast(i1Vec, intType, "")
 		// Call llvm.ctpop to count set bits
 		intrinsicName := "llvm.ctpop.i" + strconv.Itoa(vecSize)
 		llvmFn := b.mod.NamedFunction(intrinsicName)
@@ -1421,11 +1551,14 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		return b.createZExtOrTrunc(popcount, b.intType), nil
 
 	case name == "reduce.FindFirstSet":
-		// reduce.FindFirstSet(v Varying[bool]) int — index of first true lane
+		// reduce.FindFirstSet(v Varying[bool]) int — index of first true lane.
+		// Normalize to <N x i1> first (on WASM bool vectors are <N x i32>),
+		// then bitcast to iN and use llvm.cttz.
 		vec := b.getValue(instr.Args[0], getPos(instr))
-		vecSize := vec.Type().VectorSize()
+		i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+		vecSize := i1Vec.Type().VectorSize()
 		intType := b.ctx.IntType(vecSize)
-		intVal := b.CreateBitCast(vec, intType, "")
+		intVal := b.CreateBitCast(i1Vec, intType, "")
 		// Call llvm.cttz to count trailing zeros
 		intrinsicName := "llvm.cttz.i" + strconv.Itoa(vecSize)
 		llvmFn := b.mod.NamedFunction(intrinsicName)
@@ -1440,11 +1573,14 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		return b.createZExtOrTrunc(cttz, b.intType), nil
 
 	case name == "reduce.Mask":
-		// reduce.Mask(v Varying[bool]) int — bitmask of active lanes
+		// reduce.Mask(v Varying[bool]) int — bitmask of active lanes.
+		// Normalize to <N x i1> first (on WASM bool vectors are <N x i32>),
+		// then bitcast to iN and zero-extend to int.
 		vec := b.getValue(instr.Args[0], getPos(instr))
-		vecSize := vec.Type().VectorSize()
+		i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+		vecSize := i1Vec.Type().VectorSize()
 		intType := b.ctx.IntType(vecSize)
-		intVal := b.CreateBitCast(vec, intType, "")
+		intVal := b.CreateBitCast(i1Vec, intType, "")
 		return b.CreateZExt(intVal, b.intType, ""), nil
 
 	default:
@@ -1453,13 +1589,18 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 }
 
 // spmdMaskedLoad calls llvm.masked.load.<suffix>.p0 to load a vector from a scalar pointer with a per-lane mask.
+// The mask parameter may be <N x i32> (WASM format) or <N x i1>; it is truncated to <N x i1> as required
+// by the LLVM masked intrinsic interface.
 func (b *builder) spmdMaskedLoad(vecType llvm.Type, ptr, mask llvm.Value) llvm.Value {
+	laneCount := vecType.VectorSize()
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+
 	suffix := spmdVectorTypeSuffix(vecType)
 	intrinsicName := "llvm.masked.load." + suffix + ".p0"
 
 	ptrType := ptr.Type()
 	i32Type := b.ctx.Int32Type()
-	fnType := llvm.FunctionType(vecType, []llvm.Type{ptrType, i32Type, mask.Type(), vecType}, false)
+	fnType := llvm.FunctionType(vecType, []llvm.Type{ptrType, i32Type, i1Mask.Type(), vecType}, false)
 
 	fn := b.mod.NamedFunction(intrinsicName)
 	if fn.IsNil() {
@@ -1470,18 +1611,23 @@ func (b *builder) spmdMaskedLoad(vecType llvm.Type, ptr, mask llvm.Value) llvm.V
 	align := llvm.ConstInt(i32Type, elemSize, false)
 	passthru := llvm.ConstNull(vecType)
 
-	return b.createCall(fnType, fn, []llvm.Value{ptr, align, mask, passthru}, "spmd.load")
+	return b.createCall(fnType, fn, []llvm.Value{ptr, align, i1Mask, passthru}, "spmd.load")
 }
 
 // spmdMaskedStore calls llvm.masked.store.<suffix>.p0 to store a vector to a scalar pointer with a per-lane mask.
+// The mask parameter may be <N x i32> (WASM format) or <N x i1>; it is truncated to <N x i1> as required
+// by the LLVM masked intrinsic interface.
 func (b *builder) spmdMaskedStore(val, ptr, mask llvm.Value) {
 	vecType := val.Type()
+	laneCount := vecType.VectorSize()
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+
 	suffix := spmdVectorTypeSuffix(vecType)
 	intrinsicName := "llvm.masked.store." + suffix + ".p0"
 
 	ptrType := ptr.Type()
 	i32Type := b.ctx.Int32Type()
-	fnType := llvm.FunctionType(b.ctx.VoidType(), []llvm.Type{vecType, ptrType, i32Type, mask.Type()}, false)
+	fnType := llvm.FunctionType(b.ctx.VoidType(), []llvm.Type{vecType, ptrType, i32Type, i1Mask.Type()}, false)
 
 	fn := b.mod.NamedFunction(intrinsicName)
 	if fn.IsNil() {
@@ -1491,18 +1637,22 @@ func (b *builder) spmdMaskedStore(val, ptr, mask llvm.Value) {
 	elemSize := b.targetData.TypeAllocSize(vecType.ElementType())
 	align := llvm.ConstInt(i32Type, elemSize, false)
 
-	b.createCall(fnType, fn, []llvm.Value{val, ptr, align, mask}, "")
+	b.createCall(fnType, fn, []llvm.Value{val, ptr, align, i1Mask}, "")
 }
 
 // spmdMaskedGather calls llvm.masked.gather.<suffix>.v<N>p0 for non-contiguous loads from a vector of pointers.
+// The mask parameter may be <N x i32> (WASM format) or <N x i1>; it is truncated to <N x i1> as required
+// by the LLVM masked intrinsic interface.
 func (b *builder) spmdMaskedGather(vecType llvm.Type, ptrs, mask llvm.Value) llvm.Value {
-	suffix := spmdVectorTypeSuffix(vecType)
 	laneCount := ptrs.Type().VectorSize()
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+
+	suffix := spmdVectorTypeSuffix(vecType)
 	intrinsicName := "llvm.masked.gather." + suffix + ".v" + strconv.Itoa(laneCount) + "p0"
 
 	ptrVecType := ptrs.Type()
 	i32Type := b.ctx.Int32Type()
-	fnType := llvm.FunctionType(vecType, []llvm.Type{ptrVecType, i32Type, mask.Type(), vecType}, false)
+	fnType := llvm.FunctionType(vecType, []llvm.Type{ptrVecType, i32Type, i1Mask.Type(), vecType}, false)
 
 	fn := b.mod.NamedFunction(intrinsicName)
 	if fn.IsNil() {
@@ -1513,19 +1663,23 @@ func (b *builder) spmdMaskedGather(vecType llvm.Type, ptrs, mask llvm.Value) llv
 	align := llvm.ConstInt(i32Type, elemSize, false)
 	passthru := llvm.ConstNull(vecType)
 
-	return b.createCall(fnType, fn, []llvm.Value{ptrs, align, mask, passthru}, "spmd.gather")
+	return b.createCall(fnType, fn, []llvm.Value{ptrs, align, i1Mask, passthru}, "spmd.gather")
 }
 
 // spmdMaskedScatter calls llvm.masked.scatter.<suffix>.v<N>p0 for non-contiguous stores to a vector of pointers.
+// The mask parameter may be <N x i32> (WASM format) or <N x i1>; it is truncated to <N x i1> as required
+// by the LLVM masked intrinsic interface.
 func (b *builder) spmdMaskedScatter(val, ptrs, mask llvm.Value) {
 	vecType := val.Type()
-	suffix := spmdVectorTypeSuffix(vecType)
 	laneCount := ptrs.Type().VectorSize()
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+
+	suffix := spmdVectorTypeSuffix(vecType)
 	intrinsicName := "llvm.masked.scatter." + suffix + ".v" + strconv.Itoa(laneCount) + "p0"
 
 	ptrVecType := ptrs.Type()
 	i32Type := b.ctx.Int32Type()
-	fnType := llvm.FunctionType(b.ctx.VoidType(), []llvm.Type{vecType, ptrVecType, i32Type, mask.Type()}, false)
+	fnType := llvm.FunctionType(b.ctx.VoidType(), []llvm.Type{vecType, ptrVecType, i32Type, i1Mask.Type()}, false)
 
 	fn := b.mod.NamedFunction(intrinsicName)
 	if fn.IsNil() {
@@ -1535,7 +1689,7 @@ func (b *builder) spmdMaskedScatter(val, ptrs, mask llvm.Value) {
 	elemSize := b.targetData.TypeAllocSize(vecType.ElementType())
 	align := llvm.ConstInt(i32Type, elemSize, false)
 
-	b.createCall(fnType, fn, []llvm.Value{val, ptrs, align, mask}, "")
+	b.createCall(fnType, fn, []llvm.Value{val, ptrs, align, i1Mask}, "")
 }
 
 // spmdBreakResult tracks a phi at rangeint.done that receives a break value.
@@ -1785,7 +1939,7 @@ func (b *builder) detectSPMDForLoops() map[int]*spmdForLoopInfo {
 
 			elemType := b.getLLVMType(iterPhi.Type())
 			laneCount := b.spmdLaneCount(elemType)
-			maskType := llvm.VectorType(b.ctx.Int1Type(), laneCount)
+			maskType := llvm.VectorType(b.spmdMaskElemType(), laneCount)
 
 			// Create break mask alloca at function entry.
 			savedBlock := b.GetInsertBlock()
@@ -1863,7 +2017,7 @@ func (b *builder) detectSPMDForLoops() map[int]*spmdForLoopInfo {
 
 		// Create alloca for the break mask at the function entry block.
 		// We'll initialize it to all-false later in createFunction().
-		maskType := llvm.VectorType(b.ctx.Int1Type(), laneCount)
+		maskType := llvm.VectorType(b.spmdMaskElemType(), laneCount)
 
 		// Save current insert point, create alloca at function entry.
 		savedBlock := b.GetInsertBlock()

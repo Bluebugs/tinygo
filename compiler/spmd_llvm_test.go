@@ -549,6 +549,12 @@ func TestSPMDVectorAnyTrue(t *testing.T) {
 	b := newTestBuilder(t, c)
 	defer b.Dispose()
 
+	// The test context is WASM, so masks use the <N x i32> format where
+	// all-ones (0xFFFFFFFF) means active and all-zeros means inactive.
+	maskElemType := c.spmdMaskElemType() // i32 on WASM
+	allOnes := llvm.ConstAllOnes(maskElemType)
+	allZeros := llvm.ConstNull(maskElemType)
+
 	tests := []struct {
 		name     string
 		maskVals []bool
@@ -561,13 +567,13 @@ func TestSPMDVectorAnyTrue(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create a <4 x i1> constant vector.
+			// Create a <4 x i32> constant vector using WASM mask format.
 			vecElts := make([]llvm.Value, len(tt.maskVals))
 			for i, val := range tt.maskVals {
 				if val {
-					vecElts[i] = llvm.ConstInt(c.ctx.Int1Type(), 1, false)
+					vecElts[i] = allOnes
 				} else {
-					vecElts[i] = llvm.ConstInt(c.ctx.Int1Type(), 0, false)
+					vecElts[i] = allZeros
 				}
 			}
 			maskVec := llvm.ConstVector(vecElts, false)
@@ -768,7 +774,7 @@ func TestSPMDMaskType(t *testing.T) {
 			},
 			wantMaskType:  true,
 			wantLaneCount: 4, // 128 bits / 32 bits = 4 lanes
-			wantElemWidth: 1, // i1 for mask
+			wantElemWidth: 32, // i32 for WASM mask (avoids shl/shr_s sign extension)
 		},
 		{
 			name: "varying_int8_param",
@@ -780,7 +786,7 @@ func TestSPMDMaskType(t *testing.T) {
 			},
 			wantMaskType:  true,
 			wantLaneCount: 16, // 128 bits / 8 bits = 16 lanes
-			wantElemWidth: 1,
+			wantElemWidth: 32, // i32 for WASM mask
 		},
 		{
 			name: "varying_float64_param",
@@ -792,7 +798,7 @@ func TestSPMDMaskType(t *testing.T) {
 			},
 			wantMaskType:  true,
 			wantLaneCount: 2, // 128 bits / 64 bits = 2 lanes
-			wantElemWidth: 1,
+			wantElemWidth: 32, // i32 for WASM mask
 		},
 		{
 			name: "mixed_params_with_varying",
@@ -806,7 +812,7 @@ func TestSPMDMaskType(t *testing.T) {
 			},
 			wantMaskType:  true,
 			wantLaneCount: 4,
-			wantElemWidth: 1,
+			wantElemWidth: 32, // i32 for WASM mask
 		},
 		{
 			name: "constrained_varying_int32_8",
@@ -818,7 +824,7 @@ func TestSPMDMaskType(t *testing.T) {
 			},
 			wantMaskType:  true,
 			wantLaneCount: 8, // constraint overrides SIMD128 width (4)
-			wantElemWidth: 1,
+			wantElemWidth: 32, // i32 for WASM mask
 		},
 	}
 
@@ -847,7 +853,7 @@ func TestSPMDMaskType(t *testing.T) {
 						tt.name, gotLaneCount, tt.wantLaneCount)
 				}
 
-				// Verify element type is i1.
+				// Verify element type width (i32 on WASM, i1 on other targets).
 				elemType := maskType.ElementType()
 				if elemType.TypeKind() != llvm.IntegerTypeKind {
 					t.Errorf("spmdMaskTypeFromSig(%s) elem type kind = %v, want IntegerTypeKind",
@@ -2131,6 +2137,10 @@ func TestSPMDFuncBodyDetection(t *testing.T) {
 		// for any block (even nil block argument) because the sentinel is returned
 		// before any block inspection.
 		// We need spmdInfo non-nil to pass the first guard.
+		// Save and restore c.spmdInfo so later subtests that share c are not affected.
+		saved := c.spmdInfo
+		defer func() { c.spmdInfo = saved }()
+
 		b := &builder{compilerContext: c}
 		b.spmdFuncIsBody = true
 		b.spmdInfo = &SPMDInfo{} // non-nil sentinel to pass the nil guard
@@ -2144,9 +2154,11 @@ func TestSPMDFuncBodyDetection(t *testing.T) {
 	t.Run("isBlockInSPMDBody_returns_nil_when_no_spmd_info", func(t *testing.T) {
 		// When spmdInfo is nil (not an SPMD function at all), isBlockInSPMDBody
 		// must return nil regardless of spmdFuncIsBody.
+		// Explicitly clear c.spmdInfo to guard against state leaking from prior subtests.
+		c.spmdInfo = nil
+
 		b := &builder{compilerContext: c}
 		b.spmdFuncIsBody = true
-		// spmdInfo is nil
 
 		result := b.isBlockInSPMDBody(nil)
 		if result != nil {
@@ -2356,8 +2368,11 @@ func TestSPMDVectorAllTrue(t *testing.T) {
 	defer c.dispose()
 	b := newTestBuilder(t, c)
 
+	// The test context is WASM, so masks use the <N x i32> format where
+	// all-ones (0xFFFFFFFF) means active and all-zeros means inactive.
+	maskType := llvm.VectorType(c.spmdMaskElemType(), 4) // <4 x i32> on WASM
+
 	t.Run("all_true", func(t *testing.T) {
-		maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
 		allOnes := llvm.ConstAllOnes(maskType)
 		result := b.spmdVectorAllTrue(allOnes)
 		if result.IsNil() {
@@ -2369,7 +2384,6 @@ func TestSPMDVectorAllTrue(t *testing.T) {
 	})
 
 	t.Run("not_all_true", func(t *testing.T) {
-		maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
 		allZeros := llvm.ConstNull(maskType)
 		result := b.spmdVectorAllTrue(allZeros)
 		if result.IsNil() {
@@ -2384,7 +2398,8 @@ func TestSPMDCallMaskNarrowedByVaryingIf(t *testing.T) {
 	b := newTestBuilder(t, c)
 
 	// Set up SPMD function body context.
-	maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
+	// The test context is WASM, so masks use the <N x i32> format.
+	maskType := llvm.VectorType(c.spmdMaskElemType(), 4) // <4 x i32> on WASM
 	entryMask := llvm.ConstAllOnes(maskType)
 	b.spmdEntryMask = entryMask
 	b.spmdMaskStack = []llvm.Value{entryMask}
@@ -2404,5 +2419,223 @@ func TestSPMDCallMaskNarrowedByVaryingIf(t *testing.T) {
 	// Verify stack depth.
 	if len(b.spmdMaskStack) != 2 {
 		t.Errorf("expected stack depth 2, got %d", len(b.spmdMaskStack))
+	}
+}
+
+// TestSPMDIsWASM verifies that spmdIsWASM correctly detects WASM targets.
+func TestSPMDIsWASM(t *testing.T) {
+	// The default test context is WASM.
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	if !c.spmdIsWASM() {
+		t.Error("spmdIsWASM() = false for wasm32-unknown-wasi, want true")
+	}
+}
+
+// TestSPMDMaskElemType verifies that the mask element type is i32 on WASM.
+func TestSPMDMaskElemType(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	elemType := c.spmdMaskElemType()
+	if elemType.TypeKind() != llvm.IntegerTypeKind {
+		t.Errorf("spmdMaskElemType() kind = %v, want IntegerTypeKind", elemType.TypeKind())
+	}
+	if elemType.IntTypeWidth() != 32 {
+		t.Errorf("spmdMaskElemType() width = %d, want 32 (i32 on WASM)", elemType.IntTypeWidth())
+	}
+}
+
+// TestSPMDWrapMask verifies that spmdWrapMask sign-extends <N x i1> to <N x i32> on WASM.
+func TestSPMDWrapMask(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	// Create a <4 x i1> comparison result.
+	i1VecType := llvm.VectorType(c.ctx.Int1Type(), laneCount)
+	cmpResult := llvm.ConstAllOnes(i1VecType) // all-true
+
+	// spmdWrapMask should sext to <4 x i32> on WASM.
+	wrapped := b.spmdWrapMask(cmpResult, laneCount)
+
+	if wrapped.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatalf("wrapped type kind = %v, want VectorTypeKind", wrapped.Type().TypeKind())
+	}
+	if wrapped.Type().VectorSize() != laneCount {
+		t.Errorf("wrapped lane count = %d, want %d", wrapped.Type().VectorSize(), laneCount)
+	}
+	if wrapped.Type().ElementType().IntTypeWidth() != 32 {
+		t.Errorf("wrapped elem width = %d, want 32", wrapped.Type().ElementType().IntTypeWidth())
+	}
+}
+
+// TestSPMDUnwrapMaskForIntrinsic verifies that spmdUnwrapMaskForIntrinsic truncates
+// <N x i32> masks back to <N x i1> for LLVM masked memory intrinsics.
+func TestSPMDUnwrapMaskForIntrinsic(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	// Create a <4 x i32> mask (WASM format, all-ones = all active).
+	i32VecType := llvm.VectorType(c.ctx.Int32Type(), laneCount)
+	i32Mask := llvm.ConstAllOnes(i32VecType)
+
+	// spmdUnwrapMaskForIntrinsic should truncate to <4 x i1>.
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(i32Mask, laneCount)
+
+	if i1Mask.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatalf("i1Mask type kind = %v, want VectorTypeKind", i1Mask.Type().TypeKind())
+	}
+	if i1Mask.Type().VectorSize() != laneCount {
+		t.Errorf("i1Mask lane count = %d, want %d", i1Mask.Type().VectorSize(), laneCount)
+	}
+	if i1Mask.Type().ElementType().IntTypeWidth() != 1 {
+		t.Errorf("i1Mask elem width = %d, want 1", i1Mask.Type().ElementType().IntTypeWidth())
+	}
+}
+
+// TestSPMDMaskSelectWASM verifies that spmdMaskSelect uses bitwise ops on WASM
+// (since <N x i32> cannot be used directly as a CreateSelect condition).
+func TestSPMDMaskSelectWASM(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	// Create a <4 x i32> mask (all-ones = all lanes active).
+	maskType := llvm.VectorType(i32Type, laneCount)
+	mask := llvm.ConstAllOnes(maskType)
+
+	// Create two vector values to select between.
+	vecType := llvm.VectorType(i32Type, laneCount)
+	trueElts := make([]llvm.Value, laneCount)
+	falseElts := make([]llvm.Value, laneCount)
+	for i := range trueElts {
+		trueElts[i] = llvm.ConstInt(i32Type, uint64(i+1), false)
+		falseElts[i] = llvm.ConstInt(i32Type, 0, false)
+	}
+	trueVec := llvm.ConstVector(trueElts, false)
+	falseVec := llvm.ConstVector(falseElts, false)
+
+	// spmdMaskSelect should produce a vector result.
+	result := b.spmdMaskSelect(mask, trueVec, falseVec)
+
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatalf("result type kind = %v, want VectorTypeKind", result.Type().TypeKind())
+	}
+	if result.Type() != vecType {
+		t.Errorf("result type = %v, want %v", result.Type(), vecType)
+	}
+}
+
+// TestSPMDVectorAnyTrueWASM verifies that spmdVectorAnyTrue handles <N x i32> masks
+// (WASM format) by bitcasting to i128 and comparing != 0.
+func TestSPMDVectorAnyTrueWASM(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	// Create a <4 x i32> mask (all-ones).
+	maskType := llvm.VectorType(i32Type, laneCount)
+	mask := llvm.ConstAllOnes(maskType)
+
+	// spmdVectorAnyTrue should return scalar i1.
+	result := b.spmdVectorAnyTrue(mask)
+
+	if result.Type().TypeKind() != llvm.IntegerTypeKind {
+		t.Fatalf("result type kind = %v, want IntegerTypeKind", result.Type().TypeKind())
+	}
+	if result.Type().IntTypeWidth() != 1 {
+		t.Errorf("result width = %d, want 1 (scalar i1)", result.Type().IntTypeWidth())
+	}
+}
+
+// TestSPMDNormalizeBoolVecToI1 verifies that spmdNormalizeBoolVecToI1 truncates
+// <N x i32> to <N x i1> on WASM for bool-specific reduce operations.
+func TestSPMDNormalizeBoolVecToI1(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32VecType := llvm.VectorType(c.ctx.Int32Type(), laneCount)
+	i32Mask := llvm.ConstAllOnes(i32VecType)
+
+	// On WASM, spmdNormalizeBoolVecToI1 truncates <4 x i32> to <4 x i1>.
+	i1Vec := b.spmdNormalizeBoolVecToI1(i32Mask)
+
+	if i1Vec.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatalf("i1Vec type kind = %v, want VectorTypeKind", i1Vec.Type().TypeKind())
+	}
+	if i1Vec.Type().VectorSize() != laneCount {
+		t.Errorf("i1Vec lane count = %d, want %d", i1Vec.Type().VectorSize(), laneCount)
+	}
+	if i1Vec.Type().ElementType().IntTypeWidth() != 1 {
+		t.Errorf("i1Vec elem width = %d, want 1", i1Vec.Type().ElementType().IntTypeWidth())
+	}
+}
+
+// TestSPMDMaskedLoadWithI32Mask verifies that spmdMaskedLoad correctly unwraps
+// an <N x i32> mask to <N x i1> before calling the LLVM masked.load intrinsic.
+func TestSPMDMaskedLoadWithI32Mask(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	elemType := c.ctx.Int32Type()
+	vecType := llvm.VectorType(elemType, laneCount)
+
+	// Create <4 x i32> mask (WASM format).
+	i32MaskType := llvm.VectorType(c.ctx.Int32Type(), laneCount)
+	mask := llvm.ConstAllOnes(i32MaskType)
+
+	// Allocate a buffer for the pointer.
+	arrType := llvm.ArrayType(elemType, laneCount)
+	ptr := b.CreateAlloca(arrType, "test.alloca")
+	zero := llvm.ConstInt(c.ctx.Int32Type(), 0, false)
+	scalarPtr := b.CreateInBoundsGEP(arrType, ptr, []llvm.Value{zero, zero}, "test.ptr")
+
+	// spmdMaskedLoad should unwrap the i32 mask to i1 internally.
+	result := b.spmdMaskedLoad(vecType, scalarPtr, mask)
+
+	if result.IsNil() {
+		t.Fatal("spmdMaskedLoad returned nil")
+	}
+	if result.Type() != vecType {
+		t.Errorf("result type = %v, want %v", result.Type(), vecType)
+	}
+
+	// Verify the intrinsic uses <4 x i1> mask parameter (not <4 x i32>).
+	intrinsicName := "llvm.masked.load.v4i32.p0"
+	fn := c.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		t.Fatalf("intrinsic %q not found in module", intrinsicName)
+	}
+	// The 3rd parameter (index 2) of masked.load should be <4 x i1>.
+	fnType := fn.GlobalValueType()
+	paramTypes := fnType.ParamTypes()
+	if len(paramTypes) < 3 {
+		t.Fatalf("expected >= 3 params, got %d", len(paramTypes))
+	}
+	maskParam := paramTypes[2]
+	if maskParam.TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("mask param kind = %v, want VectorTypeKind", maskParam.TypeKind())
+	}
+	if maskParam.ElementType().IntTypeWidth() != 1 {
+		t.Errorf("mask param elem width = %d, want 1 (i1)", maskParam.ElementType().IntTypeWidth())
 	}
 }
