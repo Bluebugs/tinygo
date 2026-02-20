@@ -3264,12 +3264,17 @@ func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Va
 					// Dividing x by 1 obviously returns x, therefore satisfying
 					// the Go specification without a branch.
 					llvmType := x.Type()
-					minusOne := llvm.ConstSub(llvm.ConstInt(llvmType, 0, false), llvm.ConstInt(llvmType, 1, false))
-					lowestInteger := llvm.ConstInt(x.Type(), 1<<(llvmType.IntTypeWidth()-1), false)
+					// For vectors, we need to get the element type's width.
+					actualType := llvmType
+					if actualType.TypeKind() == llvm.VectorTypeKind {
+						actualType = actualType.ElementType()
+					}
+					minusOne := llvm.ConstSub(spmdConstIntOrSplat(llvmType, 0, false), spmdConstIntOrSplat(llvmType, 1, false))
+					lowestInteger := spmdConstIntOrSplat(x.Type(), 1<<(actualType.IntTypeWidth()-1), false)
 					yIsMinusOne := b.CreateICmp(llvm.IntEQ, y, minusOne, "")
 					xIsLowestInteger := b.CreateICmp(llvm.IntEQ, x, lowestInteger, "")
 					hasOverflow := b.CreateAnd(yIsMinusOne, xIsLowestInteger, "")
-					y = b.CreateSelect(hasOverflow, llvm.ConstInt(llvmType, 1, true), y, "")
+					y = b.CreateSelect(hasOverflow, spmdConstIntOrSplat(llvmType, 1, true), y, "")
 
 					if op == token.QUO {
 						return b.CreateSDiv(x, y, ""), nil
@@ -3295,14 +3300,23 @@ func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Va
 					b.createNegativeShiftCheck(y)
 				}
 
-				sizeX := b.targetData.TypeAllocSize(x.Type())
-				sizeY := b.targetData.TypeAllocSize(y.Type())
+				// For vectors, we need the element type size, not the whole vector size.
+				actualXType := x.Type()
+				if actualXType.TypeKind() == llvm.VectorTypeKind {
+					actualXType = actualXType.ElementType()
+				}
+				actualYType := y.Type()
+				if actualYType.TypeKind() == llvm.VectorTypeKind {
+					actualYType = actualYType.ElementType()
+				}
+				sizeX := b.targetData.TypeAllocSize(actualXType)
+				sizeY := b.targetData.TypeAllocSize(actualYType)
 
 				// Check if the shift is bigger than the bit-width of the shifted value.
 				// This is UB in LLVM, so it needs to be handled separately.
 				// The Go spec indirectly defines the result as 0.
 				// Negative shifts are handled earlier, so we can treat y as unsigned.
-				overshifted := b.CreateICmp(llvm.IntUGE, y, llvm.ConstInt(y.Type(), 8*sizeX, false), "shift.overflow")
+				overshifted := b.CreateICmp(llvm.IntUGE, y, spmdConstIntOrSplat(y.Type(), 8*sizeX, false), "shift.overflow")
 
 				// Adjust the size of y to match x.
 				switch {
@@ -3322,7 +3336,7 @@ func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Va
 					if signed {
 						// Arithmetic right shifts work differently, since shifting a negative number right yields -1.
 						// Cap the shift input rather than selecting the output.
-						y = b.CreateSelect(overshifted, llvm.ConstInt(y.Type(), 8*sizeX-1, false), y, "shift.offset")
+						y = b.CreateSelect(overshifted, spmdConstIntOrSplat(y.Type(), 8*sizeX-1, false), y, "shift.offset")
 						return b.CreateAShr(x, y, ""), nil
 					} else {
 						val = b.CreateLShr(x, y, "")
@@ -3332,7 +3346,7 @@ func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Va
 				}
 
 				// Select between the shift result and zero depending on whether there was an overshift.
-				return b.CreateSelect(overshifted, llvm.ConstInt(val.Type(), 0, false), val, "shift.result"), nil
+				return b.CreateSelect(overshifted, spmdConstIntOrSplat(val.Type(), 0, false), val, "shift.result"), nil
 			case token.EQL: // ==
 				return b.CreateICmp(llvm.IntEQ, x, y, ""), nil
 			case token.NEQ: // !=

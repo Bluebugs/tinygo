@@ -379,6 +379,23 @@ func (c *compilerContext) createSPMDConst(expr *ssa.Const, spmdType *types.SPMDT
 	return llvm.ConstVector(elts, false)
 }
 
+// spmdConstIntOrSplat creates an integer constant, splatting it into a vector if typ is a vector type.
+// This is used for creating constants that need to match the type of a potentially-vector operand,
+// such as bounds check comparisons and shift overflow checks.
+func spmdConstIntOrSplat(typ llvm.Type, val uint64, signed bool) llvm.Value {
+	if typ.TypeKind() == llvm.VectorTypeKind {
+		elemType := typ.ElementType()
+		scalar := llvm.ConstInt(elemType, val, signed)
+		laneCount := typ.VectorSize()
+		elts := make([]llvm.Value, laneCount)
+		for i := range elts {
+			elts[i] = scalar
+		}
+		return llvm.ConstVector(elts, false)
+	}
+	return llvm.ConstInt(typ, val, signed)
+}
+
 // spmdLoopState holds per-function SPMD loop analysis results.
 type spmdLoopState struct {
 	activeLoops map[ssa.Value]*spmdActiveLoop // iter phi -> active loop

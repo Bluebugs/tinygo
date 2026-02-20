@@ -210,6 +210,16 @@ func (b *builder) createNegativeShiftCheck(shift llvm.Value) {
 		return
 	}
 
+	// Handle vector shifts: compare per-lane, then reduce with any-true.
+	if shift.Type().TypeKind() == llvm.VectorTypeKind {
+		zeroVec := b.splatScalar(
+			llvm.ConstInt(shift.Type().ElementType(), 0, false), shift.Type())
+		isNegVec := b.CreateICmp(llvm.IntSLT, shift, zeroVec, "")
+		isNegative := b.spmdVectorAnyTrue(isNegVec)
+		b.createRuntimeAssert(isNegative, "shift", "negativeShiftPanic")
+		return
+	}
+
 	// isNegative = shift < 0
 	isNegative := b.CreateICmp(llvm.IntSLT, shift, llvm.ConstInt(shift.Type(), 0, false), "")
 	b.createRuntimeAssert(isNegative, "shift", "negativeShiftPanic")
@@ -220,6 +230,16 @@ func (b *builder) createNegativeShiftCheck(shift llvm.Value) {
 // by zero must cause a run time panic.
 func (b *builder) createDivideByZeroCheck(y llvm.Value) {
 	if b.info.nobounds {
+		return
+	}
+
+	// Handle vector divisors: compare per-lane, then reduce with any-true.
+	if y.Type().TypeKind() == llvm.VectorTypeKind {
+		zeroVec := b.splatScalar(
+			llvm.ConstInt(y.Type().ElementType(), 0, false), y.Type())
+		isZeroVec := b.CreateICmp(llvm.IntEQ, y, zeroVec, "")
+		isZero := b.spmdVectorAnyTrue(isZeroVec)
+		b.createRuntimeAssert(isZero, "divbyzero", "divideByZeroPanic")
 		return
 	}
 

@@ -2714,3 +2714,52 @@ func TestSPMDMaskedLoadWithI32Mask(t *testing.T) {
 		t.Errorf("mask param elem width = %d, want 1 (i1)", maskParam.ElementType().IntTypeWidth())
 	}
 }
+
+func TestSPMDConstIntOrSplat(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name      string
+		typ       llvm.Type
+		val       uint64
+		expectVec bool
+		lanes     int
+	}{
+		{"scalar_i32", c.ctx.Int32Type(), 42, false, 0},
+		{"vector_4xi32", llvm.VectorType(c.ctx.Int32Type(), 4), 42, true, 4},
+		{"scalar_i64", c.ctx.Int64Type(), 100, false, 0},
+		{"vector_2xi64", llvm.VectorType(c.ctx.Int64Type(), 2), 100, true, 2},
+		{"scalar_i8", c.ctx.Int8Type(), 7, false, 0},
+		{"vector_16xi8", llvm.VectorType(c.ctx.Int8Type(), 16), 7, true, 16},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := spmdConstIntOrSplat(tt.typ, tt.val, false)
+			if result.IsNil() {
+				t.Fatal("spmdConstIntOrSplat returned nil")
+			}
+			if tt.expectVec {
+				if result.Type().TypeKind() != llvm.VectorTypeKind {
+					t.Errorf("expected vector type, got %v", result.Type().TypeKind())
+				}
+				if result.Type().VectorSize() != tt.lanes {
+					t.Errorf("expected %d lanes, got %d", tt.lanes, result.Type().VectorSize())
+				}
+				// Verify all lanes have the same value (for constant vectors).
+				if !result.IsConstant() {
+					t.Error("expected constant vector")
+				}
+			} else {
+				if result.Type().TypeKind() == llvm.VectorTypeKind {
+					t.Error("expected scalar type, got vector")
+				}
+				// Verify scalar value.
+				if !result.IsConstant() {
+					t.Error("expected constant scalar")
+				}
+			}
+		})
+	}
+}
