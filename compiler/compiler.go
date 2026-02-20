@@ -2369,9 +2369,10 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 	}
 
 	// SPMD: insert execution mask as first argument for non-exported SPMD function calls.
-	// Exported SPMD functions are forbidden by the type checker, but we guard
-	// defensively to match the mask exclusion in getFunction/createFunctionStart.
-	if fn := instr.StaticCallee(); fn != nil && b.isSPMDFunction(fn) {
+	// Use spmdMaskType (not isSPMDFunction) to match the mask-insertion logic in
+	// getFunction/createFunctionStart/getLLVMFunctionType — all of which only add a
+	// mask parameter when the function has varying PARAMETERS (not just results).
+	if fn := instr.StaticCallee(); fn != nil && b.spmdMaskType(fn) != (llvm.Type{}) {
 		info := b.getFunctionInfo(fn)
 		if !info.exported {
 			mask := b.spmdCallMask(fn)
