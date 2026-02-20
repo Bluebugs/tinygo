@@ -189,6 +189,7 @@ type builder struct {
 	spmdFuncIsBody        bool                                // true if entire function body is an SPMD region (varying params, no go-for loops)
 	spmdForLoops          map[int]*spmdForLoopInfo            // body block index -> for-loop info (SPMD func body only)
 	spmdBreakRedirects    map[int]spmdBreakRedirect           // then-block index -> break redirect info
+	spmdBreakPhiOverrides map[*ssa.Phi]llvm.Value             // phi -> final value (for break result phis at rangeint.done)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1427,6 +1428,32 @@ func (b *builder) createFunction() {
 					}
 					b.CreateStore(zeroMask, loop.breakMaskAlloca)
 				}
+
+				// Initialize break result allocas to their default values.
+				for _, br := range loop.breakResults {
+					if !br.alloca.IsNil() {
+						// Get the LLVM value for the default edge.
+						// The default value is from the entry block, so we need to handle
+						// the case where it's a constant.
+						var defaultLLVMVal llvm.Value
+						if constVal, ok := br.defaultVal.(*ssa.Const); ok {
+							// Create the constant value.
+							defaultLLVMVal = b.createConst(constVal, constVal.Pos())
+						} else {
+							// Initialize with zero as placeholder. The phi provides the correct
+							// default value from the non-break edge during phi resolution.
+							phiType := b.getLLVMType(br.phi.Type())
+							defaultLLVMVal = llvm.ConstNull(phiType)
+						}
+
+						b.SetInsertPointBefore(br.alloca)
+						insertAfterAlloca := llvm.NextInstruction(br.alloca)
+						if !insertAfterAlloca.IsNil() {
+							b.SetInsertPointBefore(insertAfterAlloca)
+						}
+						b.CreateStore(defaultLLVMVal, br.alloca)
+					}
+				}
 			}
 			if !savedBlock.IsNil() {
 				b.SetInsertPointAtEnd(savedBlock)
@@ -1442,6 +1469,7 @@ func (b *builder) createFunction() {
 		b.spmdMaskTransitions = make(map[int]*spmdMaskTransition)
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
 		b.spmdBreakRedirects = make(map[int]spmdBreakRedirect)
+		b.spmdBreakPhiOverrides = make(map[*ssa.Phi]llvm.Value)
 	}
 
 	// Fill blocks with instructions.
@@ -1488,32 +1516,13 @@ func (b *builder) createFunction() {
 		}
 
 		// SPMD: handle loop body entry mask computation (for regular for loops in SPMD function bodies).
+		// NOTE: This computation is deferred to after phis are created to avoid violating LLVM's
+		// requirement that all PHIs be grouped at the top of the basic block. We'll do this in
+		// the instruction processing loop when we encounter the first non-phi instruction.
+		// For now, just mark that we need to compute the mask.
 		if b.spmdForLoops != nil {
-			if loopInfo, ok := b.spmdForLoops[block.Index]; ok {
-				// Load break mask and compute active mask for this iteration.
-				maskType := llvm.VectorType(b.ctx.Int1Type(), loopInfo.laneCount)
-				breakMask := b.CreateLoad(maskType, loopInfo.breakMaskAlloca, "break.mask")
-				notBreak := b.CreateNot(breakMask, "not.break")
-
-				// Get the current mask (top of stack). This respects any enclosing
-				// varying-if context, not just the function entry mask.
-				var entryMask llvm.Value
-				if parentMask := b.spmdCurrentMask(); !parentMask.IsNil() {
-					entryMask = parentMask
-				} else if !b.spmdEntryMask.IsNil() {
-					entryMask = b.spmdEntryMask
-				} else {
-					entryMask = llvm.ConstAllOnes(maskType)
-				}
-
-				activeMask := b.CreateAnd(entryMask, notBreak, "spmd.active.mask")
-
-				// Set as the base mask (replace spmdMaskStack[0]).
-				if len(b.spmdMaskStack) > 0 {
-					b.spmdMaskStack[0] = activeMask
-				} else {
-					b.spmdMaskStack = []llvm.Value{activeMask}
-				}
+			if _, ok := b.spmdForLoops[block.Index]; ok {
+				// Will be handled after phis are created
 			}
 		}
 
@@ -1577,13 +1586,47 @@ func (b *builder) createFunction() {
 			b.createInstruction(instr)
 
 			// SPMD: after compiling an SPMD loop's iter phi, emit the body prologue.
-			if b.spmdValueOverride != nil {
+			if b.spmdValueOverride != nil && b.spmdLoopState != nil {
 				if phi, ok := instr.(*ssa.Phi); ok {
 					if loop, ok := b.spmdLoopState.activeLoops[phi]; ok {
 						b.emitSPMDBodyPrologue(loop)
 						b.spmdValueOverride[phi] = loop.laneIndices
 						// Initialize mask stack with the tail mask for this loop.
 						b.spmdMaskStack = []llvm.Value{loop.tailMask}
+					}
+				}
+			}
+
+			// SPMD: after compiling a regular for loop's iter phi, compute entry mask.
+			// This ensures the mask computation happens AFTER all phis are created,
+			// avoiding LLVM verification errors about phi grouping.
+			if b.spmdForLoops != nil {
+				if phi, ok := instr.(*ssa.Phi); ok && phi.Comment == "rangeint.iter" {
+					if loopInfo, ok := b.spmdForLoops[block.Index]; ok {
+						// Load break mask and compute active mask for this iteration.
+						maskType := llvm.VectorType(b.ctx.Int1Type(), loopInfo.laneCount)
+						breakMask := b.CreateLoad(maskType, loopInfo.breakMaskAlloca, "break.mask")
+						notBreak := b.CreateNot(breakMask, "not.break")
+
+						// Get the current mask (top of stack). This respects any enclosing
+						// varying-if context, not just the function entry mask.
+						var entryMask llvm.Value
+						if parentMask := b.spmdCurrentMask(); !parentMask.IsNil() {
+							entryMask = parentMask
+						} else if !b.spmdEntryMask.IsNil() {
+							entryMask = b.spmdEntryMask
+						} else {
+							entryMask = llvm.ConstAllOnes(maskType)
+						}
+
+						activeMask := b.CreateAnd(entryMask, notBreak, "spmd.active.mask")
+
+						// Set as the base mask (replace spmdMaskStack[0]).
+						if len(b.spmdMaskStack) > 0 {
+							b.spmdMaskStack[0] = activeMask
+						} else {
+							b.spmdMaskStack = []llvm.Value{activeMask}
+						}
 					}
 				}
 			}
@@ -1612,6 +1655,28 @@ func (b *builder) createFunction() {
 	for _, phi := range b.phis {
 		block := phi.ssa.Block()
 		for i, edge := range phi.ssa.Edges {
+			// SPMD: skip break edge for break result phis.
+			// The break edge is redirected to the continuation block (via spmdBreakRedirects),
+			// so it's not a real predecessor of the done block in the LLVM CFG. The alloca
+			// accumulates break values instead, which are selected at the phi.
+			skipEdge := false
+			if b.spmdForLoops != nil {
+				for _, loop := range b.spmdForLoops {
+					for _, br := range loop.breakResults {
+						if br.phi == phi.ssa && i == br.breakEdge {
+							skipEdge = true
+							break
+						}
+					}
+					if skipEdge {
+						break
+					}
+				}
+			}
+			if skipEdge {
+				continue
+			}
+
 			llvmVal := b.getValue(edge, getPos(phi.ssa))
 			// SPMD: rangeindex loop phi starts at -1; change to -laneCount.
 			if b.spmdLoopState != nil {
@@ -1781,6 +1846,18 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			currentBreak := b.CreateLoad(maskType, redir.loop.breakMaskAlloca, "break.mask.cur")
 			newBreak := b.CreateOr(currentBreak, mask, "break.mask.new")
 			b.CreateStore(newBreak, redir.loop.breakMaskAlloca)
+
+			// Update break result allocas with masked select.
+			for _, br := range redir.loop.breakResults {
+				// Get the break value from the SSA instruction.
+				breakVal := b.getValue(br.breakVal, getPos(instr))
+
+				// Load current result, select based on mask, store back.
+				resultType := b.getLLVMType(br.phi.Type())
+				oldResult := b.CreateLoad(resultType, br.alloca, "break.result.old")
+				newResult := b.CreateSelect(mask, breakVal, oldResult, "break.result.new")
+				b.CreateStore(newResult, br.alloca)
+			}
 
 			// Redirect to continuation (else) block instead of rangeint.done.
 			b.CreateBr(redir.target)
@@ -2607,6 +2684,86 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		val := b.getValue(expr.X, getPos(expr))
 		index := b.getValue(expr.Index, getPos(expr))
 
+		// SPMD: when index is a vector (varying), generate a vector of pointers
+		// for gather/scatter operations. This handles computed varying indices
+		// like "j*width + i" where i is the SPMD loop iter.
+		if index.Type().TypeKind() == llvm.VectorTypeKind {
+			laneCount := index.Type().VectorSize()
+
+			// Get buffer pointer and element type.
+			var bufptr llvm.Value
+			var bufType llvm.Type
+			var elemType llvm.Type
+			switch ptrTyp := expr.X.Type().Underlying().(type) {
+			case *types.Pointer:
+				typ := ptrTyp.Elem().Underlying()
+				switch typ := typ.(type) {
+				case *types.Array:
+					bufptr = val
+					bufType = b.getLLVMType(typ)
+					elemType = b.getLLVMType(typ.Elem())
+					b.createNilCheck(expr.X, bufptr, "gep")
+				default:
+					return llvm.Value{}, b.makeError(expr.Pos(), "unsupported SPMD vector indexaddr type: "+typ.String())
+				}
+			case *types.Slice:
+				bufptr = b.CreateExtractValue(val, 0, "indexaddr.ptr")
+				bufType = b.getLLVMType(ptrTyp.Elem())
+				elemType = bufType
+			default:
+				return llvm.Value{}, b.makeError(expr.Pos(), "unsupported SPMD vector indexaddr type: "+ptrTyp.String())
+			}
+
+			// Vector bounds check: verify all lane indices are in bounds.
+			if !b.info.nobounds {
+				var buflen llvm.Value
+				switch ptrTyp := expr.X.Type().Underlying().(type) {
+				case *types.Pointer:
+					typ := ptrTyp.Elem().Underlying().(*types.Array)
+					buflen = llvm.ConstInt(b.uintptrType, uint64(typ.Len()), false)
+				case *types.Slice:
+					buflen = b.CreateExtractValue(val, 1, "indexaddr.len")
+				}
+				if !buflen.IsNil() {
+					// Extract each lane index and check against length.
+					// OR all the out-of-bounds flags together.
+					anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
+					for lane := 0; lane < laneCount; lane++ {
+						idx := b.CreateExtractElement(index, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+						if idx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+							idx = b.CreateSExt(idx, b.uintptrType, "")
+						}
+						oob := b.CreateICmp(llvm.IntUGE, idx, buflen, "")
+						anyOOB = b.CreateOr(anyOOB, oob, "")
+					}
+					b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+				}
+			}
+
+			// Build vector of pointers: each lane gets its own GEP.
+			// All LLVM pointers are opaque (ptr), so we create a vector of ptr.
+			ptrVec := llvm.Undef(llvm.VectorType(bufptr.Type(), laneCount))
+			for lane := 0; lane < laneCount; lane++ {
+				laneIdx := b.CreateExtractElement(index, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+				// Extend lane index to uintptr width
+				if laneIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+					laneIdx = b.CreateSExt(laneIdx, b.uintptrType, "")
+				}
+				var gep llvm.Value
+				switch expr.X.Type().Underlying().(type) {
+				case *types.Pointer:
+					gep = b.CreateInBoundsGEP(bufType, bufptr, []llvm.Value{
+						llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+						laneIdx,
+					}, "")
+				case *types.Slice:
+					gep = b.CreateInBoundsGEP(elemType, bufptr, []llvm.Value{laneIdx}, "")
+				}
+				ptrVec = b.CreateInsertElement(ptrVec, gep, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+			}
+			return ptrVec, nil
+		}
+
 		// Get buffer pointer and length
 		var bufptr, buflen llvm.Value
 		var bufType llvm.Type
@@ -2735,6 +2892,29 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			return b.createMapIteratorNext(rangeVal, llvmRangeVal, it), nil
 		}
 	case *ssa.Phi:
+		// SPMD: check for break result phi.
+		if b.spmdForLoops != nil {
+			for _, loop := range b.spmdForLoops {
+				for _, br := range loop.breakResults {
+					if br.phi == expr {
+						// This is a break result phi at rangeint.done.
+						// Create the phi normally (will get edges from entry and if.done).
+						phiType := b.getLLVMType(expr.Type())
+						phi := b.CreatePHI(phiType, "")
+						b.phis = append(b.phis, phiNode{expr, phi})
+
+						// Load break result and break mask.
+						breakResult := b.CreateLoad(phiType, br.alloca, "break.result")
+						maskType := llvm.VectorType(b.ctx.Int1Type(), loop.laneCount)
+						breakMask := b.CreateLoad(maskType, loop.breakMaskAlloca, "break.mask")
+
+						// Select between break result and phi result based on break mask.
+						finalResult := b.CreateSelect(breakMask, breakResult, phi, "phi.with.break")
+						return finalResult, nil
+					}
+				}
+			}
+		}
 		if val, ok := b.spmdCreateMergeSelect(expr); ok {
 			return val, nil
 		}
