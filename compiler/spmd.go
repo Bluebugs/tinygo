@@ -1585,33 +1585,56 @@ func (b *builder) spmdAnalyzeContiguousIndex(index ssa.Value) (*spmdActiveLoop, 
 
 	// Try X=iter, Y=scalar.
 	if loop, ok := b.spmdLoopState.activeLoops[binop.X]; ok {
-		if _, isVec := b.spmdValueOverride[binop.Y]; !isVec {
-			scalarY := b.getValue(binop.Y, getPos(binop))
-			if scalarY.Type().TypeKind() != llvm.VectorTypeKind {
-				scalarBase := b.CreateAdd(scalarY, loop.scalarIterVal, "spmd.contiguous.base")
-				return loop, scalarBase, true
-			}
+		if scalarVal, ok := b.spmdUnwrapScalar(binop.Y); ok {
+			scalarBase := b.CreateAdd(scalarVal, loop.scalarIterVal, "spmd.contiguous.base")
+			return loop, scalarBase, true
 		}
 	}
 	// Try X=scalar, Y=iter.
 	if loop, ok := b.spmdLoopState.activeLoops[binop.Y]; ok {
-		if _, isVec := b.spmdValueOverride[binop.X]; !isVec {
-			scalarX := b.getValue(binop.X, getPos(binop))
-			if scalarX.Type().TypeKind() != llvm.VectorTypeKind {
-				scalarBase := b.CreateAdd(scalarX, loop.scalarIterVal, "spmd.contiguous.base")
-				return loop, scalarBase, true
-			}
+		if scalarVal, ok := b.spmdUnwrapScalar(binop.X); ok {
+			scalarBase := b.CreateAdd(scalarVal, loop.scalarIterVal, "spmd.contiguous.base")
+			return loop, scalarBase, true
 		}
 	}
 
 	return nil, llvm.Value{}, false
 }
 
-// spmdContiguousIndexAddrWithBase handles IndexAddr for contiguous SPMD access
-// using a pre-computed scalar base index (from spmdAnalyzeContiguousIndex).
-// Returns a scalar pointer to the base element for subsequent vector load/store.
-func (b *builder) spmdContiguousIndexAddrWithBase(expr *ssa.IndexAddr, loop *spmdActiveLoop, scalarBase llvm.Value) (llvm.Value, error) {
-	return b.spmdContiguousIndexAddrCore(expr, loop, scalarBase)
+// spmdUnwrapScalar retrieves the scalar LLVM value for an SSA value that may
+// be wrapped in *ssa.ChangeType chains that broadcast scalars to vectors.
+// Note: only *ssa.ChangeType is unwrapped; *ssa.Convert is NOT (it may change
+// the numeric value and does not correspond to a pure type annotation).
+// Callers must ensure b.spmdValueOverride != nil before calling this function.
+// Returns (scalarValue, true) if the underlying value is scalar, or (_, false)
+// if the value is genuinely varying (in spmdValueOverride or inherently vector).
+func (b *builder) spmdUnwrapScalar(v ssa.Value) (llvm.Value, bool) {
+	// Unwrap ChangeType chains to find the underlying SSA value before any
+	// scalar-to-vector broadcasting. This handles patterns like:
+	//   j*width → ChangeType(j*width, SPMDType{int})
+	// where the ChangeType splats the scalar to all lanes.
+	unwrapped := v
+	for {
+		if ct, ok := unwrapped.(*ssa.ChangeType); ok {
+			unwrapped = ct.X
+		} else {
+			break
+		}
+	}
+
+	// Defensive check: if the unwrapped value is also in spmdValueOverride,
+	// it's genuinely varying (e.g., a ChangeType wrapping the iter phi itself).
+	if _, isVec := b.spmdValueOverride[unwrapped]; isVec {
+		return llvm.Value{}, false
+	}
+
+	// Get the LLVM value for the unwrapped (scalar) SSA value.
+	// Use the unwrapped value's position for better error location accuracy.
+	scalarVal := b.getValue(unwrapped, getPos(unwrapped))
+	if scalarVal.Type().TypeKind() == llvm.VectorTypeKind {
+		return llvm.Value{}, false
+	}
+	return scalarVal, true
 }
 
 // spmdContiguousIndexAddr handles IndexAddr for contiguous SPMD access.

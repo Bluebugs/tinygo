@@ -2741,7 +2741,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			}
 			// Generalized path: index is scalar_expr + iter (e.g., j*width + i).
 			if loop, scalarBase, ok := b.spmdAnalyzeContiguousIndex(expr.Index); ok {
-				if result, err := b.spmdContiguousIndexAddrWithBase(expr, loop, scalarBase); err == nil {
+				if result, err := b.spmdContiguousIndexAddrCore(expr, loop, scalarBase); err == nil {
 					return result, nil
 				}
 			}

@@ -1528,6 +1528,12 @@ func TestSPMDMaskTransitionTypes(t *testing.T) {
 
 func TestSPMDContiguousInfoFields(t *testing.T) {
 	// Verify spmdContiguousInfo fields can be set and read.
+	//
+	// spmdUnwrapScalar (used by spmdAnalyzeContiguousIndex) cannot be unit-tested
+	// directly because it requires a live spmdValueOverride map, which is only
+	// populated during full function compilation. The ChangeType-unwrap path is
+	// exercised end-to-end by the mandelbrot integration test (integ_mandelbrot),
+	// which verifies 0 differences vs serial output and a ~4x SPMD speedup.
 	c := newTestCompilerContext(t)
 	defer c.dispose()
 	b := newTestBuilder(t, c)
