@@ -1633,6 +1633,12 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		// Load as vector
 		return b.CreateLoad(vecType, ptr, "lanes.from"), nil
 
+	case strings.HasPrefix(name, "lanes.FromConstrained["):
+		return b.createFromConstrained(instr, name)
+
+	case strings.HasPrefix(name, "lanes.ToConstrained["):
+		return b.createToConstrained(instr, name)
+
 	default:
 		return llvm.Value{}, b.makeError(getPos(instr), "unsupported lanes builtin: "+name)
 	}
@@ -2381,4 +2387,191 @@ func (b *builder) spmdIsVaryingBreak(ifBlock *ssa.BasicBlock) (*spmdForLoopInfo,
 	}
 
 	return nil, false
+}
+
+// createFromConstrained handles lanes.FromConstrained[T](data Varying[T]) ([]Varying[T], []Varying[bool]).
+// It decomposes a constrained vector <constraintN x T> into ceil(constraintN/platformLanes) groups
+// of <platformLanes x T> vectors, plus per-group <platformLanes x maskElem> masks.
+// Returns an LLVM struct of two slices: {[]Varying[T], []Varying[bool]}.
+func (b *builder) createFromConstrained(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	// Get the input vector.
+	vec := b.getValue(instr.Args[0], getPos(instr))
+
+	// Get the input SPMDType from instr.Args[0].Type().
+	spmdType, ok := instr.Args[0].Type().(*types.SPMDType)
+	if !ok {
+		return llvm.Value{}, b.makeError(getPos(instr), "lanes.FromConstrained expects Varying[T] argument")
+	}
+
+	// Get element LLVM type.
+	elemLLVM := b.getLLVMType(spmdType.Elem())
+
+	// Compute constraint N and platform lane count.
+	constraintN := b.spmdEffectiveLaneCount(spmdType, elemLLVM)
+	platformLanes := b.spmdLaneCount(elemLLVM)
+
+	// Universal constraint (0) cannot be decomposed.
+	if spmdType.Constraint() == 0 {
+		return llvm.Value{}, b.makeError(getPos(instr), "cannot decompose universal constrained Varying[T, 0]; use type switch first")
+	}
+
+	// Compute number of groups.
+	numGroups := (constraintN + platformLanes - 1) / platformLanes
+
+	// The input vector may have been resized by the backend. Check actual size.
+	inputLanes := vec.Type().VectorSize()
+	if inputLanes != constraintN {
+		// Resize if needed (should only happen if input is smaller).
+		if inputLanes < constraintN {
+			vec = b.spmdResizeVector(vec, constraintN, elemLLVM)
+		}
+		// If input is larger, effective constraint should already be correct.
+	}
+
+	// Create platform vector type.
+	platVecType := llvm.VectorType(elemLLVM, platformLanes)
+
+	// Create mask elem type and mask vector type.
+	maskElem := b.spmdMaskElemType()
+	maskVecType := llvm.VectorType(maskElem, platformLanes)
+
+	// Allocate arrays on stack for values and masks.
+	valArrType := llvm.ArrayType(platVecType, numGroups)
+	maskArrType := llvm.ArrayType(maskVecType, numGroups)
+	valAlloca := b.CreateAlloca(valArrType, "fc.vals")
+	maskAlloca := b.CreateAlloca(maskArrType, "fc.masks")
+
+	// Extract each group via ShuffleVector and build masks.
+	i32 := b.ctx.Int32Type()
+	for g := 0; g < numGroups; g++ {
+		// Build shuffle mask to extract group.
+		indices := make([]llvm.Value, platformLanes)
+		for lane := 0; lane < platformLanes; lane++ {
+			srcIdx := g*platformLanes + lane
+			if srcIdx < constraintN {
+				indices[lane] = llvm.ConstInt(i32, uint64(srcIdx), false)
+			} else {
+				// Out-of-range: use 0 (safe), mask will mark inactive.
+				indices[lane] = llvm.ConstInt(i32, 0, false)
+			}
+		}
+		shuffleMask := llvm.ConstVector(indices, false)
+		groupVec := b.CreateShuffleVector(vec, llvm.Undef(vec.Type()), shuffleMask, "fc.group")
+
+		// Build mask: all-true for active lanes, all-false for inactive.
+		maskElems := make([]llvm.Value, platformLanes)
+		for lane := 0; lane < platformLanes; lane++ {
+			srcIdx := g*platformLanes + lane
+			if srcIdx < constraintN {
+				// Active: -1 (all ones) for i32, 1 for i1.
+				if maskElem == b.ctx.Int32Type() {
+					maskElems[lane] = llvm.ConstInt(maskElem, 0xFFFFFFFF, false)
+				} else {
+					maskElems[lane] = llvm.ConstInt(maskElem, 1, false)
+				}
+			} else {
+				maskElems[lane] = llvm.ConstInt(maskElem, 0, false)
+			}
+		}
+		groupMask := llvm.ConstVector(maskElems, false)
+
+		// Store to arrays.
+		valGEP := b.CreateInBoundsGEP(valArrType, valAlloca, []llvm.Value{
+			llvm.ConstInt(i32, 0, false),
+			llvm.ConstInt(i32, uint64(g), false),
+		}, "")
+		b.CreateStore(groupVec, valGEP)
+
+		maskGEP := b.CreateInBoundsGEP(maskArrType, maskAlloca, []llvm.Value{
+			llvm.ConstInt(i32, 0, false),
+			llvm.ConstInt(i32, uint64(g), false),
+		}, "")
+		b.CreateStore(groupMask, maskGEP)
+	}
+
+	// Build two slices and return as struct.
+	// Get result types from signature.
+	results := instr.Signature().Results()
+	valSliceType := b.getLLVMType(results.At(0).Type())  // []Varying[T]
+	maskSliceType := b.getLLVMType(results.At(1).Type()) // []Varying[bool]
+
+	lenVal := llvm.ConstInt(b.uintptrType, uint64(numGroups), false)
+
+	valPtr := b.CreateBitCast(valAlloca, b.dataPtrType, "")
+	valSlice := llvm.Undef(valSliceType)
+	valSlice = b.CreateInsertValue(valSlice, valPtr, 0, "")
+	valSlice = b.CreateInsertValue(valSlice, lenVal, 1, "")
+	valSlice = b.CreateInsertValue(valSlice, lenVal, 2, "")
+
+	maskPtr := b.CreateBitCast(maskAlloca, b.dataPtrType, "")
+	maskSlice := llvm.Undef(maskSliceType)
+	maskSlice = b.CreateInsertValue(maskSlice, maskPtr, 0, "")
+	maskSlice = b.CreateInsertValue(maskSlice, lenVal, 1, "")
+	maskSlice = b.CreateInsertValue(maskSlice, lenVal, 2, "")
+
+	// Multi-return: LLVM struct {valSlice, maskSlice}.
+	retType := b.ctx.StructType([]llvm.Type{valSliceType, maskSliceType}, false)
+	ret := llvm.Undef(retType)
+	ret = b.CreateInsertValue(ret, valSlice, 0, "")
+	ret = b.CreateInsertValue(ret, maskSlice, 1, "")
+	return ret, nil
+}
+
+// createToConstrained handles lanes.ToConstrained[T](data []Varying[T], mask []Varying[bool], target Varying[T]) Varying[T].
+// It reconstructs a constrained vector from groups of unconstrained platform vectors.
+// The target parameter determines the output constraint N from its SPMDType.
+func (b *builder) createToConstrained(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	// Get target type from the 3rd argument.
+	targetType, ok := instr.Args[2].Type().(*types.SPMDType)
+	if !ok {
+		return llvm.Value{}, b.makeError(getPos(instr), "lanes.ToConstrained target parameter must be Varying[T]")
+	}
+
+	// Get element LLVM type.
+	elemLLVM := b.getLLVMType(targetType.Elem())
+
+	// Compute constraint N, platform lanes, and number of groups.
+	constraintN := b.spmdEffectiveLaneCount(targetType, elemLLVM)
+	platformLanes := b.spmdLaneCount(elemLLVM)
+	numGroups := (constraintN + platformLanes - 1) / platformLanes
+
+	// Universal constraint (0) cannot be constructed.
+	if targetType.Constraint() == 0 {
+		return llvm.Value{}, b.makeError(getPos(instr), "cannot construct universal constrained Varying[T, 0]")
+	}
+
+	// Get the data slice.
+	dataSlice := b.getValue(instr.Args[0], getPos(instr))
+	dataPtr := b.CreateExtractValue(dataSlice, 0, "tc.data.ptr")
+
+	// Build output vector type.
+	outVecType := llvm.VectorType(elemLLVM, constraintN)
+
+	// Start with zeroinitializer.
+	result := llvm.ConstNull(outVecType)
+
+	// Load each group from the data slice and insert elements.
+	platVecType := llvm.VectorType(elemLLVM, platformLanes)
+	vecSize := b.targetData.TypeAllocSize(platVecType)
+	i32 := b.ctx.Int32Type()
+
+	for g := 0; g < numGroups; g++ {
+		// Load group vector from data slice.
+		offset := llvm.ConstInt(b.uintptrType, uint64(g)*vecSize, false)
+		groupPtrI8 := b.CreateInBoundsGEP(b.ctx.Int8Type(), dataPtr, []llvm.Value{offset}, "")
+		groupPtr := b.CreateBitCast(groupPtrI8, llvm.PointerType(platVecType, 0), "")
+		groupVec := b.CreateLoad(platVecType, groupPtr, "tc.group")
+
+		// Insert each element into result.
+		for lane := 0; lane < platformLanes; lane++ {
+			dstIdx := g*platformLanes + lane
+			if dstIdx >= constraintN {
+				break
+			}
+			elem := b.CreateExtractElement(groupVec, llvm.ConstInt(i32, uint64(lane), false), "")
+			result = b.CreateInsertElement(result, elem, llvm.ConstInt(i32, uint64(dstIdx), false), "")
+		}
+	}
+
+	return result, nil
 }
