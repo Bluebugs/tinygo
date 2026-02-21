@@ -2406,8 +2406,7 @@ func (b *builder) createFromConstrained(instr *ssa.CallCommon, name string) (llv
 	// Get element LLVM type.
 	elemLLVM := b.getLLVMType(spmdType.Elem())
 
-	// Compute constraint N and platform lane count.
-	constraintN := b.spmdEffectiveLaneCount(spmdType, elemLLVM)
+	// Compute platform lane count.
 	platformLanes := b.spmdLaneCount(elemLLVM)
 
 	// Universal constraint (0) cannot be decomposed.
@@ -2415,17 +2414,23 @@ func (b *builder) createFromConstrained(instr *ssa.CallCommon, name string) (llv
 		return llvm.Value{}, b.makeError(getPos(instr), "cannot decompose universal constrained Varying[T, 0]; use type switch first")
 	}
 
+	// Determine effective constraint N.
+	// Prefer the Go type's constraint when available, but fall back to the
+	// actual LLVM vector width. The Go type may have been relaxed from
+	// Varying[T, N] to Varying[T] by constrained-to-unconstrained assignment
+	// (Commit 1), but the LLVM vector retains its original width.
+	inputLanes := vec.Type().VectorSize()
+	constraintN := b.spmdEffectiveLaneCount(spmdType, elemLLVM)
+	if inputLanes > constraintN {
+		constraintN = inputLanes
+	}
+
 	// Compute number of groups.
 	numGroups := (constraintN + platformLanes - 1) / platformLanes
 
-	// The input vector may have been resized by the backend. Check actual size.
-	inputLanes := vec.Type().VectorSize()
-	if inputLanes != constraintN {
-		// Resize if needed (should only happen if input is smaller).
-		if inputLanes < constraintN {
-			vec = b.spmdResizeVector(vec, constraintN, elemLLVM)
-		}
-		// If input is larger, effective constraint should already be correct.
+	// Resize input vector if needed to match constraintN.
+	if inputLanes < constraintN {
+		vec = b.spmdResizeVector(vec, constraintN, elemLLVM)
 	}
 
 	// Create platform vector type.
