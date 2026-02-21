@@ -116,60 +116,6 @@ func TestSPMDExtractLoop(t *testing.T) {
 	if info.LaneCount != 4 {
 		t.Errorf("expected LaneCount=4, got %d", info.LaneCount)
 	}
-	if info.Constraint != -1 {
-		t.Errorf("expected Constraint=-1 (unconstrained), got %d", info.Constraint)
-	}
-}
-
-// TestSPMDExtractConstrainedLoop verifies extraction of constrained SPMD loops.
-func TestSPMDExtractConstrainedLoop(t *testing.T) {
-	pkg := createTestPackage(t, []*ast.File{
-		{
-			Name: ast.NewIdent("test"),
-			Decls: []ast.Decl{
-				&ast.FuncDecl{
-					Name: ast.NewIdent("constrainedFunc"),
-					Type: &ast.FuncType{
-						Params:  &ast.FieldList{},
-						Results: &ast.FieldList{},
-					},
-					Body: &ast.BlockStmt{
-						List: []ast.Stmt{
-							&ast.RangeStmt{
-								For:    token.Pos(150),
-								Range:  token.Pos(154),
-								Key:    ast.NewIdent("i"),
-								TokPos: token.Pos(156),
-								Tok:    token.DEFINE,
-								X:      &ast.BasicLit{Kind: token.INT, Value: "16"},
-								Body: &ast.BlockStmt{
-									Lbrace: token.Pos(160),
-									Rbrace: token.Pos(250),
-								},
-								IsSpmd:     true,
-								LaneCount:  4,
-								Constraint: &ast.BasicLit{Kind: token.INT, Value: "4"},
-							},
-						},
-					},
-				},
-			},
-		},
-	}, nil)
-
-	loops := extractSPMDLoops(pkg)
-	if len(loops) != 1 {
-		t.Fatalf("expected 1 SPMD loop, got %d", len(loops))
-	}
-
-	info := loops[token.Pos(150)]
-	if info == nil {
-		t.Fatal("expected loop info at position 150")
-	}
-
-	if info.Constraint != 4 {
-		t.Errorf("expected Constraint=4, got %d", info.Constraint)
-	}
 }
 
 // TestSPMDExtractMultipleLoops verifies extraction of multiple SPMD loops.
@@ -283,9 +229,6 @@ func TestSPMDAnalyzeSignature(t *testing.T) {
 	if info.VaryingParams[0].ElemType != types.Typ[types.Int32] {
 		t.Errorf("expected int32 elem type, got %v", info.VaryingParams[0].ElemType)
 	}
-	if info.VaryingParams[0].Constraint != -1 {
-		t.Errorf("expected constraint -1, got %d", info.VaryingParams[0].Constraint)
-	}
 
 	// Signature without varying parameters
 	regularSig := types.NewSignature(nil,
@@ -325,7 +268,7 @@ func TestSPMDAnalyzeSignatureWithResults(t *testing.T) {
 // TestSPMDAnalyzeSignatureMultipleParams verifies signature with multiple varying params.
 func TestSPMDAnalyzeSignatureMultipleParams(t *testing.T) {
 	varying1 := types.NewVarying(types.Typ[types.Int32])
-	varying2 := types.NewVaryingConstrained(types.Typ[types.Float32], 4)
+	varying2 := types.NewVarying(types.Typ[types.Float32])
 	sig := types.NewSignature(nil,
 		types.NewTuple(
 			types.NewParam(token.NoPos, nil, "a", types.Typ[types.Int]),
@@ -352,16 +295,10 @@ func TestSPMDAnalyzeSignatureMultipleParams(t *testing.T) {
 	if info.VaryingParams[0].Index != 1 {
 		t.Errorf("expected param 0 index=1, got %d", info.VaryingParams[0].Index)
 	}
-	if info.VaryingParams[0].Constraint != -1 {
-		t.Errorf("expected param 0 constraint=-1, got %d", info.VaryingParams[0].Constraint)
-	}
 
 	// Check second varying param (index 2 in signature)
 	if info.VaryingParams[1].Index != 2 {
 		t.Errorf("expected param 1 index=2, got %d", info.VaryingParams[1].Index)
-	}
-	if info.VaryingParams[1].Constraint != 4 {
-		t.Errorf("expected param 1 constraint=4, got %d", info.VaryingParams[1].Constraint)
 	}
 }
 

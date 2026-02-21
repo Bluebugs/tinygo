@@ -116,12 +116,6 @@ func TestSPMDMakeLLVMTypeVarying(t *testing.T) {
 			wantLanes:    2,
 			wantElemKind: llvm.IntegerTypeKind,
 		},
-		{
-			name:         "varying_int32_constrained_4",
-			goType:       types.NewVaryingConstrained(types.Typ[types.Int32], 4),
-			wantLanes:    4, // constraint matches SIMD128 width
-			wantElemKind: llvm.IntegerTypeKind,
-		},
 	}
 
 	for _, tt := range tests {
@@ -814,18 +808,6 @@ func TestSPMDMaskType(t *testing.T) {
 			},
 			wantMaskType:  true,
 			wantLaneCount: 4,
-			wantElemWidth: 32, // i32 for WASM mask
-		},
-		{
-			name: "constrained_varying_int32_8",
-			createSig: func() *types.Signature {
-				params := types.NewTuple(
-					types.NewVar(token.NoPos, nil, "v", types.NewVaryingConstrained(types.Typ[types.Int32], 8)),
-				)
-				return types.NewSignatureType(nil, nil, nil, params, nil, false)
-			},
-			wantMaskType:  true,
-			wantLaneCount: 8, // constraint overrides SIMD128 width (4)
 			wantElemWidth: 32, // i32 for WASM mask
 		},
 	}
@@ -1816,76 +1798,6 @@ func TestSPMDBroadcastMatchVectorWidth(t *testing.T) {
 	})
 }
 
-func TestSPMDConstrainedLaneCount(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-
-	tests := []struct {
-		name         string
-		goType       types.Type
-		wantLanes    int
-		wantElemKind llvm.TypeKind
-	}{
-		{
-			name:         "constrained_int_4",
-			goType:       types.NewVaryingConstrained(types.Typ[types.Int32], 4),
-			wantLanes:    4, // constraint matches SIMD128 width
-			wantElemKind: llvm.IntegerTypeKind,
-		},
-		{
-			name:         "constrained_int_8",
-			goType:       types.NewVaryingConstrained(types.Typ[types.Int32], 8),
-			wantLanes:    8, // constraint exceeds SIMD128 width
-			wantElemKind: llvm.IntegerTypeKind,
-		},
-		{
-			name:         "constrained_byte_4",
-			goType:       types.NewVaryingConstrained(types.Typ[types.Byte], 4),
-			wantLanes:    4, // smaller than SIMD128 (normally 16 for byte)
-			wantElemKind: llvm.IntegerTypeKind,
-		},
-		{
-			name:         "constrained_uint16_2",
-			goType:       types.NewVaryingConstrained(types.Typ[types.Uint16], 2),
-			wantLanes:    2, // smaller than SIMD128 (normally 8 for uint16)
-			wantElemKind: llvm.IntegerTypeKind,
-		},
-		{
-			name:         "constrained_float32_8",
-			goType:       types.NewVaryingConstrained(types.Typ[types.Float32], 8),
-			wantLanes:    8, // double SIMD128 width
-			wantElemKind: llvm.FloatTypeKind,
-		},
-		{
-			name:         "unconstrained_int32",
-			goType:       types.NewVarying(types.Typ[types.Int32]),
-			wantLanes:    4, // default SIMD128 width
-			wantElemKind: llvm.IntegerTypeKind,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			llvmType := c.getLLVMType(tt.goType)
-
-			if llvmType.TypeKind() != llvm.VectorTypeKind {
-				t.Errorf("getLLVMType(%s) TypeKind = %v, want VectorTypeKind", tt.name, llvmType.TypeKind())
-				return
-			}
-
-			gotLanes := llvmType.VectorSize()
-			if gotLanes != tt.wantLanes {
-				t.Errorf("getLLVMType(%s) VectorSize = %d, want %d", tt.name, gotLanes, tt.wantLanes)
-			}
-
-			elemType := llvmType.ElementType()
-			if elemType.TypeKind() != tt.wantElemKind {
-				t.Errorf("getLLVMType(%s) ElementType.TypeKind = %v, want %v", tt.name, elemType.TypeKind(), tt.wantElemKind)
-			}
-		})
-	}
-}
-
 func TestSPMDEffectiveLaneCount(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
@@ -1897,34 +1809,22 @@ func TestSPMDEffectiveLaneCount(t *testing.T) {
 		wantLanes int
 	}{
 		{
-			name:      "unconstrained_int32",
+			name:      "int32",
 			spmdType:  types.NewVarying(types.Typ[types.Int32]),
 			elemType:  c.ctx.Int32Type(),
-			wantLanes: 4, // SIMD128 default
+			wantLanes: 4, // SIMD128: 128/32 = 4
 		},
 		{
-			name:      "constrained_4",
-			spmdType:  types.NewVaryingConstrained(types.Typ[types.Int32], 4),
-			elemType:  c.ctx.Int32Type(),
-			wantLanes: 4, // constraint matches default
+			name:      "float32",
+			spmdType:  types.NewVarying(types.Typ[types.Float32]),
+			elemType:  c.ctx.FloatType(),
+			wantLanes: 4, // SIMD128: 128/32 = 4
 		},
 		{
-			name:      "constrained_8",
-			spmdType:  types.NewVaryingConstrained(types.Typ[types.Int32], 8),
-			elemType:  c.ctx.Int32Type(),
-			wantLanes: 8, // constraint overrides default
-		},
-		{
-			name:      "constrained_2",
-			spmdType:  types.NewVaryingConstrained(types.Typ[types.Int32], 2),
-			elemType:  c.ctx.Int32Type(),
-			wantLanes: 2, // constraint overrides default
-		},
-		{
-			name:      "constrained_byte_4",
-			spmdType:  types.NewVaryingConstrained(types.Typ[types.Byte], 4),
-			elemType:  c.ctx.Int8Type(),
-			wantLanes: 4, // constraint overrides 16 (SIMD128/8bits)
+			name:      "int64",
+			spmdType:  types.NewVarying(types.Typ[types.Int64]),
+			elemType:  c.ctx.Int64Type(),
+			wantLanes: 2, // SIMD128: 128/64 = 2
 		},
 	}
 
@@ -2003,55 +1903,6 @@ func TestSPMDArrayToVector(t *testing.T) {
 				t.Errorf("input type = %v, want ArrayTypeKind", arr.Type().TypeKind())
 			}
 			_ = arrType // used to verify
-		})
-	}
-}
-
-func TestSPMDConstrainedConst(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-
-	tests := []struct {
-		name       string
-		constValue constant.Value
-		goType     *types.SPMDType
-		wantLanes  int
-	}{
-		{
-			name:       "constrained_int32_8_const_42",
-			constValue: constant.MakeInt64(42),
-			goType:     types.NewVaryingConstrained(types.Typ[types.Int32], 8),
-			wantLanes:  8,
-		},
-		{
-			name:       "constrained_byte_4_const_7",
-			constValue: constant.MakeInt64(7),
-			goType:     types.NewVaryingConstrained(types.Typ[types.Byte], 4),
-			wantLanes:  4,
-		},
-		{
-			name:       "unconstrained_int32_const_42",
-			constValue: constant.MakeInt64(42),
-			goType:     types.NewVarying(types.Typ[types.Int32]),
-			wantLanes:  4, // SIMD128 default
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			constExpr := ssa.NewConst(tt.constValue, tt.goType)
-			result := c.createSPMDConst(constExpr, tt.goType, token.NoPos)
-
-			if result.IsNil() {
-				t.Fatal("createSPMDConst returned nil")
-			}
-			if result.Type().TypeKind() != llvm.VectorTypeKind {
-				t.Errorf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
-				return
-			}
-			if result.Type().VectorSize() != tt.wantLanes {
-				t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), tt.wantLanes)
-			}
 		})
 	}
 }
@@ -2761,210 +2612,5 @@ func TestSPMDConstIntOrSplat(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestFromConstrainedDimensions(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-
-	tests := []struct {
-		name        string
-		constraintN int
-		platformL   int
-		wantGroups  int
-	}{
-		{"exact_1group", 4, 4, 1},
-		{"exact_2groups", 8, 4, 2},
-		{"partial_2groups", 6, 4, 2},
-		{"exact_3groups", 12, 4, 3},
-		{"single_elem_group", 1, 4, 1},
-		{"large_constraint", 16, 4, 4},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			numGroups := (tt.constraintN + tt.platformL - 1) / tt.platformL
-			if numGroups != tt.wantGroups {
-				t.Errorf("numGroups(%d, %d) = %d, want %d", tt.constraintN, tt.platformL, numGroups, tt.wantGroups)
-			}
-		})
-	}
-}
-
-func TestFromConstrainedShuffleMask(t *testing.T) {
-	// Test that shuffle masks correctly clamp out-of-range indices.
-	tests := []struct {
-		name        string
-		constraintN int
-		platformL   int
-		group       int
-		wantActive  int // number of active lanes in this group
-	}{
-		{"full_group", 8, 4, 0, 4},
-		{"full_group_2", 8, 4, 1, 4},
-		{"partial_last", 6, 4, 1, 2},
-		{"partial_3of4", 7, 4, 1, 3},
-		{"single_lane", 1, 4, 0, 1},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			active := 0
-			for lane := 0; lane < tt.platformL; lane++ {
-				srcIdx := tt.group*tt.platformL + lane
-				if srcIdx < tt.constraintN {
-					active++
-				}
-			}
-			if active != tt.wantActive {
-				t.Errorf("active lanes = %d, want %d", active, tt.wantActive)
-			}
-		})
-	}
-}
-
-func TestFromConstrainedMaskValues(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-	b := newTestBuilder(t, c)
-	defer b.Dispose()
-
-	// Test mask generation: full group vs partial group.
-	maskElem := c.spmdMaskElemType()
-	platformLanes := 4
-
-	// Full group mask (all active).
-	fullMask := make([]llvm.Value, platformLanes)
-	for i := 0; i < platformLanes; i++ {
-		if maskElem == c.ctx.Int32Type() {
-			fullMask[i] = llvm.ConstInt(maskElem, 0xFFFFFFFF, false)
-		} else {
-			fullMask[i] = llvm.ConstInt(maskElem, 1, false)
-		}
-	}
-	fullVec := llvm.ConstVector(fullMask, false)
-	if fullVec.Type().VectorSize() != platformLanes {
-		t.Errorf("full mask vector size = %d, want %d", fullVec.Type().VectorSize(), platformLanes)
-	}
-
-	// Partial group mask (2 active, 2 inactive for constraintN=6, group=1).
-	constraintN := 6
-	group := 1
-	partialMask := make([]llvm.Value, platformLanes)
-	for lane := 0; lane < platformLanes; lane++ {
-		srcIdx := group*platformLanes + lane
-		if srcIdx < constraintN {
-			if maskElem == c.ctx.Int32Type() {
-				partialMask[lane] = llvm.ConstInt(maskElem, 0xFFFFFFFF, false)
-			} else {
-				partialMask[lane] = llvm.ConstInt(maskElem, 1, false)
-			}
-		} else {
-			partialMask[lane] = llvm.ConstInt(maskElem, 0, false)
-		}
-	}
-	partialVec := llvm.ConstVector(partialMask, false)
-	if partialVec.Type().VectorSize() != platformLanes {
-		t.Errorf("partial mask vector size = %d, want %d", partialVec.Type().VectorSize(), platformLanes)
-	}
-
-	_ = b // builder used to keep test infrastructure consistent
-}
-
-func TestToConstrainedReconstruction(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-	b := newTestBuilder(t, c)
-	defer b.Dispose()
-
-	// Simulate round-trip: build a <6 x i32> vector, decompose to 2 groups, reassemble.
-	elemType := c.ctx.Int32Type()
-	constraintN := 6
-	platformLanes := c.spmdLaneCount(elemType)
-	numGroups := (constraintN + platformLanes - 1) / platformLanes
-
-	// Create source vector <6 x i32> = [10, 20, 30, 40, 50, 60].
-	srcVecType := llvm.VectorType(elemType, constraintN)
-	elems := make([]llvm.Value, constraintN)
-	for i := 0; i < constraintN; i++ {
-		elems[i] = llvm.ConstInt(elemType, uint64((i+1)*10), false)
-	}
-	srcVec := llvm.ConstVector(elems, false)
-
-	// Decompose: extract groups via ShuffleVector.
-	i32 := c.ctx.Int32Type()
-	groups := make([]llvm.Value, numGroups)
-	for g := 0; g < numGroups; g++ {
-		indices := make([]llvm.Value, platformLanes)
-		for lane := 0; lane < platformLanes; lane++ {
-			srcIdx := g*platformLanes + lane
-			if srcIdx < constraintN {
-				indices[lane] = llvm.ConstInt(i32, uint64(srcIdx), false)
-			} else {
-				indices[lane] = llvm.ConstInt(i32, 0, false) // clamped
-			}
-		}
-		shuffleMask := llvm.ConstVector(indices, false)
-		groups[g] = b.CreateShuffleVector(srcVec, llvm.Undef(srcVecType), shuffleMask, "")
-	}
-
-	// Reconstruct: insert elements back.
-	result := llvm.ConstNull(srcVecType)
-	for g := 0; g < numGroups; g++ {
-		for lane := 0; lane < platformLanes; lane++ {
-			dstIdx := g*platformLanes + lane
-			if dstIdx >= constraintN {
-				break
-			}
-			elem := b.CreateExtractElement(groups[g], llvm.ConstInt(i32, uint64(lane), false), "")
-			result = b.CreateInsertElement(result, elem, llvm.ConstInt(i32, uint64(dstIdx), false), "")
-		}
-	}
-
-	if result.Type().VectorSize() != constraintN {
-		t.Errorf("reconstructed vector size = %d, want %d", result.Type().VectorSize(), constraintN)
-	}
-}
-
-func TestFromConstrainedSingleGroup(t *testing.T) {
-	// When constraintN == platformLanes, there should be exactly 1 group.
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-
-	elemType := c.ctx.Int32Type()
-	platformLanes := c.spmdLaneCount(elemType) // 4
-	constraintN := platformLanes
-	numGroups := (constraintN + platformLanes - 1) / platformLanes
-	if numGroups != 1 {
-		t.Errorf("single group: numGroups = %d, want 1", numGroups)
-	}
-
-	// All lanes should be active.
-	for lane := 0; lane < platformLanes; lane++ {
-		srcIdx := 0*platformLanes + lane
-		if srcIdx >= constraintN {
-			t.Errorf("lane %d should be active but srcIdx=%d >= constraintN=%d", lane, srcIdx, constraintN)
-		}
-	}
-}
-
-func TestFromConstrainedUniversalError(t *testing.T) {
-	// Varying[T, 0] (universal) should not be decomposable.
-	spmdType := types.NewVarying(types.Typ[types.Int32])
-	// Constraint 0 is universal.
-	constrainedType := types.NewVaryingConstrained(types.Typ[types.Int32], 0)
-
-	if spmdType.Constraint() == 0 {
-		t.Errorf("unconstrained type should have constraint -1, got 0")
-	}
-	if constrainedType.Constraint() != 0 {
-		t.Errorf("universal constrained type should have constraint 0, got %d", constrainedType.Constraint())
-	}
-
-	// The actual error check happens in createFromConstrained, which checks
-	// spmdType.Constraint() == 0. We verify the type system gives us the right values.
-	if !constrainedType.IsConstrained() {
-		t.Errorf("universal constrained type should report IsConstrained()=true")
 	}
 }
