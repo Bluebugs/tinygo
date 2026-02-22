@@ -191,6 +191,9 @@ type builder struct {
 	spmdBreakRedirects    map[int]spmdBreakRedirect           // then-block index -> break redirect info
 	spmdBreakPhiOverrides map[*ssa.Phi]llvm.Value             // phi -> final value (for break result phis at rangeint.done)
 	spmdMergePhiOverrides map[*ssa.Phi]spmdMergePhiOverride   // phi -> override info (for multi-predecessor merge phis)
+	spmdSwitchChains      []spmdSwitchChain                   // detected varying switch chains
+	spmdSwitchIfBlocks    map[int]int                         // ifBlock.Index -> chain index in spmdSwitchChains
+	spmdSwitchBodyBlocks  map[int]int                         // bodyBlock.Index -> chain index in spmdSwitchChains
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1481,6 +1484,9 @@ func (b *builder) createFunction() {
 		b.spmdBreakRedirects = make(map[int]spmdBreakRedirect)
 		b.spmdBreakPhiOverrides = make(map[*ssa.Phi]llvm.Value)
 		b.spmdMergePhiOverrides = make(map[*ssa.Phi]spmdMergePhiOverride)
+		b.spmdSwitchChains = nil
+		b.spmdSwitchIfBlocks = make(map[int]int)
+		b.spmdSwitchBodyBlocks = make(map[int]int)
 
 		// SPMD: pre-detect varying ifs before compiling blocks.
 		// This is necessary so that phis at merge blocks can be converted to
