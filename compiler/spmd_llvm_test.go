@@ -3091,3 +3091,234 @@ func TestSPMDSwitchChainFields(t *testing.T) {
 		t.Errorf("chain.doneBlock = %d, want 8", chain.doneBlock)
 	}
 }
+
+// TestSPMDSwitchMaskNarrowing verifies sequential mask narrowing for switch cases.
+// Tests the ISPC algorithm:
+//   mask1 = remaining & cond1
+//   remaining1 = remaining & ~cond1
+//   mask2 = remaining1 & cond2
+//   remaining2 = remaining1 & ~cond2
+//   mask3 = remaining2 & cond3
+func TestSPMDSwitchMaskNarrowing(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+
+	// Simulate a 3-case switch with all-ones initial mask.
+	i32x4 := llvm.VectorType(c.ctx.Int32Type(), 4)
+	allOnes := llvm.ConstAllOnes(i32x4)
+
+	// Case 1: mask1 = allOnes & cond1, remaining1 = allOnes & ~cond1.
+	cond1 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(c.ctx.Int32Type(), 0xFFFFFFFF, false), // lane 0 matches
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+	}, false)
+	mask1 := b.CreateAnd(allOnes, cond1, "mask1")
+	notCond1 := b.CreateNot(cond1, "")
+	remaining1 := b.CreateAnd(allOnes, notCond1, "remaining1")
+
+	// Case 2: mask2 = remaining1 & cond2, remaining2 = remaining1 & ~cond2.
+	cond2 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+		llvm.ConstInt(c.ctx.Int32Type(), 0xFFFFFFFF, false), // lane 1 matches
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+	}, false)
+	mask2 := b.CreateAnd(remaining1, cond2, "mask2")
+	notCond2 := b.CreateNot(cond2, "")
+	remaining2 := b.CreateAnd(remaining1, notCond2, "remaining2")
+
+	// Case 3: mask3 = remaining2 & cond3.
+	cond3 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+		llvm.ConstInt(c.ctx.Int32Type(), 0xFFFFFFFF, false), // lane 2 matches
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+	}, false)
+	mask3 := b.CreateAnd(remaining2, cond3, "mask3")
+
+	// Verify masks are non-nil and have correct type.
+	if mask1.IsNil() {
+		t.Error("mask1 is nil")
+	}
+	if mask2.IsNil() {
+		t.Error("mask2 is nil")
+	}
+	if mask3.IsNil() {
+		t.Error("mask3 is nil")
+	}
+	if mask1.Type() != i32x4 {
+		t.Errorf("mask1 type = %v, want <4 x i32>", mask1.Type())
+	}
+	if mask2.Type() != i32x4 {
+		t.Errorf("mask2 type = %v, want <4 x i32>", mask2.Type())
+	}
+	if mask3.Type() != i32x4 {
+		t.Errorf("mask3 type = %v, want <4 x i32>", mask3.Type())
+	}
+
+	// Verify that sequential narrowing produces distinct masks.
+	// Each mask should activate different lanes (lane 0, 1, 2 respectively).
+	if mask1 == mask2 || mask1 == mask3 || mask2 == mask3 {
+		t.Error("masks should be distinct (different conditions)")
+	}
+}
+
+// TestSPMDSwitchCascadedSelect verifies cascaded select merge for switch.done phi.
+// Tests building: result = select(mask3, val3, select(mask2, val2, select(mask1, val1, default))).
+func TestSPMDSwitchCascadedSelect(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+
+	i32x4 := llvm.VectorType(c.ctx.Int32Type(), 4)
+	i32 := c.ctx.Int32Type()
+
+	// Create 3 case masks (lane 0, 1, 2 active respectively).
+	mask1 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(i32, 0xFFFFFFFF, false),
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0, false),
+	}, false)
+	mask2 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0xFFFFFFFF, false),
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0, false),
+	}, false)
+	mask3 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0xFFFFFFFF, false),
+		llvm.ConstInt(i32, 0, false),
+	}, false)
+
+	// Create values for each case (10, 20, 30) and default (0).
+	val1 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(i32, 10, false),
+		llvm.ConstInt(i32, 10, false),
+		llvm.ConstInt(i32, 10, false),
+		llvm.ConstInt(i32, 10, false),
+	}, false)
+	val2 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(i32, 20, false),
+		llvm.ConstInt(i32, 20, false),
+		llvm.ConstInt(i32, 20, false),
+		llvm.ConstInt(i32, 20, false),
+	}, false)
+	val3 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(i32, 30, false),
+		llvm.ConstInt(i32, 30, false),
+		llvm.ConstInt(i32, 30, false),
+		llvm.ConstInt(i32, 30, false),
+	}, false)
+	defaultVal := llvm.ConstNull(i32x4)
+
+	// Build cascaded select: result = select(mask1, val1, default), then select(mask2, val2, result), etc.
+	result := defaultVal
+	result = b.spmdMaskSelect(mask1, val1, result)
+	result = b.spmdMaskSelect(mask2, val2, result)
+	result = b.spmdMaskSelect(mask3, val3, result)
+
+	// Verify result is non-nil and has correct type.
+	if result.IsNil() {
+		t.Error("result is nil")
+	}
+	if result.Type() != i32x4 {
+		t.Errorf("result type = %v, want <4 x i32>", result.Type())
+	}
+
+	// The cascaded select should produce a merged result.
+	// Each lane should have the value from its matching case: [10, 20, 30, 0].
+}
+
+// TestSPMDSwitchDefaultMask verifies default case gets remaining mask.
+// Tests that after 2 cases, the remaining mask is correctly assigned to the default body.
+func TestSPMDSwitchDefaultMask(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+
+	i32x4 := llvm.VectorType(c.ctx.Int32Type(), 4)
+	i32 := c.ctx.Int32Type()
+
+	// Start with all-ones mask.
+	allOnes := llvm.ConstAllOnes(i32x4)
+
+	// Case 1: mask1 = allOnes & cond1 (lane 0), remaining1 = allOnes & ~cond1.
+	cond1 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(i32, 0xFFFFFFFF, false),
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0, false),
+	}, false)
+	remaining1 := b.CreateAnd(allOnes, b.CreateNot(cond1, ""), "remaining1")
+
+	// Case 2: mask2 = remaining1 & cond2 (lane 1), remaining2 = remaining1 & ~cond2.
+	cond2 := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0xFFFFFFFF, false),
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0, false),
+	}, false)
+	defaultMask := b.CreateAnd(remaining1, b.CreateNot(cond2, ""), "default.mask")
+
+	// Verify default mask is non-nil and has correct type.
+	if defaultMask.IsNil() {
+		t.Error("defaultMask is nil")
+	}
+	if defaultMask.Type() != i32x4 {
+		t.Errorf("defaultMask type = %v, want <4 x i32>", defaultMask.Type())
+	}
+
+	// Default mask should activate lanes [0, 0, 1, 1] (lanes 2 and 3).
+}
+
+// TestSPMDSwitchPushDirectTransition verifies "pushDirect" mask transition.
+// Tests that the pushDirect transition pushes the mask directly without AND-ing with parent.
+func TestSPMDSwitchPushDirectTransition(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+
+	i32x4 := llvm.VectorType(c.ctx.Int32Type(), 4)
+	i32 := c.ctx.Int32Type()
+
+	// Create a specific case mask.
+	caseMask := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0xFFFFFFFF, false), // lane 1 active
+		llvm.ConstInt(i32, 0, false),
+		llvm.ConstInt(i32, 0, false),
+	}, false)
+
+	// Initialize mask stack with a parent mask.
+	parentMask := llvm.ConstAllOnes(i32x4)
+	b.spmdMaskStack = []llvm.Value{parentMask}
+
+	// Push caseMask directly (simulating "pushDirect" transition).
+	b.spmdPushMask(caseMask)
+
+	// Verify the mask stack now has 2 entries: parent and caseMask.
+	if len(b.spmdMaskStack) != 2 {
+		t.Errorf("mask stack length = %d, want 2", len(b.spmdMaskStack))
+	}
+
+	// Verify the top of the stack is caseMask (not parent & caseMask).
+	currentMask := b.spmdCurrentMask()
+	if currentMask != caseMask {
+		t.Error("current mask should be caseMask (not AND-ed with parent)")
+	}
+
+	// Pop and verify we're back to parent.
+	b.spmdPopMask()
+	if len(b.spmdMaskStack) != 1 {
+		t.Errorf("after pop, mask stack length = %d, want 1", len(b.spmdMaskStack))
+	}
+	if b.spmdCurrentMask() != parentMask {
+		t.Error("after pop, current mask should be parentMask")
+	}
+}

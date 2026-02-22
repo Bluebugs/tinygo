@@ -2890,3 +2890,188 @@ func (b *builder) spmdIsVaryingBreak(ifBlock *ssa.BasicBlock) (*spmdForLoopInfo,
 	return nil, false
 }
 
+// spmdCompileSwitchIf compiles a switch.next If instruction. This is the
+// compilation-time handler (called from the *ssa.If case) that computes the
+// case mask via sequential narrowing and registers mask transitions.
+//
+// Algorithm (ISPC approach):
+//   remainingMask = currentMask (for first case) or b.spmdSwitchRemainingMask (subsequent)
+//   caseMask = remainingMask & cond
+//   remainingMask = remainingMask & ~cond
+//
+// For the last case, also handles the default body by pushing the remaining mask.
+func (b *builder) spmdCompileSwitchIf(block *ssa.BasicBlock, cond llvm.Value, chainIdx int) {
+	chain := &b.spmdSwitchChains[chainIdx]
+
+	// Find which case index this block is.
+	caseIdx := -1
+	for i := range chain.cases {
+		if chain.cases[i].ifBlock == block.Index {
+			caseIdx = i
+			break
+		}
+	}
+	if caseIdx == -1 {
+		return
+	}
+
+	// Get the remaining mask.
+	var remainingMask llvm.Value
+	if caseIdx == 0 {
+		// First case: use current mask from stack.
+		remainingMask = b.spmdCurrentMask()
+		if remainingMask.IsNil() {
+			// No mask on stack — use all-ones.
+			remainingMask = llvm.ConstAllOnes(cond.Type())
+		}
+	} else {
+		// Subsequent case: use the remaining mask from previous case.
+		remainingMask = b.spmdSwitchRemainingMask
+	}
+
+	// Compute case mask: remainingMask & cond.
+	caseMask := b.CreateAnd(remainingMask, cond, "switch.case.mask")
+	chain.cases[caseIdx].caseMask = caseMask
+
+	// Update remaining mask: remainingMask & ~cond.
+	notCond := b.CreateNot(cond, "")
+	b.spmdSwitchRemainingMask = b.CreateAnd(remainingMask, notCond, "switch.remaining")
+
+	// Register mask transition for the body block (push caseMask directly).
+	// spmdMaskTransitions is always initialized by createFunction when SPMD is active.
+	bodyBlockIdx := chain.cases[caseIdx].bodyBlock
+	b.spmdMaskTransitions[bodyBlockIdx] = &spmdMaskTransition{kind: "pushDirect", cond: caseMask}
+
+	// For the last case, also handle the default body (if any).
+	if caseIdx == len(chain.cases)-1 && chain.defaultBody != -1 {
+		defaultMask := b.spmdSwitchRemainingMask
+		b.spmdMaskTransitions[chain.defaultBody] = &spmdMaskTransition{kind: "pushDirect", cond: defaultMask}
+	}
+}
+
+// spmdSwitchBodyJumpTarget determines the target block for a Jump instruction
+// at the end of a switch case body. Returns the next switch.next comparison block,
+// the default body, or switch.done, depending on the case position in the chain.
+func (b *builder) spmdSwitchBodyJumpTarget(block *ssa.BasicBlock, chain *spmdSwitchChain) llvm.BasicBlock {
+	// Find which case this body belongs to.
+	for i, c := range chain.cases {
+		if c.bodyBlock == block.Index {
+			// This body is for case i. Next target:
+			if i+1 < len(chain.cases) {
+				// Next case comparison block.
+				nextIfIdx := chain.cases[i+1].ifBlock
+				return b.blockInfo[nextIfIdx].entry
+			}
+			// Last case: go to default body or switch.done.
+			if chain.defaultBody != -1 {
+				return b.blockInfo[chain.defaultBody].entry
+			}
+			return b.blockInfo[chain.doneBlock].entry
+		}
+	}
+
+	// Default body: go to switch.done.
+	if chain.defaultBody == block.Index {
+		return b.blockInfo[chain.doneBlock].entry
+	}
+
+	// Fallback: should not happen for well-formed switch chains.
+	// All body blocks must be either a case body or the default body.
+	return b.blockInfo[chain.doneBlock].entry
+}
+
+// spmdIsSwitchDoneBlock returns the chain index if blockIdx is a switch.done merge
+// block for a detected varying switch chain, or -1 if not.
+func (b *builder) spmdIsSwitchDoneBlock(blockIdx int) int {
+	for i := range b.spmdSwitchChains {
+		if b.spmdSwitchChains[i].doneBlock == blockIdx {
+			return i
+		}
+	}
+	return -1
+}
+
+// spmdCreateSwitchMergeSelect creates the cascaded select instructions for a
+// phi at switch.done. This merges values from all case bodies using the case
+// masks computed during switch compilation.
+//
+// Algorithm:
+//   result = defaultValue (or zero if no default)
+//   for each case i (first to last):
+//     result = select(caseMask[i], caseValue[i], result)
+func (b *builder) spmdCreateSwitchMergeSelect(phi *ssa.Phi, chainIdx int) (llvm.Value, bool) {
+	chain := &b.spmdSwitchChains[chainIdx]
+
+	// Map each phi edge to its source: case body, default body, or "entry".
+	var entryEdgeIdx = -1
+	var defaultEdgeIdx = -1
+	caseEdges := make(map[int]int) // caseIdx -> edgeIdx
+
+	for i, pred := range phi.Block().Preds {
+		if chain.defaultBody != -1 && pred.Index == chain.defaultBody {
+			defaultEdgeIdx = i
+		} else {
+			found := false
+			for ci, c := range chain.cases {
+				if pred.Index == c.bodyBlock {
+					caseEdges[ci] = i
+					found = true
+					break
+				}
+			}
+			if !found {
+				// Check if pred is reachable from a case body (multi-block case bodies).
+				for ci, c := range chain.cases {
+					bodyBlock := b.fn.Blocks[c.bodyBlock]
+					if b.spmdIsReachableFrom(bodyBlock, pred, phi.Block()) {
+						caseEdges[ci] = i
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				entryEdgeIdx = i // This is the pre-switch edge.
+			}
+		}
+	}
+
+	// Build cascaded select. Start with the entry/default value.
+	var result llvm.Value
+	phiType := b.getLLVMType(phi.Type())
+
+	if defaultEdgeIdx >= 0 {
+		result = b.getValue(phi.Edges[defaultEdgeIdx], getPos(phi))
+	} else if entryEdgeIdx >= 0 {
+		result = b.getValue(phi.Edges[entryEdgeIdx], getPos(phi))
+	} else {
+		result = llvm.ConstNull(phiType)
+	}
+
+	// Apply cascaded selects from first case to last.
+	for ci := 0; ci < len(chain.cases); ci++ {
+		edgeIdx, ok := caseEdges[ci]
+		if !ok {
+			continue // Case body doesn't contribute to this phi.
+		}
+		caseVal := b.getValue(phi.Edges[edgeIdx], getPos(phi))
+		caseMask := chain.cases[ci].caseMask
+		if caseMask.IsNil() {
+			continue
+		}
+
+		// Broadcast match if needed.
+		caseVal, result = b.spmdBroadcastMatch(caseVal, result)
+
+		if caseVal.Type().TypeKind() == llvm.VectorTypeKind || result.Type().TypeKind() == llvm.VectorTypeKind {
+			result = b.spmdMaskSelect(caseMask, caseVal, result)
+		} else {
+			// Scalar: reduce mask to scalar.
+			scalarCond := b.spmdVectorAnyTrue(caseMask)
+			result = b.CreateSelect(scalarCond, caseVal, result, "")
+		}
+	}
+
+	return result, true
+}
+

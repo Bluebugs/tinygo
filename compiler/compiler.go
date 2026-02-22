@@ -191,9 +191,10 @@ type builder struct {
 	spmdBreakRedirects    map[int]spmdBreakRedirect           // then-block index -> break redirect info
 	spmdBreakPhiOverrides map[*ssa.Phi]llvm.Value             // phi -> final value (for break result phis at rangeint.done)
 	spmdMergePhiOverrides map[*ssa.Phi]spmdMergePhiOverride   // phi -> override info (for multi-predecessor merge phis)
-	spmdSwitchChains      []spmdSwitchChain                   // detected varying switch chains
-	spmdSwitchIfBlocks    map[int]int                         // ifBlock.Index -> chain index in spmdSwitchChains
-	spmdSwitchBodyBlocks  map[int]int                         // bodyBlock.Index -> chain index in spmdSwitchChains
+	spmdSwitchChains        []spmdSwitchChain                   // detected varying switch chains
+	spmdSwitchIfBlocks      map[int]int                         // ifBlock.Index -> chain index in spmdSwitchChains
+	spmdSwitchBodyBlocks    map[int]int                         // bodyBlock.Index -> chain index in spmdSwitchChains
+	spmdSwitchRemainingMask llvm.Value                          // remaining mask during switch chain compilation
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1570,6 +1571,9 @@ func (b *builder) createFunction() {
 					}
 				case "pop":
 					b.spmdPopMask()
+				case "pushDirect":
+					// Push the pre-computed mask directly (for switch case bodies).
+					b.spmdPushMask(tr.cond)
 				}
 			}
 		}
@@ -1890,6 +1894,12 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		block := instr.Block()
 		blockThen := b.blockInfo[block.Succs[0].Index].entry
 		blockElse := b.blockInfo[block.Succs[1].Index].entry
+		// SPMD: check for switch chain If before other varying-if handling.
+		if chainIdx, ok := b.spmdSwitchIfBlocks[block.Index]; ok {
+			b.spmdCompileSwitchIf(block, cond, chainIdx)
+			b.CreateBr(blockThen) // linearize: always branch to body
+			break
+		}
 		// SPMD: check for varying break pattern before general linearization.
 		if b.spmdFuncIsBody && cond.Type().TypeKind() == llvm.VectorTypeKind {
 			if loopInfo, isBreak := b.spmdIsVaryingBreak(block); isBreak {
@@ -1924,7 +1934,15 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			b.CreateCondBr(cond, blockThen, blockElse)
 		}
 	case *ssa.Jump:
-		// SPMD: check for break redirect first.
+		// SPMD: check for switch body block Jump (redirect to next comparison or done).
+		if chainIdx, ok := b.spmdSwitchBodyBlocks[instr.Block().Index]; ok {
+			b.spmdPopMask() // pop the case mask pushed at body entry
+			chain := &b.spmdSwitchChains[chainIdx]
+			target := b.spmdSwitchBodyJumpTarget(instr.Block(), chain)
+			b.CreateBr(target)
+			break
+		}
+		// SPMD: check for break redirect.
 		if redir, ok := b.spmdBreakRedirects[instr.Block().Index]; ok {
 			// This is a break redirect: accumulate break mask and redirect to continuation.
 			mask := b.spmdCurrentMask() // the then-mask (lanes that are breaking)
@@ -3041,6 +3059,12 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			return b.createMapIteratorNext(rangeVal, llvmRangeVal, it), nil
 		}
 	case *ssa.Phi:
+		// SPMD: check for switch merge phi.
+		if chainIdx := b.spmdIsSwitchDoneBlock(expr.Block().Index); chainIdx >= 0 {
+			if val, ok := b.spmdCreateSwitchMergeSelect(expr, chainIdx); ok {
+				return val, nil
+			}
+		}
 		// SPMD: check for break result phi.
 		if b.spmdForLoops != nil {
 			for _, loop := range b.spmdForLoops {
