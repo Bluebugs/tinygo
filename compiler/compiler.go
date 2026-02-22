@@ -196,6 +196,8 @@ type builder struct {
 	spmdSwitchBodyBlocks    map[int]int                         // bodyBlock.Index -> chain index in spmdSwitchChains
 	spmdSwitchRemainingMask llvm.Value                          // remaining mask during switch chain compilation
 	spmdDeferredSwitchPhis  []spmdDeferredSwitchPhi             // switch.done phis deferred until all case masks are ready
+	spmdCondChains          map[int]*spmdCondChain              // outerIfBlock.Index -> chain
+	spmdCondChainInner      map[int]*spmdCondChain              // innerBlock.Index -> chain (lookup)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
