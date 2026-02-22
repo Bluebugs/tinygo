@@ -1694,22 +1694,22 @@ func (b *builder) createFunction() {
 				continue
 			}
 
-			// SPMD: handle multi-predecessor merge phi overrides.
+			// SPMD: handle merge phi overrides (multi-pred and deferred 2-edge cases).
 			if override, ok := b.spmdMergePhiOverrides[phi.ssa]; ok {
-				if i == override.thenEdgeIdx {
-					continue // skip then-edge — merged into selected value at else-edge
+				if i == override.skipEdgeIdx {
+					continue // skip redirected edge — no LLVM predecessor after linearization
 				}
-				if i == override.elseEdgeIdx {
-					// Create select in the else-exit block, just before its terminator.
-					// We can't put it in the loop header (phi's block) because the then/else
-					// values are defined in blocks that come after the loop header in the CFG,
+				if i == override.thenEdgeIdx || i == override.elseEdgeIdx {
+					// Create select in the surviving block, just before its terminator.
+					// We can't put it in the merge block (phi's block) because the then/else
+					// values are defined in blocks that come after the merge in the CFG,
 					// and LLVM requires instructions to dominate all their uses.
-					elseExitBB := override.llvmBlock
-					elseExitTerm := elseExitBB.LastInstruction()
-					if !elseExitTerm.IsNil() {
-						b.SetInsertPointBefore(elseExitTerm)
+					survivingBB := override.llvmBlock
+					term := survivingBB.LastInstruction()
+					if !term.IsNil() {
+						b.SetInsertPointBefore(term)
 					} else {
-						b.SetInsertPointAtEnd(elseExitBB)
+						b.SetInsertPointAtEnd(survivingBB)
 					}
 
 					// Create select for the then/else pair.
@@ -1728,7 +1728,7 @@ func (b *builder) createFunction() {
 						selected = b.CreateSelect(scalarCond, thenValue, elseValue, "")
 					}
 
-					phi.llvm.AddIncoming([]llvm.Value{selected}, []llvm.BasicBlock{elseExitBB})
+					phi.llvm.AddIncoming([]llvm.Value{selected}, []llvm.BasicBlock{survivingBB})
 					continue
 				}
 			}

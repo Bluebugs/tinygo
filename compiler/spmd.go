@@ -774,16 +774,29 @@ type spmdVaryingIf struct {
 	hasElse        bool       // true if then/else are distinct from merge
 }
 
-// spmdMergePhiOverride tracks a phi at a multi-predecessor merge block
-// where a then/else pair of edges has been combined via select.
-// This handles cases like varying if/else inside loop bodies where the merge
-// is the loop header with 3+ predecessors (entry, then-exit, else-exit).
-// The select is created during phi resolution, not during phi creation.
+// spmdMergePhiOverride tracks a phi at a varying-if merge block where then/else
+// edges have been combined via a deferred select instruction.
+//
+// Two cases arise:
+//
+//  1. Multi-predecessor merge (loop header, 3+ edges): the then-branch edge is
+//     skipped and the else-branch edge is replaced by select(cond, then, else).
+//     skipEdgeIdx == thenEdgeIdx.
+//
+//  2. 2-edge merge (plain if/else or if-without-else): after CFG linearization
+//     only one LLVM predecessor remains. The original "redirected" edge no longer
+//     has a live LLVM predecessor, so a plain phi would be invalid.
+//     skipEdgeIdx is the edge whose LLVM predecessor was redirected away.
+//     elseEdgeIdx is the surviving edge; its llvmBlock carries the select result.
+//
+// The select is always created during phi resolution (not phi creation) to avoid
+// circular dependencies when edge values reference the phi itself.
 type spmdMergePhiOverride struct {
-	thenEdgeIdx int           // phi edge index for the then-branch
-	elseEdgeIdx int           // phi edge index for the else-branch
-	info        *spmdVaryingIf // varying if info (for condition)
-	llvmBlock   llvm.BasicBlock // LLVM block to use as predecessor for the selected value
+	skipEdgeIdx int            // phi edge index to skip during resolution (no LLVM pred after linearization)
+	thenEdgeIdx int            // phi edge index for the then-branch value
+	elseEdgeIdx int            // phi edge index for the else-branch value; for 2-edge cases also the surviving LLVM pred
+	info        *spmdVaryingIf // varying-if info (holds the vector condition)
+	llvmBlock   llvm.BasicBlock // LLVM exit block of the surviving predecessor
 }
 
 // spmdMaskTransition describes how the execution mask changes at a block boundary.
@@ -1086,9 +1099,61 @@ func (b *builder) spmdShouldRedirectJump(block *ssa.BasicBlock) (llvm.BasicBlock
 	return elseLLVMBlock, ok
 }
 
+// spmdTryGetValue is like getValue but returns (zero, false) instead of panicking
+// when a local SSA value hasn't been compiled yet. DomPreorder visits blocks in
+// dominance order, so a merge block can be visited before some of its predecessor
+// blocks are compiled. spmdCreateMergeSelect calls this to detect that situation
+// and switch to the deferred-select path instead of emitting a value immediately.
+func (b *builder) spmdTryGetValue(expr ssa.Value) (llvm.Value, bool) {
+	// Check overrides first (same as getValue).
+	if b.spmdValueOverride != nil {
+		if override, ok := b.spmdValueOverride[expr]; ok {
+			return override, true
+		}
+	}
+	switch expr := expr.(type) {
+	case *ssa.Const:
+		file := b.program.Fset.File(b.fn.Pos())
+		pos := token.NoPos
+		if file != nil {
+			pos = file.Pos(0)
+		}
+		return b.createConst(expr, pos), true
+	case *ssa.Function:
+		// Functions are compiled separately; returning false here is conservative
+		// (getFunction could provide the value), but function-valued phi edges at
+		// varying merge blocks are extremely rare. The deferred path handles it.
+		return llvm.Value{}, false
+	case *ssa.Global:
+		value := b.getGlobal(expr)
+		if value.IsNil() {
+			return llvm.Value{}, false
+		}
+		return value, true
+	default:
+		if value, ok := b.locals[expr]; ok {
+			return value, true
+		}
+		return llvm.Value{}, false
+	}
+}
+
 // spmdCreateMergeSelect converts a phi at a merge block into a select instruction
-// when the phi results from a varying if/else. Returns (value, true) if a select
-// was created, (zero, false) if this phi is not a varying merge phi.
+// when the phi results from a varying if/else.
+//
+// After CFG linearization the merge block has fewer LLVM predecessors than SSA
+// predecessors:
+//   - if-without-else: ifBlock no longer jumps to merge; only thenExit does.
+//   - if-with-else:    thenExit no longer jumps to merge; only elseExit does.
+//
+// When both edge values are already available, the select is emitted immediately
+// and the function returns (select, true).  When one edge value has not been
+// compiled yet (DomPreorder visited the merge before that predecessor), the
+// function creates a plain LLVM phi with a single incoming edge and registers a
+// spmdMergePhiOverride so that phi resolution will emit the select later.
+// This deferred path is the same mechanism used by spmdCreateMultiPredMergeSelect.
+//
+// Returns (zero, false) only when this phi is not a varying merge phi at all.
 func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 	if b.spmdMergeSelects == nil {
 		return llvm.Value{}, false
@@ -1113,61 +1178,94 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 	block := phi.Block()
 	preds := block.Preds
 
-	// Determine which edge is "then" and which is "else".
-	// For if-without-else: predecessor matching ifBlockIndex is "else" (default), other is "then".
-	// For if-with-else: determine based on reachability from then-entry vs else-entry.
-	var thenValue, elseValue llvm.Value
+	// Classify each edge as "then" or "else/default" and try to obtain its value.
+	// thenIdx is the edge from the then-branch; elseIdx is the surviving LLVM pred.
+	//
+	// if-without-else: ifBlock pred is "else" (pre-if default value), thenExit is "then".
+	//   After linearization only thenExit remains as an LLVM pred; ifBlock is redirected.
+	//   → skipEdgeIdx = ifBlock edge, llvmBlock = thenExit.exit
+	//
+	// if-with-else: both preds come from branches; thenExit was redirected to elseEntry.
+	//   After linearization only elseExit remains as an LLVM pred; thenExit is redirected.
+	//   → skipEdgeIdx = thenExit edge, llvmBlock = elseExit.exit
+	var thenIdx, elseIdx int
 	if !info.hasElse {
-		// If-without-else: elseEntry IS merge, so ifBlock predecessor is "else" edge.
+		// If-without-else: the pred matching ifBlockIndex is "else" (default).
 		for i := 0; i < len(preds); i++ {
 			if preds[i].Index == info.ifBlockIndex {
-				// This edge comes from ifBlock (the else/default path).
-				elseValue = b.getValue(phi.Edges[i], token.NoPos)
+				elseIdx = i
 			} else {
-				// This edge comes from then-branch.
-				thenValue = b.getValue(phi.Edges[i], token.NoPos)
+				thenIdx = i
 			}
 		}
 	} else {
-		// If-with-else: determine based on reachability.
+		// If-with-else: classify by reachability from thenEntry.
 		thenEntry := b.fn.Blocks[info.thenEntryIndex]
 		for i := 0; i < len(preds); i++ {
 			if b.spmdIsReachableFrom(thenEntry, preds[i], block) {
-				// This edge comes from then-branch.
-				thenValue = b.getValue(phi.Edges[i], token.NoPos)
+				thenIdx = i
 			} else {
-				// This edge comes from else-branch.
-				elseValue = b.getValue(phi.Edges[i], token.NoPos)
+				elseIdx = i
 			}
 		}
 	}
 
-	// Ensure both values are non-nil.
-	if thenValue.IsNil() || elseValue.IsNil() {
-		return llvm.Value{}, false
+	thenVal, thenOK := b.spmdTryGetValue(phi.Edges[thenIdx])
+	elseVal, elseOK := b.spmdTryGetValue(phi.Edges[elseIdx])
+
+	if thenOK && elseOK {
+		// Both values are ready: emit the select immediately.
+		thenVal, elseVal = b.spmdBroadcastMatch(thenVal, elseVal)
+		thenIsVec := thenVal.Type().TypeKind() == llvm.VectorTypeKind
+		elseIsVec := elseVal.Type().TypeKind() == llvm.VectorTypeKind
+		if thenIsVec || elseIsVec {
+			// At least one operand is a vector → vector masked select.
+			// On WASM the mask is <N x i32>, so use spmdMaskSelect instead of
+			// CreateSelect (which requires an <N x i1> condition).
+			return b.spmdMaskSelect(info.cond, thenVal, elseVal), true
+		}
+		// Both are scalars → reduce condition to scalar boolean and use scalar select.
+		// Scalar phis at a varying merge represent uniform values. We use any-true
+		// reduction: if any lane took the then-branch, use the then-value. This is
+		// safe because the SPMD type checker forbids varying-dependent mutation of
+		// uniform variables, so both edges carry the same value in practice.
+		scalarCond := b.spmdVectorAnyTrue(info.cond)
+		return b.CreateSelect(scalarCond, thenVal, elseVal, ""), true
 	}
 
-	// Handle type mismatches via broadcast.
-	thenValue, elseValue = b.spmdBroadcastMatch(thenValue, elseValue)
+	// One or both values are not yet available. Defer select creation to phi
+	// resolution, just like spmdCreateMultiPredMergeSelect does.
+	//
+	// After linearization the merge block has exactly one LLVM predecessor:
+	//   if-without-else → thenExit (ifBlock was redirected away)
+	//   if-with-else    → elseExit (thenExit was redirected to elseEntry)
+	// Create a single-incoming phi now; the override fills in the select later.
+	phiType := b.getLLVMType(phi.Type())
+	llvmPhi := b.CreatePHI(phiType, "")
+	b.phis = append(b.phis, phiNode{phi, llvmPhi})
 
-	// Determine select type based on operand types.
-	thenIsVec := thenValue.Type().TypeKind() == llvm.VectorTypeKind
-	elseIsVec := elseValue.Type().TypeKind() == llvm.VectorTypeKind
-
-	if thenIsVec || elseIsVec {
-		// At least one operand is a vector → vector masked select.
-		// On WASM the mask is <N x i32> so use spmdMaskSelect instead of CreateSelect
-		// (which requires an <N x i1> condition).
-		return b.spmdMaskSelect(info.cond, thenValue, elseValue), true
+	// Determine the surviving LLVM exit block and which SSA edge to skip.
+	var survivingLLVMBlock llvm.BasicBlock
+	var skipEdgeIdx int
+	if !info.hasElse {
+		// ifBlock edge is redirected away; thenExit is the only LLVM pred.
+		skipEdgeIdx = elseIdx // elseIdx == ifBlock edge
+		survivingLLVMBlock = b.blockInfo[preds[thenIdx].Index].exit
+	} else {
+		// thenExit was redirected to elseEntry; elseExit is the only LLVM pred.
+		skipEdgeIdx = thenIdx
+		survivingLLVMBlock = b.blockInfo[preds[elseIdx].Index].exit
 	}
 
-	// Both are scalars → reduce condition to scalar boolean and use scalar select.
-	// Scalar phis at a varying merge represent uniform values. We use any-true
-	// reduction: if any lane took the then-branch, use the then-value. This is
-	// safe because the SPMD type checker forbids varying-dependent mutation of
-	// uniform variables, so both edges carry the same value in practice.
-	scalarCond := b.spmdVectorAnyTrue(info.cond)
-	return b.CreateSelect(scalarCond, thenValue, elseValue, ""), true
+	b.spmdMergePhiOverrides[phi] = spmdMergePhiOverride{
+		skipEdgeIdx: skipEdgeIdx,
+		thenEdgeIdx: thenIdx,
+		elseEdgeIdx: elseIdx,
+		info:        info,
+		llvmBlock:   survivingLLVMBlock,
+	}
+
+	return llvmPhi, true
 }
 
 // spmdCreateMultiPredMergeSelect handles phis at merge blocks with >2 predecessors,
@@ -1207,10 +1305,12 @@ func (b *builder) spmdCreateMultiPredMergeSelect(phi *ssa.Phi, info *spmdVarying
 	llvmPhi := b.CreatePHI(phiType, "")
 	b.phis = append(b.phis, phiNode{phi, llvmPhi})
 
-	// Record override: during phi resolution, skip then-edge and replace else-edge
-	// with a select(cond, thenVal, elseVal). Use the else-block's LLVM exit as the
-	// predecessor because after linearization, if.then jumps to if.else.
+	// Record override: during phi resolution, skip the then-edge (it has no LLVM
+	// predecessor after linearization) and replace the else-edge with
+	// select(cond, thenVal, elseVal). Use the else-block's LLVM exit as the
+	// predecessor because after linearization if.then jumps to if.else.
 	b.spmdMergePhiOverrides[phi] = spmdMergePhiOverride{
+		skipEdgeIdx: thenIdx,
 		thenEdgeIdx: thenIdx,
 		elseEdgeIdx: elseIdx,
 		info:        info,
