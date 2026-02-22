@@ -2614,3 +2614,357 @@ func TestSPMDConstIntOrSplat(t *testing.T) {
 		})
 	}
 }
+
+// TestSPMDRotateWithinMask verifies the shuffle index mask computed by spmdRotateWithinMask.
+func TestSPMDRotateWithinMask(t *testing.T) {
+	tests := []struct {
+		name       string
+		totalLanes int
+		groupSize  int
+		offset     int
+		want       []uint64
+	}{
+		{
+			// 8 lanes, groups of 4, rotate left by 1:
+			// group0: [0,1,2,3] -> src for lane i is (i+1)%4 -> [1,2,3,0]
+			// group1: [4,5,6,7] -> [5,6,7,4]
+			name:       "8_lanes_group4_offset1",
+			totalLanes: 8,
+			groupSize:  4,
+			offset:     1,
+			want:       []uint64{1, 2, 3, 0, 5, 6, 7, 4},
+		},
+		{
+			// 8 lanes, groups of 4, rotate right by 1 (offset=-1):
+			// group0: src for lane i is (i-1+4)%4 -> [3,0,1,2]
+			// group1: [7,4,5,6]
+			name:       "8_lanes_group4_offset_minus1",
+			totalLanes: 8,
+			groupSize:  4,
+			offset:     -1,
+			want:       []uint64{3, 0, 1, 2, 7, 4, 5, 6},
+		},
+		{
+			// 16 lanes, groups of 4, rotate left by 2:
+			// group0: src (i+2)%4 -> [2,3,0,1]
+			// group1: [6,7,4,5]
+			// group2: [10,11,8,9]
+			// group3: [14,15,12,13]
+			name:       "16_lanes_group4_offset2",
+			totalLanes: 16,
+			groupSize:  4,
+			offset:     2,
+			want:       []uint64{2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13},
+		},
+		{
+			// 4 lanes, groups of 2, rotate left by 1:
+			// group0: [0,1] -> [1,0]
+			// group1: [2,3] -> [3,2]
+			name:       "4_lanes_group2_offset1",
+			totalLanes: 4,
+			groupSize:  2,
+			offset:     1,
+			want:       []uint64{1, 0, 3, 2},
+		},
+		{
+			// 4 lanes, single group of 4, rotate left by 3:
+			// src for lane i: (i+3)%4 -> [3,0,1,2]
+			name:       "4_lanes_group4_offset3",
+			totalLanes: 4,
+			groupSize:  4,
+			offset:     3,
+			want:       []uint64{3, 0, 1, 2},
+		},
+		{
+			// Zero offset: identity permutation.
+			name:       "8_lanes_group4_offset0",
+			totalLanes: 8,
+			groupSize:  4,
+			offset:     0,
+			want:       []uint64{0, 1, 2, 3, 4, 5, 6, 7},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := spmdRotateWithinMask(tt.totalLanes, tt.groupSize, tt.offset)
+			if len(got) != len(tt.want) {
+				t.Fatalf("mask length = %d, want %d", len(got), len(tt.want))
+			}
+			for i, v := range got {
+				if v != tt.want[i] {
+					t.Errorf("mask[%d] = %d, want %d", i, v, tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestSPMDShiftLeftWithinMask verifies the shuffle index mask computed by spmdShiftLeftWithinMask.
+func TestSPMDShiftLeftWithinMask(t *testing.T) {
+	tests := []struct {
+		name       string
+		totalLanes int
+		groupSize  int
+		amount     int
+		wantMask   []uint64
+		wantZero   []bool
+	}{
+		{
+			// 8 lanes, groups of 4, shift left by 1:
+			// lane i in group gets value from lane i+1; lane 3 in each group is zeroed.
+			// group0: [1,2,3,zero] -> mask=[1,2,3,0], zero=[F,F,F,T]
+			// group1: [5,6,7,zero] -> mask=[5,6,7,0], zero=[F,F,F,T]
+			name:       "8_lanes_group4_amount1",
+			totalLanes: 8,
+			groupSize:  4,
+			amount:     1,
+			wantMask:   []uint64{1, 2, 3, 0, 5, 6, 7, 0},
+			wantZero:   []bool{false, false, false, true, false, false, false, true},
+		},
+		{
+			// 8 lanes, groups of 4, shift left by 2:
+			// lane i gets value from lane i+2; lanes 2,3 in each group zeroed.
+			// group0: [2,3,zero,zero], group1: [6,7,zero,zero]
+			name:       "8_lanes_group4_amount2",
+			totalLanes: 8,
+			groupSize:  4,
+			amount:     2,
+			wantMask:   []uint64{2, 3, 0, 0, 6, 7, 0, 0},
+			wantZero:   []bool{false, false, true, true, false, false, true, true},
+		},
+		{
+			// Zero amount: identity permutation, no zeroing.
+			name:       "8_lanes_group4_amount0",
+			totalLanes: 8,
+			groupSize:  4,
+			amount:     0,
+			wantMask:   []uint64{0, 1, 2, 3, 4, 5, 6, 7},
+			wantZero:   []bool{false, false, false, false, false, false, false, false},
+		},
+		{
+			// 4 lanes, groups of 2, shift left by 1:
+			// group0: [1,zero], group1: [3,zero]
+			name:       "4_lanes_group2_amount1",
+			totalLanes: 4,
+			groupSize:  2,
+			amount:     1,
+			wantMask:   []uint64{1, 0, 3, 0},
+			wantZero:   []bool{false, true, false, true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotMask, gotZero := spmdShiftLeftWithinMask(tt.totalLanes, tt.groupSize, tt.amount)
+			if len(gotMask) != len(tt.wantMask) {
+				t.Fatalf("mask length = %d, want %d", len(gotMask), len(tt.wantMask))
+			}
+			for i := range gotMask {
+				if !tt.wantZero[i] && gotMask[i] != tt.wantMask[i] {
+					t.Errorf("mask[%d] = %d, want %d", i, gotMask[i], tt.wantMask[i])
+				}
+				if gotZero[i] != tt.wantZero[i] {
+					t.Errorf("zero[%d] = %v, want %v", i, gotZero[i], tt.wantZero[i])
+				}
+			}
+		})
+	}
+}
+
+// TestSPMDShiftRightWithinMask verifies the shuffle index mask computed by spmdShiftRightWithinMask.
+func TestSPMDShiftRightWithinMask(t *testing.T) {
+	tests := []struct {
+		name       string
+		totalLanes int
+		groupSize  int
+		amount     int
+		wantMask   []uint64
+		wantZero   []bool
+	}{
+		{
+			// 8 lanes, groups of 4, shift right by 1:
+			// lane i gets value from lane i-1; lane 0 in each group zeroed.
+			// group0: [zero,0,1,2], group1: [zero,4,5,6]
+			name:       "8_lanes_group4_amount1",
+			totalLanes: 8,
+			groupSize:  4,
+			amount:     1,
+			wantMask:   []uint64{0, 0, 1, 2, 0, 4, 5, 6},
+			wantZero:   []bool{true, false, false, false, true, false, false, false},
+		},
+		{
+			// 8 lanes, groups of 4, shift right by 2:
+			// lanes 0,1 in each group zeroed.
+			// group0: [zero,zero,0,1], group1: [zero,zero,4,5]
+			name:       "8_lanes_group4_amount2",
+			totalLanes: 8,
+			groupSize:  4,
+			amount:     2,
+			wantMask:   []uint64{0, 0, 0, 1, 0, 0, 4, 5},
+			wantZero:   []bool{true, true, false, false, true, true, false, false},
+		},
+		{
+			// Zero amount: identity permutation, no zeroing.
+			name:       "8_lanes_group4_amount0",
+			totalLanes: 8,
+			groupSize:  4,
+			amount:     0,
+			wantMask:   []uint64{0, 1, 2, 3, 4, 5, 6, 7},
+			wantZero:   []bool{false, false, false, false, false, false, false, false},
+		},
+		{
+			// 4 lanes, groups of 2, shift right by 1:
+			// group0: [zero,0], group1: [zero,2]
+			name:       "4_lanes_group2_amount1",
+			totalLanes: 4,
+			groupSize:  2,
+			amount:     1,
+			wantMask:   []uint64{0, 0, 0, 2},
+			wantZero:   []bool{true, false, true, false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotMask, gotZero := spmdShiftRightWithinMask(tt.totalLanes, tt.groupSize, tt.amount)
+			if len(gotMask) != len(tt.wantMask) {
+				t.Fatalf("mask length = %d, want %d", len(gotMask), len(tt.wantMask))
+			}
+			for i := range gotMask {
+				if !tt.wantZero[i] && gotMask[i] != tt.wantMask[i] {
+					t.Errorf("mask[%d] = %d, want %d", i, gotMask[i], tt.wantMask[i])
+				}
+				if gotZero[i] != tt.wantZero[i] {
+					t.Errorf("zero[%d] = %v, want %v", i, gotZero[i], tt.wantZero[i])
+				}
+			}
+		})
+	}
+}
+
+// TestSPMDRotateWithin verifies that createRotateWithin emits a shufflevector instruction
+// with correct type (same vector type as input) and non-nil result.
+func TestSPMDRotateWithin(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Build a constant <8 x i32> input vector [0..7].
+	vecElts := make([]llvm.Value, 8)
+	for i := range vecElts {
+		vecElts[i] = llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false)
+	}
+	input := llvm.ConstVector(vecElts, false)
+	vecType := input.Type() // <8 x i32>
+
+	// Compute the shuffle mask directly (rotate left by 1 within groups of 4).
+	mask := spmdRotateWithinMask(8, 4, 1)
+	shuffleMask := c.spmdShuffleConst(mask)
+
+	result := b.CreateShuffleVector(input, llvm.Undef(vecType), shuffleMask, "rotatewithin")
+
+	if result.IsNil() {
+		t.Fatal("CreateShuffleVector returned nil")
+	}
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("result type kind = %v, want VectorTypeKind", result.Type().TypeKind())
+	}
+	if result.Type().VectorSize() != 8 {
+		t.Errorf("result lane count = %d, want 8", result.Type().VectorSize())
+	}
+	if result.Type().ElementType().IntTypeWidth() != 32 {
+		t.Errorf("result element width = %d, want 32", result.Type().ElementType().IntTypeWidth())
+	}
+}
+
+// TestSPMDShiftLeftWithin verifies that the shift-left-within shuffle mask and zero mask
+// generate the correct LLVM shufflevector + select sequence.
+func TestSPMDShiftLeftWithin(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Build a constant <8 x i32> input vector [10,11,12,13,20,21,22,23].
+	vals := []uint64{10, 11, 12, 13, 20, 21, 22, 23}
+	vecElts := make([]llvm.Value, 8)
+	for i, v := range vals {
+		vecElts[i] = llvm.ConstInt(c.ctx.Int32Type(), v, false)
+	}
+	input := llvm.ConstVector(vecElts, false)
+	vecType := input.Type()
+
+	// ShiftLeft by 1 within groups of 4.
+	mask, zeroMask := spmdShiftLeftWithinMask(8, 4, 1)
+
+	shuffleMask := c.spmdShuffleConst(mask)
+	shuffled := b.CreateShuffleVector(input, llvm.Undef(vecType), shuffleMask, "shiftleftwithin")
+
+	if shuffled.IsNil() {
+		t.Fatal("CreateShuffleVector returned nil")
+	}
+
+	// Apply zero select for out-of-range lanes.
+	zero := llvm.ConstNull(vecType)
+	selectorElts := make([]llvm.Value, 8)
+	for i := 0; i < 8; i++ {
+		keep := !zeroMask[i]
+		selectorElts[i] = llvm.ConstInt(c.ctx.Int1Type(), boolToUint64(keep), false)
+	}
+	selector := llvm.ConstVector(selectorElts, false)
+	result := b.CreateSelect(selector, shuffled, zero, "shiftleftwithin.zero")
+
+	if result.IsNil() {
+		t.Fatal("CreateSelect returned nil")
+	}
+	if result.Type().VectorSize() != 8 {
+		t.Errorf("result lane count = %d, want 8", result.Type().VectorSize())
+	}
+}
+
+// TestSPMDShiftRightWithin verifies that the shift-right-within shuffle mask and zero mask
+// generate the correct LLVM shufflevector + select sequence.
+func TestSPMDShiftRightWithin(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Build a constant <8 x i32> input vector [10,11,12,13,20,21,22,23].
+	vals := []uint64{10, 11, 12, 13, 20, 21, 22, 23}
+	vecElts := make([]llvm.Value, 8)
+	for i, v := range vals {
+		vecElts[i] = llvm.ConstInt(c.ctx.Int32Type(), v, false)
+	}
+	input := llvm.ConstVector(vecElts, false)
+	vecType := input.Type()
+
+	// ShiftRight by 1 within groups of 4.
+	mask, zeroMask := spmdShiftRightWithinMask(8, 4, 1)
+
+	shuffleMask := c.spmdShuffleConst(mask)
+	shuffled := b.CreateShuffleVector(input, llvm.Undef(vecType), shuffleMask, "shiftrightwithin")
+
+	if shuffled.IsNil() {
+		t.Fatal("CreateShuffleVector returned nil")
+	}
+
+	// Apply zero select for out-of-range lanes.
+	zero := llvm.ConstNull(vecType)
+	selectorElts := make([]llvm.Value, 8)
+	for i := 0; i < 8; i++ {
+		keep := !zeroMask[i]
+		selectorElts[i] = llvm.ConstInt(c.ctx.Int1Type(), boolToUint64(keep), false)
+	}
+	selector := llvm.ConstVector(selectorElts, false)
+	result := b.CreateSelect(selector, shuffled, zero, "shiftrightwithin.zero")
+
+	if result.IsNil() {
+		t.Fatal("CreateSelect returned nil")
+	}
+	if result.Type().VectorSize() != 8 {
+		t.Errorf("result lane count = %d, want 8", result.Type().VectorSize())
+	}
+}

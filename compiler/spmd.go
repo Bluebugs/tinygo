@@ -1613,9 +1613,255 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		// Load as vector
 		return b.CreateLoad(vecType, ptr, "lanes.from"), nil
 
+	case strings.HasPrefix(name, "lanes.RotateWithin["):
+		return b.createRotateWithin(instr, name)
+
+	case strings.HasPrefix(name, "lanes.ShiftLeftWithin["):
+		return b.createShiftLeftWithin(instr, name)
+
+	case strings.HasPrefix(name, "lanes.ShiftRightWithin["):
+		return b.createShiftRightWithin(instr, name)
+
+	case strings.HasPrefix(name, "lanes.SwizzleWithin["):
+		// SwizzleWithin requires variable shuffle indices which are not supported
+		// as constant shufflevector masks on all LLVM targets. Deferred to a future
+		// phase that can generate extractelement/insertelement sequences.
+		return llvm.Value{}, b.makeError(getPos(instr), "lanes.SwizzleWithin not yet implemented")
+
 	default:
 		return llvm.Value{}, b.makeError(getPos(instr), "unsupported lanes builtin: "+name)
 	}
+}
+
+// spmdExtractIntConst extracts a compile-time integer constant from an SSA value.
+// Returns the int64 value and true on success, or 0 and false if not a constant.
+func spmdExtractIntConst(v ssa.Value) (int64, bool) {
+	c, ok := v.(*ssa.Const)
+	if !ok {
+		return 0, false
+	}
+	return c.Int64(), true
+}
+
+// spmdShuffleConst builds an LLVM <N x i32> constant vector from a slice of uint64 indices.
+// This is the mask operand for CreateShuffleVector.
+func (c *compilerContext) spmdShuffleConst(indices []uint64) llvm.Value {
+	elts := make([]llvm.Value, len(indices))
+	for i, idx := range indices {
+		elts[i] = llvm.ConstInt(c.ctx.Int32Type(), idx, false)
+	}
+	return llvm.ConstVector(elts, false)
+}
+
+// createRotateWithin rotates values within independent groups of groupSize lanes.
+//
+// For a vector of totalLanes elements divided into groups of groupSize, each group
+// is rotated independently by offset positions. Negative offset rotates right.
+//
+// Example: RotateWithin(<0,1,2,3,4,5,6,7>, offset=1, groupSize=4)
+// => <1,2,3,0, 5,6,7,4>  (each group of 4 rotated left by 1)
+func (b *builder) createRotateWithin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	pos := getPos(instr)
+	value := b.getValue(instr.Args[0], pos)
+
+	offset, ok := spmdExtractIntConst(instr.Args[1])
+	if !ok {
+		return llvm.Value{}, b.makeError(pos, "lanes.RotateWithin: offset must be a compile-time constant")
+	}
+	groupSize, ok := spmdExtractIntConst(instr.Args[2])
+	if !ok {
+		return llvm.Value{}, b.makeError(pos, "lanes.RotateWithin: groupSize must be a compile-time constant")
+	}
+
+	vecType := value.Type()
+	totalLanes := vecType.VectorSize()
+	gs := int(groupSize)
+
+	if gs <= 0 || totalLanes%gs != 0 {
+		return llvm.Value{}, b.makeError(pos, "lanes.RotateWithin: groupSize must evenly divide lane count")
+	}
+
+	mask := spmdRotateWithinMask(totalLanes, gs, int(offset))
+	shuffleMask := b.spmdShuffleConst(mask)
+	return b.CreateShuffleVector(value, llvm.Undef(vecType), shuffleMask, "rotatewithin"), nil
+}
+
+// spmdRotateWithinMask computes the shufflevector index mask for RotateWithin.
+// Each group of groupSize elements is rotated by offset positions (positive = left).
+func spmdRotateWithinMask(totalLanes, groupSize, offset int) []uint64 {
+	mask := make([]uint64, totalLanes)
+	for i := 0; i < totalLanes; i++ {
+		group := i / groupSize
+		lane := i % groupSize
+		// Positive offset rotates left: lane i gets value from lane (i+offset) % groupSize.
+		// The modulo handles wrap-around and negative offsets.
+		src := ((lane + offset) % groupSize + groupSize) % groupSize
+		mask[i] = uint64(group*groupSize + src)
+	}
+	return mask
+}
+
+// createShiftLeftWithin shifts values left within independent groups of groupSize lanes.
+//
+// Element at position i within a group gets the value from position i+amount.
+// Positions shifted in from the left (i+amount >= groupSize) become zero.
+//
+// Example: ShiftLeftWithin(<0,1,2,3,4,5,6,7>, amount=1, groupSize=4)
+// => <1,2,3,0, 5,6,7,0>  (each group of 4 shifted left by 1, new elements = 0)
+func (b *builder) createShiftLeftWithin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	pos := getPos(instr)
+	value := b.getValue(instr.Args[0], pos)
+
+	amount, ok := spmdExtractIntConst(instr.Args[1])
+	if !ok {
+		return llvm.Value{}, b.makeError(pos, "lanes.ShiftLeftWithin: amount must be a compile-time constant")
+	}
+	groupSize, ok := spmdExtractIntConst(instr.Args[2])
+	if !ok {
+		return llvm.Value{}, b.makeError(pos, "lanes.ShiftLeftWithin: groupSize must be a compile-time constant")
+	}
+
+	vecType := value.Type()
+	totalLanes := vecType.VectorSize()
+	gs := int(groupSize)
+	amt := int(amount)
+
+	if gs <= 0 || totalLanes%gs != 0 {
+		return llvm.Value{}, b.makeError(pos, "lanes.ShiftLeftWithin: groupSize must evenly divide lane count")
+	}
+
+	mask, zeroMask := spmdShiftLeftWithinMask(totalLanes, gs, amt)
+	shuffleMask := b.spmdShuffleConst(mask)
+
+	// Concatenate value with itself so out-of-range indices map to the second
+	// copy (which we will then select away with a zero). LLVM treats indices >=
+	// totalLanes in a two-operand shufflevector as elements of the second
+	// operand, so passing Undef leaves those lanes undefined; we AND them to
+	// zero via a select instead.
+	shuffled := b.CreateShuffleVector(value, llvm.Undef(vecType), shuffleMask, "shiftleftwithin")
+
+	// Zero out the lanes that were shifted beyond the group boundary.
+	if len(zeroMask) > 0 {
+		zero := llvm.ConstNull(vecType)
+		// Build a per-lane boolean selector: true => keep shuffled, false => zero.
+		selectorElts := make([]llvm.Value, totalLanes)
+		allTrue := true
+		for i := 0; i < totalLanes; i++ {
+			keep := !zeroMask[i]
+			if !keep {
+				allTrue = false
+			}
+			selectorElts[i] = llvm.ConstInt(b.ctx.Int1Type(), boolToUint64(keep), false)
+		}
+		if !allTrue {
+			selector := llvm.ConstVector(selectorElts, false)
+			shuffled = b.CreateSelect(selector, shuffled, zero, "shiftleftwithin.zero")
+		}
+	}
+	return shuffled, nil
+}
+
+// spmdShiftLeftWithinMask computes the shufflevector index mask for ShiftLeftWithin.
+// Returns the mask and a per-lane boolean slice indicating which lanes should be zeroed.
+// Indices that fall outside the group are set to 0 (they'll be zeroed by the caller via select).
+func spmdShiftLeftWithinMask(totalLanes, groupSize, amount int) ([]uint64, []bool) {
+	mask := make([]uint64, totalLanes)
+	zero := make([]bool, totalLanes)
+	for i := 0; i < totalLanes; i++ {
+		group := i / groupSize
+		lane := i % groupSize
+		src := lane + amount
+		if src >= groupSize {
+			// Shifted out of the group; the select will zero this lane.
+			mask[i] = 0
+			zero[i] = true
+		} else {
+			mask[i] = uint64(group*groupSize + src)
+		}
+	}
+	return mask, zero
+}
+
+// createShiftRightWithin shifts values right within independent groups of groupSize lanes.
+//
+// Element at position i within a group gets the value from position i-amount.
+// Positions shifted in from the right (i-amount < 0) become zero.
+//
+// Example: ShiftRightWithin(<0,1,2,3,4,5,6,7>, amount=1, groupSize=4)
+// => <0,0,1,2, 0,4,5,6>  (each group of 4 shifted right by 1, new elements = 0)
+func (b *builder) createShiftRightWithin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	pos := getPos(instr)
+	value := b.getValue(instr.Args[0], pos)
+
+	amount, ok := spmdExtractIntConst(instr.Args[1])
+	if !ok {
+		return llvm.Value{}, b.makeError(pos, "lanes.ShiftRightWithin: amount must be a compile-time constant")
+	}
+	groupSize, ok := spmdExtractIntConst(instr.Args[2])
+	if !ok {
+		return llvm.Value{}, b.makeError(pos, "lanes.ShiftRightWithin: groupSize must be a compile-time constant")
+	}
+
+	vecType := value.Type()
+	totalLanes := vecType.VectorSize()
+	gs := int(groupSize)
+	amt := int(amount)
+
+	if gs <= 0 || totalLanes%gs != 0 {
+		return llvm.Value{}, b.makeError(pos, "lanes.ShiftRightWithin: groupSize must evenly divide lane count")
+	}
+
+	mask, zeroMask := spmdShiftRightWithinMask(totalLanes, gs, amt)
+	shuffleMask := b.spmdShuffleConst(mask)
+
+	shuffled := b.CreateShuffleVector(value, llvm.Undef(vecType), shuffleMask, "shiftrightwithin")
+
+	// Zero out lanes that were shifted beyond the group boundary.
+	if len(zeroMask) > 0 {
+		zero := llvm.ConstNull(vecType)
+		selectorElts := make([]llvm.Value, totalLanes)
+		allTrue := true
+		for i := 0; i < totalLanes; i++ {
+			keep := !zeroMask[i]
+			if !keep {
+				allTrue = false
+			}
+			selectorElts[i] = llvm.ConstInt(b.ctx.Int1Type(), boolToUint64(keep), false)
+		}
+		if !allTrue {
+			selector := llvm.ConstVector(selectorElts, false)
+			shuffled = b.CreateSelect(selector, shuffled, zero, "shiftrightwithin.zero")
+		}
+	}
+	return shuffled, nil
+}
+
+// spmdShiftRightWithinMask computes the shufflevector index mask for ShiftRightWithin.
+// Returns the mask and a per-lane boolean slice indicating which lanes should be zeroed.
+func spmdShiftRightWithinMask(totalLanes, groupSize, amount int) ([]uint64, []bool) {
+	mask := make([]uint64, totalLanes)
+	zero := make([]bool, totalLanes)
+	for i := 0; i < totalLanes; i++ {
+		group := i / groupSize
+		lane := i % groupSize
+		src := lane - amount
+		if src < 0 {
+			// Shifted out of the group; the select will zero this lane.
+			mask[i] = 0
+			zero[i] = true
+		} else {
+			mask[i] = uint64(group*groupSize + src)
+		}
+	}
+	return mask, zero
+}
+
+// boolToUint64 converts a bool to 0 or 1 for use in LLVM constant construction.
+func boolToUint64(b bool) uint64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // createReduceBuiltin handles interception of reduce.* function calls.
