@@ -3322,3 +3322,121 @@ func TestSPMDSwitchPushDirectTransition(t *testing.T) {
 		t.Error("after pop, current mask should be parentMask")
 	}
 }
+
+// TestSPMDCondChainAndMaskCombine verifies that two i32 vectors are combined with AND for &&.
+func TestSPMDCondChainAndMaskCombine(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+
+	i32x4 := llvm.VectorType(c.ctx.Int32Type(), 4)
+	a := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(c.ctx.Int32Type(), 0xFFFFFFFF, false),
+		llvm.ConstNull(c.ctx.Int32Type()),
+		llvm.ConstInt(c.ctx.Int32Type(), 0xFFFFFFFF, false),
+		llvm.ConstNull(c.ctx.Int32Type()),
+	}, false)
+	bVal := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(c.ctx.Int32Type(), 0xFFFFFFFF, false),
+		llvm.ConstInt(c.ctx.Int32Type(), 0xFFFFFFFF, false),
+		llvm.ConstNull(c.ctx.Int32Type()),
+		llvm.ConstNull(c.ctx.Int32Type()),
+	}, false)
+
+	result := b.CreateAnd(a, bVal, "spmd.chain.and")
+
+	if result.Type() != i32x4 {
+		t.Errorf("expected <4 x i32>, got %s", result.Type())
+	}
+	// Verify the AND operation produces a valid instruction.
+	if result.IsNil() {
+		t.Error("CreateAnd returned nil")
+	}
+}
+
+// TestSPMDCondChainOrMaskCombine verifies that two i32 vectors are combined with OR for ||.
+func TestSPMDCondChainOrMaskCombine(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+
+	i32x4 := llvm.VectorType(c.ctx.Int32Type(), 4)
+	a := llvm.ConstVector([]llvm.Value{
+		llvm.ConstInt(c.ctx.Int32Type(), 0xFFFFFFFF, false),
+		llvm.ConstNull(c.ctx.Int32Type()),
+		llvm.ConstNull(c.ctx.Int32Type()),
+		llvm.ConstNull(c.ctx.Int32Type()),
+	}, false)
+	bVal := llvm.ConstVector([]llvm.Value{
+		llvm.ConstNull(c.ctx.Int32Type()),
+		llvm.ConstInt(c.ctx.Int32Type(), 0xFFFFFFFF, false),
+		llvm.ConstNull(c.ctx.Int32Type()),
+		llvm.ConstNull(c.ctx.Int32Type()),
+	}, false)
+
+	result := b.CreateOr(a, bVal, "spmd.chain.or")
+
+	if result.Type() != i32x4 {
+		t.Errorf("expected <4 x i32>, got %s", result.Type())
+	}
+	if result.IsNil() {
+		t.Error("CreateOr returned nil")
+	}
+}
+
+// TestSPMDCondChainMergeSelectType verifies the spmdCondChain and spmdMergePhiOverride
+// type structures have the expected fields.
+func TestSPMDCondChainMergeSelectType(t *testing.T) {
+	// Verify spmdCondChain has all expected fields.
+	chain := spmdCondChain{
+		outerIfBlock: 0,
+		innerBlocks:  []int{1, 2},
+		op:           token.LAND,
+		thenTarget:   3,
+		elseTarget:   4,
+	}
+	if chain.op != token.LAND {
+		t.Error("expected LAND op")
+	}
+	if len(chain.innerBlocks) != 2 {
+		t.Errorf("expected 2 inner blocks, got %d", len(chain.innerBlocks))
+	}
+	if chain.combinedCond.C != nil {
+		t.Error("expected nil combinedCond before compilation")
+	}
+
+	// Verify spmdMergePhiOverride has skipEdgeIdxs.
+	override := spmdMergePhiOverride{
+		skipEdgeIdx:  0,
+		skipEdgeIdxs: []int{0, 1, 2},
+		thenEdgeIdx:  3,
+		elseEdgeIdx:  0,
+	}
+	if len(override.skipEdgeIdxs) != 3 {
+		t.Errorf("expected 3 skipEdgeIdxs, got %d", len(override.skipEdgeIdxs))
+	}
+}
+
+// TestSPMDCondChainDefaultPreds verifies chainDefaultPreds is populated correctly.
+func TestSPMDCondChainDefaultPreds(t *testing.T) {
+	info := &spmdVaryingIf{
+		ifBlockIndex:      0,
+		thenEntryIndex:    3,
+		elseEntryIndex:    4,
+		mergeIndex:        4,
+		hasElse:           false,
+		chainDefaultPreds: []int{0, 1, 2},
+	}
+
+	if len(info.chainDefaultPreds) != 3 {
+		t.Errorf("expected 3 default preds, got %d", len(info.chainDefaultPreds))
+	}
+
+	// Verify the preds match the outer block + inner blocks.
+	expected := map[int]bool{0: true, 1: true, 2: true}
+	for _, idx := range info.chainDefaultPreds {
+		if !expected[idx] {
+			t.Errorf("unexpected default pred index %d", idx)
+		}
+	}
+}

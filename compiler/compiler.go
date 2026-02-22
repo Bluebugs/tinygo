@@ -1721,8 +1721,18 @@ func (b *builder) createFunction() {
 
 			// SPMD: handle merge phi overrides (multi-pred and deferred 2-edge cases).
 			if override, ok := b.spmdMergePhiOverrides[phi.ssa]; ok {
-				if i == override.skipEdgeIdx {
-					continue // skip redirected edge — no LLVM predecessor after linearization
+				// Check if this edge should be skipped (redirected away after linearization).
+				shouldSkip := (i == override.skipEdgeIdx)
+				if !shouldSkip && len(override.skipEdgeIdxs) > 0 {
+					for _, idx := range override.skipEdgeIdxs {
+						if i == idx {
+							shouldSkip = true
+							break
+						}
+					}
+				}
+				if shouldSkip {
+					continue
 				}
 				if i == override.thenEdgeIdx || i == override.elseEdgeIdx {
 					// Create select in the surviving block, just before its terminator.
@@ -1942,6 +1952,49 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		if chainIdx, ok := b.spmdSwitchIfBlocks[block.Index]; ok {
 			b.spmdCompileSwitchIf(block, cond, chainIdx)
 			b.CreateBr(blockThen) // linearize: always branch to body
+			break
+		}
+		// SPMD: check for condition chain (&&/||) head or inner block.
+		if chain, ok := b.spmdCondChains[block.Index]; ok {
+			// Chain head: start combining conditions.
+			chain.combinedCond = cond
+			// Linearize: branch to the first inner block.
+			// For && (LAND): inner is Succs[0] (cond.true)
+			// For || (LOR): inner is Succs[1] (cond.false)
+			if chain.op == token.LAND {
+				b.CreateBr(blockThen) // Succs[0] = cond.true
+			} else {
+				b.CreateBr(blockElse) // Succs[1] = cond.false
+			}
+			break
+		}
+		if chain, ok := b.spmdCondChainInner[block.Index]; ok {
+			// Inner block: combine condition with running chain.
+			if chain.op == token.LAND {
+				chain.combinedCond = b.CreateAnd(chain.combinedCond, cond, "spmd.chain.and")
+			} else {
+				chain.combinedCond = b.CreateOr(chain.combinedCond, cond, "spmd.chain.or")
+			}
+			// Check if this is the last inner block in the chain.
+			isLast := chain.innerBlocks[len(chain.innerBlocks)-1] == block.Index
+			if isLast {
+				// Last block: use combined condition for the full varying if.
+				// Call spmdDetectVaryingIf on the OUTER block with combined cond.
+				outerBlock := b.fn.Blocks[chain.outerIfBlock]
+				b.spmdDetectVaryingIf(outerBlock, chain.combinedCond)
+			}
+			// Linearize: branch to next in chain or to then-body.
+			// For && (LAND): always Succs[0] (next cond.true, or if.then for last)
+			// For || (LOR): Succs[1] for non-last (next cond.false), Succs[0] for last (shared T)
+			if chain.op == token.LAND {
+				b.CreateBr(blockThen) // Succs[0]
+			} else {
+				if isLast {
+					b.CreateBr(blockThen) // Succs[0] = shared true target
+				} else {
+					b.CreateBr(blockElse) // Succs[1] = next cond.false
+				}
+			}
 			break
 		}
 		// SPMD: check for varying break pattern before general linearization.

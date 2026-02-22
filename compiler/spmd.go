@@ -832,11 +832,12 @@ type spmdCondChain struct {
 // The select is always created during phi resolution (not phi creation) to avoid
 // circular dependencies when edge values reference the phi itself.
 type spmdMergePhiOverride struct {
-	skipEdgeIdx int            // phi edge index to skip during resolution (no LLVM pred after linearization)
-	thenEdgeIdx int            // phi edge index for the then-branch value
-	elseEdgeIdx int            // phi edge index for the else-branch value; for 2-edge cases also the surviving LLVM pred
-	info        *spmdVaryingIf // varying-if info (holds the vector condition)
-	llvmBlock   llvm.BasicBlock // LLVM exit block of the surviving predecessor
+	skipEdgeIdx  int            // phi edge index to skip during resolution (no LLVM pred after linearization)
+	skipEdgeIdxs []int          // multiple edges to skip (for condition chains)
+	thenEdgeIdx  int            // phi edge index for the then-branch value
+	elseEdgeIdx  int            // phi edge index for the else-branch value; for 2-edge cases also the surviving LLVM pred
+	info         *spmdVaryingIf // varying-if info (holds the vector condition)
+	llvmBlock    llvm.BasicBlock // LLVM exit block of the surviving predecessor
 }
 
 // spmdMaskTransition describes how the execution mask changes at a block boundary.
@@ -1012,6 +1013,27 @@ func (b *builder) spmdDetectCondChains() {
 			continue
 		}
 
+		// Check if block is already the head of a sub-chain (e.g., for a && b && c
+		// where cond.true.1 was processed before cond.true due to block ordering).
+		// If so, absorb the sub-chain: move outerIfBlock up to the new outerBlock
+		// and prepend block to the inner list.
+		if subChain, ok := b.spmdCondChains[block.Index]; ok && subChain.op == op {
+			// Absorb: the existing chain block→[...] becomes outerBlock→[block, ...]
+			subChain.outerIfBlock = outerBlock.Index
+			subChain.innerBlocks = append([]int{block.Index}, subChain.innerBlocks...)
+			// Update targets from outerBlock for the shared side.
+			if op == token.LAND {
+				subChain.elseTarget = outerBlock.Succs[1].Index
+			} else {
+				subChain.thenTarget = outerBlock.Succs[0].Index
+			}
+			// Re-register: remove old head, register new head + inner.
+			delete(b.spmdCondChains, block.Index)
+			b.spmdCondChains[outerBlock.Index] = subChain
+			b.spmdCondChainInner[block.Index] = subChain
+			continue
+		}
+
 		// Create new chain.
 		var thenTarget, elseTarget int
 		if op == token.LAND {
@@ -1032,6 +1054,7 @@ func (b *builder) spmdDetectCondChains() {
 		b.spmdCondChains[outerBlock.Index] = chain
 		b.spmdCondChainInner[block.Index] = chain
 	}
+
 }
 
 // preDetectVaryingIfs scans all blocks in the function for If instructions
@@ -1347,17 +1370,36 @@ func (b *builder) spmdAnalyzeVaryingIf(ifBlock *ssa.BasicBlock) {
 
 	if hasElse {
 		// For if-with-else: record that then-exit blocks need to be redirected.
-		// We'll populate the LLVM blocks later during compilation.
-		// For now, just find the then-exit blocks.
-		_ = b.spmdFindThenExits(thenEntry, merge)
+		// For chains, the redirect must be pre-registered because DomPreorder may
+		// visit the then-exit before the last inner block compiles. The LLVM block
+		// entries are pre-allocated, so we can register them now.
+		thenExits := b.spmdFindThenExits(thenEntry, merge)
+		elseLLVMBlock := b.blockInfo[elseEntry.Index].entry
+		for _, exitBlock := range thenExits {
+			b.spmdThenExitRedirects[exitBlock.Index] = elseLLVMBlock
+		}
 	}
 
 	// Record mask transitions for block-level mask stack management.
+	// For || (LOR) chains, the then-body is visited by DomPreorder BEFORE the
+	// last inner block, so the combined condition isn't available yet. Skip
+	// pushThen/swapElse for LOR chains — those rely on the merge select for
+	// correctness (value-only patterns) or need deferred handling (stores).
+	// For && (LAND) chains, the then-body IS dominated by the last inner block,
+	// so the condition will be available before the then-body is compiled.
+	isLORChain := false
+	if b.spmdCondChains != nil {
+		if chain, ok := b.spmdCondChains[ifBlock.Index]; ok {
+			isLORChain = (chain.op == token.LOR)
+		}
+	}
 	if b.spmdMaskTransitions != nil {
-		// Condition will be filled in during compilation.
-		b.spmdMaskTransitions[thenEntry.Index] = &spmdMaskTransition{kind: "pushThen", cond: llvm.Value{}}
-		if hasElse {
-			b.spmdMaskTransitions[elseEntry.Index] = &spmdMaskTransition{kind: "swapElse", cond: llvm.Value{}}
+		if !isLORChain {
+			// Condition will be filled in during compilation.
+			b.spmdMaskTransitions[thenEntry.Index] = &spmdMaskTransition{kind: "pushThen", cond: llvm.Value{}}
+			if hasElse {
+				b.spmdMaskTransitions[elseEntry.Index] = &spmdMaskTransition{kind: "swapElse", cond: llvm.Value{}}
+			}
 		}
 		// When merge is a loop header, don't register "pop" at merge (it would
 		// fire on every loop iteration, including from the entry edge). Instead,
@@ -1607,6 +1649,10 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 		if len(phi.Edges) > 2 && info.hasElse {
 			return b.spmdCreateMultiPredMergeSelect(phi, info)
 		}
+		// Chain without-else: merge has >2 SSA edges (outer + inner + then).
+		if len(phi.Edges) > 2 && !info.hasElse && len(info.chainDefaultPreds) > 0 {
+			return b.spmdCreateChainMergeSelect(phi, info)
+		}
 		return llvm.Value{}, false
 	}
 
@@ -1626,8 +1672,19 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 	var thenIdx, elseIdx int
 	if !info.hasElse {
 		// If-without-else: the pred matching ifBlockIndex is "else" (default).
+		// For condition chains (&&/||), the outer ifBlock isn't a direct pred —
+		// the last inner block (cond.false for ||) is. Use chainDefaultPreds
+		// if available to identify default edges.
+		defaultPredSet := make(map[int]bool)
+		if len(info.chainDefaultPreds) > 0 {
+			for _, idx := range info.chainDefaultPreds {
+				defaultPredSet[idx] = true
+			}
+		} else {
+			defaultPredSet[info.ifBlockIndex] = true
+		}
 		for i := 0; i < len(preds); i++ {
-			if preds[i].Index == info.ifBlockIndex {
+			if defaultPredSet[preds[i].Index] {
 				elseIdx = i
 			} else {
 				thenIdx = i
@@ -1648,7 +1705,11 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 	thenVal, thenOK := b.spmdTryGetValue(phi.Edges[thenIdx])
 	elseVal, elseOK := b.spmdTryGetValue(phi.Edges[elseIdx])
 
-	if thenOK && elseOK {
+	// For condition chains, the condition may not yet be filled in (DomPreorder
+	// visits merge before last inner block). Check info.cond is valid before
+	// attempting immediate select; otherwise fall through to deferred path.
+	condReady := !info.cond.IsNil()
+	if thenOK && elseOK && condReady {
 		// Both values are ready: emit the select immediately.
 		thenVal, elseVal = b.spmdBroadcastMatch(thenVal, elseVal)
 		thenIsVec := thenVal.Type().TypeKind() == llvm.VectorTypeKind
@@ -1750,6 +1811,88 @@ func (b *builder) spmdCreateMultiPredMergeSelect(phi *ssa.Phi, info *spmdVarying
 		elseEdgeIdx: elseIdx,
 		info:        info,
 		llvmBlock:   b.blockInfo[preds[elseIdx].Index].exit,
+	}
+
+	return llvmPhi, true
+}
+
+// spmdCreateChainMergeSelect handles phis at merge blocks of condition chains
+// without else. These phis have >2 SSA edges because each block in the chain
+// (outer + inner blocks) can jump to the merge. After CFG linearization,
+// only the then-exit block remains as an LLVM predecessor.
+//
+// Edge classification:
+//   - "default" edges: from outer ifBlock and all inner chain blocks — these
+//     carry the pre-if default value (the phi had this value before the if)
+//   - "then" edge: from the then-body exit — carries the value set in the body
+//
+// The select uses the combined chain condition (e.g., a AND b for &&).
+func (b *builder) spmdCreateChainMergeSelect(phi *ssa.Phi, info *spmdVaryingIf) (llvm.Value, bool) {
+	block := phi.Block()
+	preds := block.Preds
+
+	// Build default-pred set from chainDefaultPreds.
+	defaultPredSet := make(map[int]bool)
+	for _, predIdx := range info.chainDefaultPreds {
+		defaultPredSet[predIdx] = true
+	}
+
+	// Find then-edge (not a default pred) and any default edge.
+	thenIdx := -1
+	defaultIdx := -1
+	for i, pred := range preds {
+		if defaultPredSet[pred.Index] {
+			if defaultIdx < 0 {
+				defaultIdx = i
+			}
+		} else {
+			if thenIdx < 0 {
+				thenIdx = i
+			}
+		}
+	}
+
+	if thenIdx < 0 || defaultIdx < 0 {
+		return llvm.Value{}, false
+	}
+
+	thenVal, thenOK := b.spmdTryGetValue(phi.Edges[thenIdx])
+	defaultVal, defaultOK := b.spmdTryGetValue(phi.Edges[defaultIdx])
+
+	if thenOK && defaultOK {
+		// Both values ready: emit select immediately.
+		thenVal, defaultVal = b.spmdBroadcastMatch(thenVal, defaultVal)
+		thenIsVec := thenVal.Type().TypeKind() == llvm.VectorTypeKind
+		defaultIsVec := defaultVal.Type().TypeKind() == llvm.VectorTypeKind
+		if thenIsVec || defaultIsVec {
+			return b.spmdMaskSelect(info.cond, thenVal, defaultVal), true
+		}
+		scalarCond := b.spmdVectorAnyTrue(info.cond)
+		return b.CreateSelect(scalarCond, thenVal, defaultVal, ""), true
+	}
+
+	// Deferred: create phi and register override.
+	phiType := b.getLLVMType(phi.Type())
+	llvmPhi := b.CreatePHI(phiType, "")
+	b.phis = append(b.phis, phiNode{phi, llvmPhi})
+
+	// After linearization only the then-exit is the LLVM pred.
+	// All default edges (outer, inner blocks) are linearized away.
+	// Find skipEdgeIdxs = all default edges, surviving = then-exit edge.
+	var skipEdgeIdxs []int
+	for i, pred := range preds {
+		if defaultPredSet[pred.Index] {
+			skipEdgeIdxs = append(skipEdgeIdxs, i)
+		}
+	}
+
+	b.spmdMergePhiOverrides[phi] = spmdMergePhiOverride{
+		skipEdgeIdx:  skipEdgeIdxs[0], // first default edge (backwards compat)
+		skipEdgeIdxs: skipEdgeIdxs,    // all default edges
+		thenEdgeIdx:  thenIdx,
+		elseEdgeIdx:  defaultIdx,
+		info:         info,
+		llvmBlock:    b.blockInfo[preds[thenIdx].Index].exit,
 	}
 
 	return llvmPhi, true
