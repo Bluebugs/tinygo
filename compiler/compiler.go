@@ -195,6 +195,7 @@ type builder struct {
 	spmdSwitchIfBlocks      map[int]int                         // ifBlock.Index -> chain index in spmdSwitchChains
 	spmdSwitchBodyBlocks    map[int]int                         // bodyBlock.Index -> chain index in spmdSwitchChains
 	spmdSwitchRemainingMask llvm.Value                          // remaining mask during switch chain compilation
+	spmdDeferredSwitchPhis  []spmdDeferredSwitchPhi             // switch.done phis deferred until all case masks are ready
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1680,6 +1681,18 @@ func (b *builder) createFunction() {
 
 	// Resolve phi nodes
 	for _, phi := range b.phis {
+		// SPMD: skip deferred switch phis entirely — they'll be resolved below.
+		isDeferredSwitch := false
+		for _, dsp := range b.spmdDeferredSwitchPhis {
+			if dsp.phi == phi.ssa {
+				isDeferredSwitch = true
+				break
+			}
+		}
+		if isDeferredSwitch {
+			continue
+		}
+
 		block := phi.ssa.Block()
 		for i, edge := range phi.ssa.Edges {
 			// SPMD: skip break edge for break result phis.
@@ -1783,9 +1796,38 @@ func (b *builder) createFunction() {
 		}
 	}
 
+	// SPMD: resolve deferred switch phis now that all case masks are computed.
+	// In DomPreorder, switch.done may be visited before switch.next blocks,
+	// so case masks are only available after all blocks have been processed.
+	// This runs AFTER the phi resolution loop and BEFORE NeedsStackObjects.
+	erasedSwitchPhis := make(map[*ssa.Phi]bool, len(b.spmdDeferredSwitchPhis))
+	for _, dsp := range b.spmdDeferredSwitchPhis {
+		chain := &b.spmdSwitchChains[dsp.chainIdx]
+		// Set insert point to the switch.done block, just before the terminator.
+		doneBlock := b.blockInfo[chain.doneBlock].entry
+		term := doneBlock.LastInstruction()
+		if !term.IsNil() {
+			b.SetInsertPointBefore(term)
+		} else {
+			b.SetInsertPointAtEnd(doneBlock)
+		}
+		selectVal, ok := b.spmdCreateSwitchMergeSelect(dsp.phi, dsp.chainIdx)
+		if ok {
+			dsp.llvm.ReplaceAllUsesWith(selectVal)
+			dsp.llvm.EraseFromParentAsInstruction()
+			// Update locals cache so subsequent getValue calls return the select.
+			b.locals[dsp.phi] = selectVal
+			erasedSwitchPhis[dsp.phi] = true
+		}
+	}
+
 	if b.NeedsStackObjects {
-		// Track phi nodes.
+		// Track phi nodes. Skip erased deferred switch phis (their LLVM values
+		// were freed by EraseFromParentAsInstruction and must not be accessed).
 		for _, phi := range b.phis {
+			if erasedSwitchPhis[phi.ssa] {
+				continue
+			}
 			insertPoint := llvm.NextInstruction(phi.llvm)
 			for !insertPoint.IsAPHINode().IsNil() {
 				insertPoint = llvm.NextInstruction(insertPoint)
@@ -3059,11 +3101,19 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			return b.createMapIteratorNext(rangeVal, llvmRangeVal, it), nil
 		}
 	case *ssa.Phi:
-		// SPMD: check for switch merge phi.
+		// SPMD: check for switch merge phi. In DomPreorder, switch.done may be
+		// visited before the switch.next comparison blocks, so case masks may not
+		// yet be computed. Create a placeholder phi and defer the cascaded select.
 		if chainIdx := b.spmdIsSwitchDoneBlock(expr.Block().Index); chainIdx >= 0 {
-			if val, ok := b.spmdCreateSwitchMergeSelect(expr, chainIdx); ok {
-				return val, nil
-			}
+			phiType := b.getLLVMType(expr.Type())
+			phi := b.CreatePHI(phiType, "switch.merge.deferred")
+			b.phis = append(b.phis, phiNode{expr, phi})
+			b.spmdDeferredSwitchPhis = append(b.spmdDeferredSwitchPhis, spmdDeferredSwitchPhi{
+				phi:      expr,
+				llvm:     phi,
+				chainIdx: chainIdx,
+			})
+			return phi, nil
 		}
 		// SPMD: check for break result phi.
 		if b.spmdForLoops != nil {
