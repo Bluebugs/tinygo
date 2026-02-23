@@ -4126,12 +4126,26 @@ func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.
 
 	// Aggregate bounds check: OR per-lane OOB flags.
 	if !b.info.nobounds {
-		anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
-		for lane := 0; lane < laneCount; lane++ {
-			oob := b.CreateICmp(llvm.IntUGE, laneIdxs[lane], length, "")
-			anyOOB = b.CreateOr(anyOOB, oob, "")
+		canElide := false
+		if maxVal, known := spmdIndexMaxValue(expr.Index); known {
+			// For constant strings, check if max index is within bounds.
+			if constStr, ok := expr.X.(*ssa.Const); ok {
+				if constStr.Value != nil && constStr.Value.Kind() == constant.String {
+					strLen := uint64(len(constant.StringVal(constStr.Value)))
+					if strLen > 0 && maxVal < strLen {
+						canElide = true
+					}
+				}
+			}
 		}
-		b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+		if !canElide {
+			anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
+			for lane := 0; lane < laneCount; lane++ {
+				oob := b.CreateICmp(llvm.IntUGE, laneIdxs[lane], length, "")
+				anyOOB = b.CreateOr(anyOOB, oob, "")
+			}
+			b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+		}
 	}
 
 	// SPMD: on WASM, use i8x16.swizzle for const string lookups of <=16 bytes.
@@ -4188,12 +4202,20 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 	// Aggregate bounds check: OR per-lane OOB flags.
 	arrayLen := llvm.ConstInt(b.uintptrType, uint64(xType.Len()), false)
 	if !b.info.nobounds {
-		anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
-		for lane := 0; lane < laneCount; lane++ {
-			oob := b.CreateICmp(llvm.IntUGE, laneIdxs[lane], arrayLen, "")
-			anyOOB = b.CreateOr(anyOOB, oob, "")
+		canElide := false
+		if maxVal, known := spmdIndexMaxValue(expr.Index); known {
+			if maxVal < uint64(xType.Len()) {
+				canElide = true
+			}
 		}
-		b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+		if !canElide {
+			anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
+			for lane := 0; lane < laneCount; lane++ {
+				oob := b.CreateICmp(llvm.IntUGE, laneIdxs[lane], arrayLen, "")
+				anyOOB = b.CreateOr(anyOOB, oob, "")
+			}
+			b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+		}
 	}
 
 	// Per-lane: GEP, load, insert into result vector.
@@ -4308,4 +4330,134 @@ func (b *builder) spmdSwizzlePrepareIndex(index llvm.Value, laneCount int) llvm.
 	}
 	maskVec := llvm.ConstVector(maskElems, false)
 	return b.CreateShuffleVector(index, llvm.Undef(llvm.VectorType(i8Type, laneCount)), maskVec, "")
+}
+
+// ssaConstUint64 extracts a uint64 value from an *ssa.Const if it holds an integer
+// constant. Returns (0, false) for non-const SSA values, nil constant values, or
+// constants that cannot be represented as uint64 (e.g., negative integers).
+func ssaConstUint64(v ssa.Value) (uint64, bool) {
+	c, ok := v.(*ssa.Const)
+	if !ok || c.Value == nil || c.Value.Kind() != constant.Int {
+		return 0, false
+	}
+	val, ok := constant.Uint64Val(c.Value)
+	return val, ok
+}
+
+// typeBitWidth returns the bit width of a Go type for index range analysis.
+// Returns 0 for platform-dependent sizes (int, uint) or non-integer types.
+// Unwraps *types.SPMDType before inspection.
+func typeBitWidth(t types.Type) int {
+	// Unwrap SPMDType wrapper.
+	if spmd, ok := t.(*types.SPMDType); ok {
+		t = spmd.Elem()
+	}
+	basic, ok := t.Underlying().(*types.Basic)
+	if !ok {
+		return 0
+	}
+	switch basic.Kind() {
+	case types.Uint8: // types.Byte == types.Uint8
+		return 8
+	case types.Uint16:
+		return 16
+	case types.Uint32:
+		return 32
+	case types.Uint64:
+		return 64
+	case types.Int8:
+		return 8
+	case types.Int16:
+		return 16
+	case types.Int32:
+		return 32
+	case types.Int64:
+		return 64
+	default:
+		// int, uint, uintptr, float*, string, etc. — size unknown at compile time.
+		return 0
+	}
+}
+
+// spmdIndexMaxValue computes the maximum possible value of an SSA expression
+// used as an index. Returns (maxVal, true) when the upper bound is provable,
+// or (0, false) when unknown.
+//
+// Recognized patterns (compose recursively):
+//   - BinOp SHR(x, const k): max = maxOf(x) >> k
+//   - BinOp AND(x, const mask): max = mask
+//   - BinOp REM(x, const k): max = k - 1  (for k > 0)
+//   - Convert to narrower type: max = 2^N - 1
+//   - Const: max = const value
+//   - ChangeType: delegates to inner value
+//
+// Falls back to type-based analysis: unsigned N-bit → max 2^N - 1.
+func spmdIndexMaxValue(v ssa.Value) (uint64, bool) {
+	switch val := v.(type) {
+	case *ssa.Const:
+		return ssaConstUint64(val)
+
+	case *ssa.ChangeType:
+		// ChangeType is a no-op type coercion; delegate to the inner value.
+		return spmdIndexMaxValue(val.X)
+
+	case *ssa.Convert:
+		// Conversion to a narrower integer type caps the maximum.
+		bits := typeBitWidth(val.Type())
+		if bits > 0 && bits < 64 {
+			// Check if the type is unsigned — signed truncation can produce negative values.
+			rawType := val.Type()
+			if spmd, ok := rawType.(*types.SPMDType); ok {
+				rawType = spmd.Elem()
+			}
+			if basic, ok := rawType.Underlying().(*types.Basic); ok {
+				if basic.Info()&types.IsUnsigned != 0 {
+					return (uint64(1) << uint(bits)) - 1, true
+				}
+			}
+		}
+		// For signed conversions or platform-size types, fall through to type fallback.
+
+	case *ssa.BinOp:
+		switch val.Op {
+		case token.SHR:
+			// x >> k: upper bound is maxOf(x) >> k.
+			if maxX, ok := spmdIndexMaxValue(val.X); ok {
+				if k, ok := ssaConstUint64(val.Y); ok && k < 64 {
+					return maxX >> k, true
+				}
+			}
+
+		case token.AND:
+			// x & mask: the result is bounded by the mask value, regardless of x.
+			if mask, ok := ssaConstUint64(val.Y); ok {
+				return mask, true
+			}
+			if mask, ok := ssaConstUint64(val.X); ok {
+				return mask, true
+			}
+
+		case token.REM:
+			// x % k: result is in [0, k-1] for k > 0.
+			if k, ok := ssaConstUint64(val.Y); ok && k > 0 {
+				return k - 1, true
+			}
+		}
+	}
+
+	// Type-based fallback: unsigned N-bit type has max 2^N - 1.
+	bits := typeBitWidth(v.Type())
+	if bits > 0 && bits < 64 {
+		rawType := v.Type()
+		if spmd, ok := rawType.(*types.SPMDType); ok {
+			rawType = spmd.Elem()
+		}
+		if basic, ok := rawType.Underlying().(*types.Basic); ok {
+			if basic.Info()&types.IsUnsigned != 0 {
+				return (uint64(1) << uint(bits)) - 1, true
+			}
+		}
+	}
+
+	return 0, false
 }

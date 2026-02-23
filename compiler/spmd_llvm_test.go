@@ -4210,3 +4210,204 @@ func TestSPMDDecomposedSplattedConstantExtraction(t *testing.T) {
 		t.Errorf("scalar constant value = %d, want 2", val)
 	}
 }
+
+// TestSPMDSSAConstUint64 verifies that ssaConstUint64 extracts integer values
+// from *ssa.Const correctly and rejects non-integer or nil constants.
+func TestSPMDSSAConstUint64(t *testing.T) {
+	tests := []struct {
+		name   string
+		val    *ssa.Const
+		want   uint64
+		wantOK bool
+	}{
+		{
+			name:   "positive int",
+			val:    ssa.NewConst(constant.MakeInt64(42), types.Typ[types.Int]),
+			want:   42,
+			wantOK: true,
+		},
+		{
+			name:   "zero",
+			val:    ssa.NewConst(constant.MakeInt64(0), types.Typ[types.Int]),
+			want:   0,
+			wantOK: true,
+		},
+		{
+			name:   "max uint8",
+			val:    ssa.NewConst(constant.MakeInt64(255), types.Typ[types.Uint8]),
+			want:   255,
+			wantOK: true,
+		},
+		{
+			name:   "large value",
+			val:    ssa.NewConst(constant.MakeInt64(65535), types.Typ[types.Uint16]),
+			want:   65535,
+			wantOK: true,
+		},
+		{
+			// ssa.NewConst(nil, int) produces a zero-valued int constant, not a nil Value.
+			// Use a string constant (non-integer Kind) to exercise the rejection path.
+			name:   "non-integer constant",
+			val:    ssa.NewConst(constant.MakeString("hello"), types.Typ[types.String]),
+			want:   0,
+			wantOK: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ssaConstUint64(tt.val)
+			if ok != tt.wantOK {
+				t.Errorf("ssaConstUint64() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && got != tt.want {
+				t.Errorf("ssaConstUint64() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSPMDTypeBitWidth verifies that typeBitWidth returns the correct bit width
+// for fixed-size integer types and 0 for platform-dependent or non-integer types.
+func TestSPMDTypeBitWidth(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  types.Type
+		want int
+	}{
+		{"uint8", types.Typ[types.Uint8], 8},
+		{"byte", types.Typ[types.Byte], 8},
+		{"uint16", types.Typ[types.Uint16], 16},
+		{"uint32", types.Typ[types.Uint32], 32},
+		{"uint64", types.Typ[types.Uint64], 64},
+		{"int8", types.Typ[types.Int8], 8},
+		{"int16", types.Typ[types.Int16], 16},
+		{"int32", types.Typ[types.Int32], 32},
+		{"int64", types.Typ[types.Int64], 64},
+		// Platform-dependent sizes return 0.
+		{"int (platform)", types.Typ[types.Int], 0},
+		{"uint (platform)", types.Typ[types.Uint], 0},
+		// Non-integer types return 0.
+		{"float32", types.Typ[types.Float32], 0},
+		{"string", types.Typ[types.String], 0},
+		// SPMDType wrapping is unwrapped before inspection.
+		{"varying uint8", types.NewVarying(types.Typ[types.Uint8]), 8},
+		{"varying int32", types.NewVarying(types.Typ[types.Int32]), 32},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := typeBitWidth(tt.typ)
+			if got != tt.want {
+				t.Errorf("typeBitWidth(%s) = %d, want %d", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSPMDIndexMaxValueConst verifies that spmdIndexMaxValue returns the correct
+// maximum for *ssa.Const values.
+func TestSPMDIndexMaxValueConst(t *testing.T) {
+	tests := []struct {
+		name    string
+		val     ssa.Value
+		wantMax uint64
+		wantOK  bool
+	}{
+		{
+			name:    "const 10",
+			val:     ssa.NewConst(constant.MakeInt64(10), types.Typ[types.Int]),
+			wantMax: 10,
+			wantOK:  true,
+		},
+		{
+			name:    "const 0",
+			val:     ssa.NewConst(constant.MakeInt64(0), types.Typ[types.Int]),
+			wantMax: 0,
+			wantOK:  true,
+		},
+		{
+			name:    "const 255 uint8",
+			val:     ssa.NewConst(constant.MakeInt64(255), types.Typ[types.Uint8]),
+			wantMax: 255,
+			wantOK:  true,
+		},
+		{
+			name:    "const 15 int32",
+			val:     ssa.NewConst(constant.MakeInt64(15), types.Typ[types.Int32]),
+			wantMax: 15,
+			wantOK:  true,
+		},
+		{
+			// Non-integer constant (string) is rejected — not representable as uint64.
+			name:   "non-integer const falls through to type fallback",
+			val:    ssa.NewConst(constant.MakeString("hi"), types.Typ[types.String]),
+			wantOK: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := spmdIndexMaxValue(tt.val)
+			if ok != tt.wantOK {
+				t.Errorf("spmdIndexMaxValue() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && got != tt.wantMax {
+				t.Errorf("spmdIndexMaxValue() = %d, want %d", got, tt.wantMax)
+			}
+		})
+	}
+}
+
+// TestSPMDIndexMaxValueTypeFallback verifies that spmdIndexMaxValue applies the
+// type-based upper bound for unsigned fixed-size types when expression analysis
+// is not available. This test exercises the logic path directly via typeBitWidth
+// and the IsUnsigned check, mirroring what spmdIndexMaxValue does internally.
+func TestSPMDIndexMaxValueTypeFallback(t *testing.T) {
+	tests := []struct {
+		name    string
+		typ     types.Type
+		wantMax uint64
+		wantOK  bool
+	}{
+		{"uint8 typed", types.Typ[types.Uint8], 255, true},
+		{"uint16 typed", types.Typ[types.Uint16], 65535, true},
+		{"uint32 typed", types.Typ[types.Uint32], 4294967295, true},
+		// Platform-dependent sizes — unknown upper bound.
+		{"int (unknown)", types.Typ[types.Int], 0, false},
+		{"uint (unknown)", types.Typ[types.Uint], 0, false},
+		// Varying wrappers are unwrapped correctly.
+		{"varying uint8", types.NewVarying(types.Typ[types.Uint8]), 255, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bits := typeBitWidth(tt.typ)
+			if bits == 0 {
+				if tt.wantOK {
+					t.Errorf("expected known max for %s, but typeBitWidth returned 0", tt.name)
+				}
+				return
+			}
+			// Check if the type is unsigned (mirrors spmdIndexMaxValue's fallback logic).
+			rawType := tt.typ
+			if spmd, ok := rawType.(*types.SPMDType); ok {
+				rawType = spmd.Elem()
+			}
+			basic, ok := rawType.Underlying().(*types.Basic)
+			if !ok {
+				if tt.wantOK {
+					t.Errorf("expected basic type for %s", tt.name)
+				}
+				return
+			}
+			isUnsigned := basic.Info()&types.IsUnsigned != 0
+			if !isUnsigned {
+				if tt.wantOK {
+					t.Errorf("expected unsigned type for %s", tt.name)
+				}
+				return
+			}
+			maxVal := (uint64(1) << uint(bits)) - 1
+			if maxVal != tt.wantMax {
+				t.Errorf("type fallback max for %s = %d, want %d", tt.name, maxVal, tt.wantMax)
+			}
+		})
+	}
+}
