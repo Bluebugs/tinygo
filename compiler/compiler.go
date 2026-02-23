@@ -2878,6 +2878,11 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		collection := b.getValue(expr.X, getPos(expr))
 		index := b.getValue(expr.Index, getPos(expr))
 
+		// SPMD: when index is a vector, perform per-lane index operations.
+		if index.Type().TypeKind() == llvm.VectorTypeKind {
+			return b.spmdVectorIndex(expr, collection, index)
+		}
+
 		switch xType := expr.X.Type().Underlying().(type) {
 		case *types.Basic: // extract byte from string
 			// Value type must be a string, which is a basic type.

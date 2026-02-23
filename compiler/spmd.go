@@ -3472,3 +3472,131 @@ func (b *builder) spmdCreateSwitchMergeSelect(phi *ssa.Phi, chainIdx int) (llvm.
 	return result, true
 }
 
+// spmdVectorIndex handles *ssa.Index when the index is a vector type (varying).
+// Dispatches to string or array handlers based on the collection type.
+func (b *builder) spmdVectorIndex(expr *ssa.Index, collection, index llvm.Value) (llvm.Value, error) {
+	switch expr.X.Type().Underlying().(type) {
+	case *types.Basic:
+		return b.spmdVectorIndexString(expr, collection, index)
+	case *types.Array:
+		return b.spmdVectorIndexArray(expr, collection, index)
+	default:
+		return llvm.Value{}, b.makeError(expr.Pos(), "unsupported SPMD vector index type: "+expr.X.Type().Underlying().String())
+	}
+}
+
+// spmdVectorIndexString performs per-lane byte extraction from a string using a vector index.
+// Each lane extracts: string_ptr[index_lane_i] → byte result per lane.
+func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.Value) (llvm.Value, error) {
+	laneCount := index.Type().VectorSize()
+
+	// Extract {ptr, len} from string.
+	buf := b.CreateExtractValue(collection, 0, "")
+	length := b.CreateExtractValue(collection, 1, "len")
+
+	// Pre-compute extended lane indices (used for both bounds check and GEP).
+	laneIdxs := make([]llvm.Value, laneCount)
+	for lane := 0; lane < laneCount; lane++ {
+		idx := b.CreateExtractElement(index, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+		if idx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+			idx = b.spmdExtendIndex(idx, expr.Index.Type(), b.uintptrType)
+		}
+		laneIdxs[lane] = idx
+	}
+
+	// Aggregate bounds check: OR per-lane OOB flags.
+	if !b.info.nobounds {
+		anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
+		for lane := 0; lane < laneCount; lane++ {
+			oob := b.CreateICmp(llvm.IntUGE, laneIdxs[lane], length, "")
+			anyOOB = b.CreateOr(anyOOB, oob, "")
+		}
+		b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+	}
+
+	// Per-lane: GEP, load, insert into result vector.
+	bufElemType := b.ctx.Int8Type()
+	result := llvm.Undef(llvm.VectorType(bufElemType, laneCount))
+	for lane := 0; lane < laneCount; lane++ {
+		ptr := b.CreateInBoundsGEP(bufElemType, buf, []llvm.Value{laneIdxs[lane]}, "")
+		val := b.CreateLoad(bufElemType, ptr, "")
+		result = b.CreateInsertElement(result, val, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+	}
+	return result, nil
+}
+
+// spmdVectorIndexArray performs per-lane element extraction from an array using a vector index.
+// The array is spilled to an alloca, then each lane does GEP+load.
+func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.Value) (llvm.Value, error) {
+	laneCount := index.Type().VectorSize()
+	xType := expr.X.Type().Underlying().(*types.Array)
+
+	// Spill array to alloca (can't index a non-constant array in registers).
+	arrayType := collection.Type()
+
+	// Reject arrays of varying elements (vector element type + vector index would
+	// produce a malformed vector-of-vectors result).
+	if arrayType.ElementType().TypeKind() == llvm.VectorTypeKind {
+		return llvm.Value{}, b.makeError(expr.Pos(), "SPMD vector index into array of varying elements is not supported")
+	}
+
+	alloca, allocaSize := b.createTemporaryAlloca(arrayType, "index.alloca")
+	b.CreateStore(collection, alloca)
+
+	// Pre-compute extended lane indices (used for both bounds check and GEP).
+	laneIdxs := make([]llvm.Value, laneCount)
+	for lane := 0; lane < laneCount; lane++ {
+		idx := b.CreateExtractElement(index, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+		if idx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+			idx = b.spmdExtendIndex(idx, expr.Index.Type(), b.uintptrType)
+		}
+		laneIdxs[lane] = idx
+	}
+
+	// Aggregate bounds check: OR per-lane OOB flags.
+	arrayLen := llvm.ConstInt(b.uintptrType, uint64(xType.Len()), false)
+	if !b.info.nobounds {
+		anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
+		for lane := 0; lane < laneCount; lane++ {
+			oob := b.CreateICmp(llvm.IntUGE, laneIdxs[lane], arrayLen, "")
+			anyOOB = b.CreateOr(anyOOB, oob, "")
+		}
+		b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+	}
+
+	// Per-lane: GEP, load, insert into result vector.
+	elemType := arrayType.ElementType()
+	result := llvm.Undef(llvm.VectorType(elemType, laneCount))
+	zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+	for lane := 0; lane < laneCount; lane++ {
+		ptr := b.CreateInBoundsGEP(arrayType, alloca, []llvm.Value{zero, laneIdxs[lane]}, "index.gep")
+		val := b.CreateLoad(elemType, ptr, "index.load")
+		result = b.CreateInsertElement(result, val, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+	}
+	b.emitLifetimeEnd(alloca, allocaSize)
+	return result, nil
+}
+
+// spmdExtendIndex extends a scalar index extracted from a vector to the target type.
+// Determines signed/unsigned from the Go type (unwrapping SPMDType if needed).
+func (b *builder) spmdExtendIndex(value llvm.Value, goType types.Type, targetType llvm.Type) llvm.Value {
+	if value.Type().IntTypeWidth() >= targetType.IntTypeWidth() {
+		return value
+	}
+	// Strip SPMDType before calling Underlying(), because SPMDType.Underlying()
+	// delegates to its element type directly — making a post-Underlying() check unreachable.
+	typ := goType
+	if spmdType, ok := typ.(*types.SPMDType); ok {
+		typ = spmdType.Elem()
+	}
+	basic, ok := typ.Underlying().(*types.Basic)
+	if !ok {
+		// Fallback to zero-extend for safety.
+		return b.CreateZExt(value, targetType, "")
+	}
+	if basic.Info()&types.IsUnsigned != 0 {
+		return b.CreateZExt(value, targetType, "")
+	}
+	return b.CreateSExt(value, targetType, "")
+}
+

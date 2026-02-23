@@ -3440,3 +3440,172 @@ func TestSPMDCondChainDefaultPreds(t *testing.T) {
 		}
 	}
 }
+
+func TestSPMDExtendIndex(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Use -1 (0xFF in i8) to distinguish ZExt from SExt:
+	// ZExt(-1 as uint8) → 255 (0x000000FF)
+	// SExt(-1 as int8)  → -1  (0xFFFFFFFF)
+	i8Val := llvm.ConstInt(c.ctx.Int8Type(), 0xFF, false) // -1 / 255
+
+	tests := []struct {
+		name    string
+		goType  types.Type
+		wantVal uint64 // expected ZExtValue of the result constant
+	}{
+		{"uint8_zext", types.Typ[types.Uint8], 0xFF},                              // 255
+		{"int8_sext", types.Typ[types.Int8], 0xFFFFFFFF},                          // -1 as i32
+		{"spmd_uint8_zext", types.NewVarying(types.Typ[types.Uint8]), 0xFF},
+		{"spmd_int8_sext", types.NewVarying(types.Typ[types.Int8]), 0xFFFFFFFF},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := b.spmdExtendIndex(i8Val, tt.goType, b.uintptrType)
+			if result.Type() != b.uintptrType {
+				t.Fatalf("expected uintptr type, got width %d", result.Type().IntTypeWidth())
+			}
+			// For constant inputs, spmdExtendIndex should produce a constant result.
+			if result.IsAConstantInt().IsNil() {
+				t.Fatal("expected constant result from constant input")
+			}
+			gotVal := result.ZExtValue()
+			if gotVal != tt.wantVal {
+				t.Errorf("got 0x%X, want 0x%X", gotVal, tt.wantVal)
+			}
+		})
+	}
+}
+
+func TestSPMDExtendIndexNoOpWhenWide(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// When value is already uintptr width, spmdExtendIndex must return it unchanged.
+	val := llvm.ConstInt(b.uintptrType, 42, false)
+	result := b.spmdExtendIndex(val, types.Typ[types.Uint32], b.uintptrType)
+	if result.Type() != b.uintptrType {
+		t.Errorf("expected uintptr type, got width %d", result.Type().IntTypeWidth())
+	}
+}
+
+func TestSPMDVectorIndexStringLLVM(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Build a string global: "0123456789abcdef"
+	i8Type := c.ctx.Int8Type()
+	strBytes := "0123456789abcdef"
+	strConst := llvm.ConstString(strBytes, false)
+	strGlobal := llvm.AddGlobal(c.mod, strConst.Type(), "test_str")
+	strGlobal.SetInitializer(strConst)
+	strGlobal.SetGlobalConstant(true)
+	strPtr := b.CreateInBoundsGEP(strConst.Type(), strGlobal, []llvm.Value{
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+		llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+	}, "str.ptr")
+
+	// Manually exercise the per-lane logic that spmdVectorIndexString uses
+	// (we can't call it directly without a full ssa.Index, but we test the
+	// LLVM IR primitives it relies on).
+	laneCount := 4
+
+	// Simulate vector index [0, 1, 2, 3]
+	vecType := llvm.VectorType(i8Type, laneCount)
+	indexVec := llvm.Undef(vecType)
+	for i := 0; i < laneCount; i++ {
+		indexVec = b.CreateInsertElement(indexVec, llvm.ConstInt(i8Type, uint64(i), false),
+			llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false), "")
+	}
+
+	// Perform the per-lane extraction that spmdVectorIndexString does.
+	bufElemType := c.ctx.Int8Type()
+	result := llvm.Undef(llvm.VectorType(bufElemType, laneCount))
+	for lane := 0; lane < laneCount; lane++ {
+		laneIdx := b.CreateExtractElement(indexVec, llvm.ConstInt(c.ctx.Int32Type(), uint64(lane), false), "")
+		// Extend i8 index to uintptr.
+		laneIdx = b.spmdExtendIndex(laneIdx, types.Typ[types.Uint8], b.uintptrType)
+		ptr := b.CreateInBoundsGEP(bufElemType, strPtr, []llvm.Value{laneIdx}, "")
+		val := b.CreateLoad(bufElemType, ptr, "")
+		result = b.CreateInsertElement(result, val, llvm.ConstInt(c.ctx.Int32Type(), uint64(lane), false), "")
+	}
+
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("expected vector result, got type kind %v", result.Type().TypeKind())
+	}
+	if result.Type().VectorSize() != laneCount {
+		t.Errorf("expected %d lanes, got %d", laneCount, result.Type().VectorSize())
+	}
+	if result.Type().ElementType() != i8Type {
+		t.Errorf("expected i8 element type")
+	}
+}
+
+func TestSPMDVectorIndexArrayLLVM(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name      string
+		arrayLen  int
+		elemType  llvm.Type
+		laneCount int
+		indexType llvm.Type
+	}{
+		{"4xi32_array_4xi32_index", 4, c.ctx.Int32Type(), 4, c.ctx.Int32Type()},
+		{"16xi8_array_4xi8_index", 16, c.ctx.Int8Type(), 4, c.ctx.Int8Type()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build an array value.
+			arrayType := llvm.ArrayType(tt.elemType, tt.arrayLen)
+			arrayVal := llvm.ConstNull(arrayType)
+
+			// Build vector index [0, 1, 2, ... laneCount-1].
+			vecType := llvm.VectorType(tt.indexType, tt.laneCount)
+			indexVec := llvm.Undef(vecType)
+			for i := 0; i < tt.laneCount; i++ {
+				indexVec = b.CreateInsertElement(indexVec,
+					llvm.ConstInt(tt.indexType, uint64(i%tt.arrayLen), false),
+					llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false), "")
+			}
+
+			// Exercise the alloca+GEP+load pattern used by spmdVectorIndexArray.
+			alloca, allocaSize := b.createTemporaryAlloca(arrayType, "index.alloca")
+			b.CreateStore(arrayVal, alloca)
+			zero := llvm.ConstInt(c.ctx.Int32Type(), 0, false)
+
+			result := llvm.Undef(llvm.VectorType(tt.elemType, tt.laneCount))
+			for lane := 0; lane < tt.laneCount; lane++ {
+				laneIdx := b.CreateExtractElement(indexVec, llvm.ConstInt(c.ctx.Int32Type(), uint64(lane), false), "")
+				laneIdx = b.spmdExtendIndex(laneIdx, types.Typ[types.Uint8], b.uintptrType)
+				ptr := b.CreateInBoundsGEP(arrayType, alloca, []llvm.Value{zero, laneIdx}, "index.gep")
+				val := b.CreateLoad(tt.elemType, ptr, "index.load")
+				result = b.CreateInsertElement(result, val, llvm.ConstInt(c.ctx.Int32Type(), uint64(lane), false), "")
+			}
+
+			b.emitLifetimeEnd(alloca, allocaSize)
+
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("expected vector result, got type kind %v", result.Type().TypeKind())
+			}
+			if result.Type().VectorSize() != tt.laneCount {
+				t.Errorf("expected %d lanes, got %d", tt.laneCount, result.Type().VectorSize())
+			}
+			if result.Type().ElementType() != tt.elemType {
+				t.Errorf("element type mismatch")
+			}
+		})
+	}
+}
