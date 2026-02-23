@@ -3511,20 +3511,48 @@ func (b *builder) spmdDecomposedIndexAddr(expr *ssa.IndexAddr, decomp *spmdDecom
 			buflen = b.CreateExtractValue(val, 1, "indexaddr.len")
 		}
 		if !buflen.IsNil() {
-			anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
-			for lane := 0; lane < laneCount; lane++ {
-				offsetByte := b.CreateExtractElement(decomp.varyingOffset,
-					llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
-				// Zero-extend offset byte to i32, then add scalar base.
-				offsetI32 := b.CreateZExt(offsetByte, b.ctx.Int32Type(), "")
-				laneIdx := b.CreateAdd(decomp.scalarBase, offsetI32, "")
-				if laneIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
-					laneIdx = b.CreateSExt(laneIdx, b.uintptrType, "")
+			if decomp.varyingOffset.IsConstant() {
+				// OPTIMIZED: constant offset vector → single scalar bounds check.
+				// Find the maximum offset element at compile time, then check:
+				//   (scalarBase + maxOffset) >= buflen → panic
+				// Correctness: maxOffset >= every per-lane offset, so if
+				// (base + maxOffset) is in bounds then all lanes are in bounds.
+				maxOffset := uint64(0)
+				for lane := 0; lane < laneCount; lane++ {
+					elem := llvm.ConstExtractElement(decomp.varyingOffset,
+						llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false))
+					// ZExtValue: offset bytes are unsigned (zero-extended everywhere
+					// in the decomposed-index pipeline).
+					elemVal := elem.ZExtValue()
+					if elemVal > maxOffset {
+						maxOffset = elemVal
+					}
 				}
-				oob := b.CreateICmp(llvm.IntUGE, laneIdx, buflen, "")
-				anyOOB = b.CreateOr(anyOOB, oob, "")
+				maxIdx := b.CreateAdd(decomp.scalarBase,
+					llvm.ConstInt(decomp.scalarBase.Type(), maxOffset, false),
+					"spmd.bounds.maxidx")
+				if maxIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+					maxIdx = b.CreateSExt(maxIdx, b.uintptrType, "")
+				}
+				oob := b.CreateICmp(llvm.IntUGE, maxIdx, buflen, "spmd.bounds.oob")
+				b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+			} else {
+				// FALLBACK: non-constant offset vector, per-lane bounds check.
+				anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
+				for lane := 0; lane < laneCount; lane++ {
+					offsetByte := b.CreateExtractElement(decomp.varyingOffset,
+						llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+					// Zero-extend offset byte to i32, then add scalar base.
+					offsetI32 := b.CreateZExt(offsetByte, b.ctx.Int32Type(), "")
+					laneIdx := b.CreateAdd(decomp.scalarBase, offsetI32, "")
+					if laneIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+						laneIdx = b.CreateSExt(laneIdx, b.uintptrType, "")
+					}
+					oob := b.CreateICmp(llvm.IntUGE, laneIdx, buflen, "")
+					anyOOB = b.CreateOr(anyOOB, oob, "")
+				}
+				b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
 			}
-			b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
 		}
 	}
 
