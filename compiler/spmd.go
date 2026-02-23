@@ -446,10 +446,34 @@ type spmdActiveLoop struct {
 	bodyIterValue ssa.Value // value body uses as index: iterPhi (rangeint) or incrBinOp (rangeindex)
 	initEdgeIndex int       // phi edge index for the entry predecessor (rangeindex only; -1 for rangeint)
 
+	// Decomposed index fields (isDecomposed == true):
+	// When laneCount > 4 on WASM (e.g., 16 for byte), a naive <16 x i32> index vector
+	// would be 512-bit, exceeding WASM's 128-bit SIMD registers. Instead the index is
+	// represented as scalar base (i32) + varying offset (<16 x i8>), with math
+	// operations decomposed algebraically. isDecomposed is set by analyzeSPMDLoops.
+	isDecomposed bool
+
 	// Set during IR generation:
-	laneIndices   llvm.Value // <iter, iter+1, ..., iter+laneCount-1>
+	laneIndices   llvm.Value // <iter, iter+1, ..., iter+laneCount-1> (nil when isDecomposed)
 	tailMask      llvm.Value // per-lane bounds check
 	scalarIterVal llvm.Value // scalar LLVM value (before override to lane indices)
+}
+
+// spmdDecomposedIndex tracks a base+offset decomposed SPMD index value.
+// Used for byte-lane loops (laneCount > 4) where the full materialized vector
+// (<16 x i32>) would exceed WASM's 128-bit register width.
+type spmdDecomposedIndex struct {
+	scalarBase    llvm.Value      // Scalar i32 component (uniform across lanes)
+	varyingOffset llvm.Value      // <N x i8> component (varying per lane)
+	laneCount     int             // Number of lanes (e.g., 16 for byte)
+	loop          *spmdActiveLoop // The SPMD loop this index belongs to
+	// fromBodyIter is true when this decomposition is the raw body iterator
+	// from emitSPMDBodyPrologue (i.e., base = loop counter, offset = <0,1,...,N-1>).
+	// SHR/AND/REM algebraic shortcuts require that base is aligned to the relevant
+	// boundary, which is guaranteed only for the direct body iterator (whose base
+	// is always a multiple of laneCount). After an ADD/SUB the base shifts by an
+	// arbitrary amount, so those shortcuts are no longer valid.
+	fromBodyIter bool
 }
 
 // analyzeSPMDLoops performs two-pass pre-analysis of SPMD loops before block compilation.
@@ -704,6 +728,11 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		// SIMD width. For []byte slices this yields 16 lanes instead of 4.
 		laneCount := b.spmdRangeIndexLaneCount(boundValue, block, incrBinOp)
 
+		// On WASM with laneCount > 4, a naive <laneCount x i32> index vector would
+		// be wider than 128 bits (e.g., <16 x i32> is 512-bit). Use decomposed
+		// representation (scalar base + <N x i8> offset) to stay within 128 bits.
+		isDecomposed := b.spmdIsWASM() && laneCount > 4
+
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
 			iterPhi:       nil, // rangeindex has no iter phi in body
@@ -711,6 +740,7 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			boundValue:    boundValue,
 			incrBinOp:     incrBinOp,
 			isRangeIndex:  true,
+			isDecomposed:  isDecomposed,
 			bodyIterValue: incrBinOp, // rangeindex: body uses the incr BinOp
 			initEdgeIndex: initEdgeIndex,
 		}
@@ -748,6 +778,11 @@ func (c *compilerContext) spmdLaneOffsetConst(laneCount int, elemType llvm.Type)
 // For rangeindex loops (isRangeIndex == true), the scalar base value is the
 // incrBinOp (loopPhi + 1) compiled in the loop block, which dominates the body
 // block so its LLVM value is already present in b.locals via DomPreorder.
+//
+// For decomposed loops (isDecomposed == true, only possible on rangeindex with
+// laneCount > 4 on WASM), the index is represented as scalar base + <N x i8>
+// offset to avoid creating a <16 x i32> 512-bit vector that would exceed WASM's
+// 128-bit SIMD registers. The decomposition is stored in b.spmdDecomposed.
 func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	// Obtain the scalar iteration value that the body block uses as its index.
 	var scalarPhi llvm.Value
@@ -763,6 +798,58 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	// Save the scalar value for later use in contiguous IndexAddr detection.
 	loop.scalarIterVal = scalarPhi
 
+	if loop.isDecomposed {
+		// Decomposed path: represent the index as scalar base + <N x i8> offset.
+		// This avoids creating a <16 x i32> 512-bit vector on WASM SIMD128.
+		i8Type := b.ctx.Int8Type()
+		laneCount := loop.laneCount
+
+		// Create constant byte offset <0, 1, 2, ..., laneCount-1> as <N x i8>.
+		varyingOffset := b.spmdLaneOffsetConst(laneCount, i8Type)
+
+		// Register the decomposition so BinOp/IndexAddr handlers can use it.
+		if b.spmdDecomposed != nil {
+			b.spmdDecomposed[loop.bodyIterValue] = &spmdDecomposedIndex{
+				scalarBase:    scalarPhi,
+				varyingOffset: varyingOffset,
+				laneCount:     laneCount,
+				loop:          loop,
+				fromBodyIter:  true, // raw iterator: base is always a multiple of laneCount
+			}
+		}
+
+		// Compute tail mask using <N x i8> comparison to stay within 128-bit registers.
+		// diff = bound - base (scalar i32); clamp to [0, laneCount]; truncate to i8.
+		// Then compare: offset < clamp(diff) using unsigned <N x i8> comparison.
+		boundScalar := b.getValue(loop.boundValue, token.NoPos)
+		diff := b.CreateSub(boundScalar, scalarPhi, "spmd.diff")
+
+		// Clamp diff to [0, laneCount]: max(0, min(laneCount, diff)).
+		zero32 := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+		lcConst := llvm.ConstInt(b.ctx.Int32Type(), uint64(laneCount), false)
+		// min(laneCount, diff): if diff > laneCount, use laneCount
+		diffClamped := b.CreateSelect(
+			b.CreateICmp(llvm.IntSGT, diff, lcConst, ""),
+			lcConst, diff, "spmd.diff.clamped")
+		// max(0, clamped): if clamped < 0, use 0
+		diffClamped = b.CreateSelect(
+			b.CreateICmp(llvm.IntSLT, diffClamped, zero32, ""),
+			zero32, diffClamped, "spmd.diff.nonneg")
+
+		// Truncate clamped diff to i8 (safe: value is in [0, laneCount=16]).
+		diffI8 := b.CreateTrunc(diffClamped, i8Type, "spmd.diff.i8")
+
+		// Splat diffI8 to <N x i8> for vector comparison.
+		diffVec := b.splatScalar(diffI8, llvm.VectorType(i8Type, laneCount))
+
+		// Compute: offset < clamp(diff) using unsigned comparison.
+		tailMaskI1 := b.CreateICmp(llvm.IntULT, varyingOffset, diffVec, "spmd.tail.mask")
+		loop.tailMask = b.spmdWrapMask(tailMaskI1, laneCount)
+		// laneIndices not set for decomposed path (use spmdDecomposed map instead).
+		return
+	}
+
+	// Non-decomposed path: materialize the full index vector.
 	// Get element type from the scalar phi (e.g., i32 for int on WASM).
 	elemType := scalarPhi.Type()
 
@@ -792,6 +879,19 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	// Store the results in the loop state.
 	loop.laneIndices = laneIndices
 	loop.tailMask = tailMask
+}
+
+// spmdMaterializeDecomposed converts a decomposed index (scalar base + <N x i8> offset)
+// to a full <N x i32> vector by zero-extending the offset and adding the splatted base.
+// This is only used as a fallback when an operation cannot be decomposed algebraically.
+// On WASM SIMD128 this produces a 512-bit <16 x i32> value which LLVM must scalarize;
+// it is only acceptable for non-WASM targets or when no 128-bit path is feasible.
+func (b *builder) spmdMaterializeDecomposed(decomp *spmdDecomposedIndex) llvm.Value {
+	i32Type := b.ctx.Int32Type()
+	vecType := llvm.VectorType(i32Type, decomp.laneCount)
+	baseVec := b.splatScalar(decomp.scalarBase, vecType)
+	offsetExt := b.CreateZExt(decomp.varyingOffset, vecType, "")
+	return b.CreateAdd(baseVec, offsetExt, "spmd.materialized.idx")
 }
 
 // spmdPushMask pushes a new execution mask onto the stack.
@@ -3012,6 +3112,437 @@ func (b *builder) spmdContiguousIndexAddrCore(expr *ssa.IndexAddr, loop *spmdAct
 		b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop}
 	}
 	return ptr, nil
+}
+
+// spmdDecomposedBinOp handles a BinOp where one operand is a decomposed index
+// (scalar base + <N x i8> offset). It applies algebraic decomposition rules to
+// produce a new decomposed result or a plain vector result (for comparisons).
+//
+// Decomposition rules for (base + offset) OP constant:
+//   - ADD scalar c:  {base+c, offset}     (new decomposed)
+//   - SUB scalar c:  {base-c, offset}     (new decomposed)
+//   - SHR const k:   {base>>k, offsetShifted} IF laneCount is multiple of 2^k (new decomposed)
+//   - AND const mask:{0, offset & mask}   IF base is aligned (new decomposed for modulo-like ops)
+//   - QUO/REM const k: {0, offset % k}    IF laneCount is divisible by k (new decomposed)
+//   - EQL/NEQ/LSS/etc: compare offset against trunc(c - base) (plain <N x i1> comparison)
+//   - Otherwise:      materialize to <N x i32> (fallback; produces wide vector on WASM)
+//
+// decompIsLHS is true when the decomposed value is expr.X (left-hand side).
+func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedIndex, decompIsLHS bool) (llvm.Value, bool) {
+	laneCount := decomp.laneCount
+	i8Type := b.ctx.Int8Type()
+
+	// Get the scalar (non-decomposed) operand.
+	var scalarSSA ssa.Value
+	if decompIsLHS {
+		scalarSSA = expr.Y
+	} else {
+		scalarSSA = expr.X
+	}
+
+	// Only decompose when the other operand is a scalar constant or uniform value.
+	scalarLLVM := b.getValue(scalarSSA, getPos(expr))
+	if scalarLLVM.Type().TypeKind() == llvm.VectorTypeKind {
+		// Both sides are varying; fall through to materialization below.
+		materialized := b.spmdMaterializeDecomposed(decomp)
+		return materialized, false
+	}
+
+	switch expr.Op {
+	case token.ADD:
+		if !decompIsLHS {
+			// c + (base + offset) = (c + base) + offset
+			// Also valid since addition is commutative.
+		}
+		// (base + offset) + c = (base + c) + offset
+		newBase := b.CreateAdd(decomp.scalarBase, scalarLLVM, "spmd.decomp.add")
+		if b.spmdDecomposed != nil {
+			b.spmdDecomposed[expr] = &spmdDecomposedIndex{
+				scalarBase:    newBase,
+				varyingOffset: decomp.varyingOffset,
+				laneCount:     laneCount,
+				loop:          decomp.loop,
+			}
+		}
+		return llvm.Value{}, true // signal: stored in spmdDecomposed
+
+	case token.SUB:
+		if !decompIsLHS {
+			// c - (base + offset) is not a simple shift; fall through to materialization.
+			break
+		}
+		// (base + offset) - c = (base - c) + offset
+		newBase := b.CreateSub(decomp.scalarBase, scalarLLVM, "spmd.decomp.sub")
+		if b.spmdDecomposed != nil {
+			b.spmdDecomposed[expr] = &spmdDecomposedIndex{
+				scalarBase:    newBase,
+				varyingOffset: decomp.varyingOffset,
+				laneCount:     laneCount,
+				loop:          decomp.loop,
+			}
+		}
+		return llvm.Value{}, true // signal: stored in spmdDecomposed
+
+	case token.SHR:
+		if !decompIsLHS {
+			break
+		}
+		// (base + offset) >> k where offset = <0,1,...,N-1> and k is a constant.
+		// Valid ONLY when the base is a multiple of 2^k (ensured by fromBodyIter),
+		// so that (base >> k) + (offset >> k) == (base + offset) >> k with no carry.
+		// After an ADD/SUB the base may be misaligned, so we skip this optimization.
+		// We compute the new offset as a COMPILE-TIME constant vector to avoid
+		// creating <N x i8> vector-shift-by-vector IR, which WASM cannot lower
+		// (WASM i8x16.shr_u takes a scalar shift amount, not per-lane).
+		if !decomp.fromBodyIter {
+			break
+		}
+		if constVal, ok := scalarSSA.(*ssa.Const); ok {
+			if k, ok := constant.Int64Val(constVal.Value); ok && k > 0 {
+				power := int64(1) << uint(k)
+				if int64(laneCount)%power == 0 {
+					// Shift the base scalar.
+					newBase := b.CreateAShr(decomp.scalarBase, scalarLLVM, "spmd.decomp.shr.base")
+					// Compute the new offset as a constant vector directly.
+					// For offset <0,1,...,N-1> >> k: each element i maps to i >> k.
+					newOffsetElts := make([]llvm.Value, laneCount)
+					for i := 0; i < laneCount; i++ {
+						newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(i)>>uint(k), false)
+					}
+					newOffset := llvm.ConstVector(newOffsetElts, false)
+					if b.spmdDecomposed != nil {
+						b.spmdDecomposed[expr] = &spmdDecomposedIndex{
+							scalarBase:    newBase,
+							varyingOffset: newOffset,
+							laneCount:     laneCount,
+							loop:          decomp.loop,
+						}
+					}
+					return llvm.Value{}, true
+				}
+			}
+		}
+
+	case token.AND:
+		if !decompIsLHS {
+			break
+		}
+		// (base + offset) & mask where offset = <0,1,...,N-1> and mask is a constant.
+		// Valid ONLY when base & mask == 0 (ensured by fromBodyIter, since base is a
+		// multiple of laneCount which is always > mask for mask < laneCount).
+		// After an ADD/SUB the base may have low bits set, breaking the identity
+		// (base + offset) & mask == (base & mask) + (offset & mask).
+		// We compute the new offset as a COMPILE-TIME constant vector to avoid
+		// creating runtime <N x i8> AND which could mismatch WASM SIMD lane widths.
+		// This handles the common "i & 1" (i.e., "i % 2") pattern.
+		if !decomp.fromBodyIter {
+			break
+		}
+		if constVal, ok := scalarSSA.(*ssa.Const); ok {
+			if mask, ok := constant.Int64Val(constVal.Value); ok && mask >= 0 && mask < int64(laneCount) {
+				// Compute offset & mask as constant vector.
+				newOffsetElts := make([]llvm.Value, laneCount)
+				for i := 0; i < laneCount; i++ {
+					newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(i)&uint64(mask), false)
+				}
+				newOffset := llvm.ConstVector(newOffsetElts, false)
+				// Base contribution: base & mask (scalar).
+				baseContrib := b.CreateAnd(decomp.scalarBase, scalarLLVM, "spmd.decomp.and.base")
+				if b.spmdDecomposed != nil {
+					b.spmdDecomposed[expr] = &spmdDecomposedIndex{
+						scalarBase:    baseContrib,
+						varyingOffset: newOffset,
+						laneCount:     laneCount,
+						loop:          decomp.loop,
+					}
+				}
+				return llvm.Value{}, true
+			}
+		}
+
+	case token.REM:
+		if !decompIsLHS {
+			break
+		}
+		// (base + offset) % k where offset = <0,1,...,N-1> and k is a constant.
+		// Valid ONLY when base % k == 0 (ensured by fromBodyIter, since base is a
+		// multiple of laneCount which is always divisible by k when laneCount%k==0).
+		// After an ADD/SUB the base may not be aligned, so the identity
+		// (base + offset) % k == (base % k) + (offset % k) may not hold.
+		// We compute the new offset as a COMPILE-TIME constant vector to avoid
+		// creating <N x i8> remainder IR which WASM SIMD cannot lower (no i8x16.rem).
+		// Valid when laneCount is divisible by k.
+		if !decomp.fromBodyIter {
+			break
+		}
+		if constVal, ok := scalarSSA.(*ssa.Const); ok {
+			if k, ok := constant.Int64Val(constVal.Value); ok && k > 0 && int64(laneCount)%k == 0 {
+				// Compute offset % k as constant vector.
+				newOffsetElts := make([]llvm.Value, laneCount)
+				for i := 0; i < laneCount; i++ {
+					newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(i)%uint64(k), false)
+				}
+				newOffset := llvm.ConstVector(newOffsetElts, false)
+				// Base contribution: base % k (scalar).
+				baseContrib := b.CreateURem(decomp.scalarBase, scalarLLVM, "spmd.decomp.rem.base")
+				if b.spmdDecomposed != nil {
+					b.spmdDecomposed[expr] = &spmdDecomposedIndex{
+						scalarBase:    baseContrib,
+						varyingOffset: newOffset,
+						laneCount:     laneCount,
+						loop:          decomp.loop,
+					}
+				}
+				return llvm.Value{}, true
+			}
+		}
+
+	case token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ:
+		// Comparison: (base + offset) CMP c  →  offset CMP (c - base)  [unsigned <N x i8>]
+		// The scalar operand is always on the right when decompIsLHS; when !decompIsLHS the
+		// expression is  c CMP (base + offset)  and we swap the predicate below.
+		//
+		// We compute diff = c - base as a signed i32 scalar. Two edge cases require
+		// special handling before the clamped i8 comparison:
+		//
+		//   diff < 0  (c < base):  every lane has base+offset > c (since offset >= 0),
+		//     so (base+offset) CMP c should be: LT→all-false, LE→all-false, GT→all-true,
+		//     GE→all-true, EQ→all-false, NE→all-true.
+		//
+		//   diff >= laneCount  (c >= base+laneCount): every lane has base+offset <= c
+		//     (since offset <= laneCount-1), so:
+		//     LT→all-true, LE→all-true, GT→all-false, GE→all-false, EQ→all-false,
+		//     NE→all-true.
+		//
+		// These edge-case results are for the canonical "(base+offset) CMP c" form.
+		// When !decompIsLHS the expression is "c CMP (base+offset)" and we apply the
+		// complementary result (true↔false for LT/GT/LE/GE, identity for EQ/NE).
+
+		// diff = c - base (scalar i32) using the decomposed base.
+		diff := b.CreateSub(scalarLLVM, decomp.scalarBase, "spmd.decomp.cmp.diff")
+
+		i1VecType := llvm.VectorType(b.ctx.Int1Type(), laneCount)
+		allTrue := llvm.ConstAllOnes(i1VecType)
+		allFalse := llvm.ConstNull(i1VecType)
+
+		zero32 := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+		lcConst32 := llvm.ConstInt(b.ctx.Int32Type(), uint64(laneCount), false)
+		// Splat the scalar edge-case conditions to <N x i1> so they can be used as
+		// the condition in vector CreateSelect (LLVM select requires matching shapes).
+		diffNeg := b.splatScalar(
+			b.CreateICmp(llvm.IntSLT, diff, zero32, "spmd.decomp.cmp.neg"),
+			i1VecType)
+		diffOver := b.splatScalar(
+			b.CreateICmp(llvm.IntSGE, diff, lcConst32, "spmd.decomp.cmp.over"),
+			i1VecType)
+
+		// Determine the all-true/all-false overrides for the "(base+offset) CMP c" form.
+		// negResult applies when diff < 0 (c < base); overResult applies when diff >= laneCount.
+		var negResult, overResult llvm.Value
+		switch expr.Op {
+		case token.LSS, token.LEQ:
+			// (base+offset) </<= c: when c < base → all false; when c >= base+N → all true.
+			negResult = allFalse
+			overResult = allTrue
+		case token.GTR, token.GEQ:
+			// (base+offset) >/>= c: when c < base → all true; when c >= base+N → all false.
+			negResult = allTrue
+			overResult = allFalse
+		case token.EQL:
+			negResult = allFalse
+			overResult = allFalse
+		case token.NEQ:
+			negResult = allTrue
+			overResult = allTrue
+		}
+
+		// When the decomposed value is on the RHS (c CMP (base+offset)), the meaning
+		// flips for ordering comparisons: LSS↔GTR, LEQ↔GEQ; EQ/NE are symmetric.
+		if !decompIsLHS {
+			switch expr.Op {
+			case token.LSS, token.LEQ:
+				// c </<= (base+offset): when c < base → all true; when c >= base+N → all false.
+				negResult = allTrue
+				overResult = allFalse
+			case token.GTR, token.GEQ:
+				// c >/>= (base+offset): when c < base → all false; when c >= base+N → all true.
+				negResult = allFalse
+				overResult = allTrue
+			// EQL and NEQ are symmetric; negResult/overResult already set correctly above.
+			}
+		}
+
+		// Clamp diff to [0, 255] for safe i8 truncation.
+		max8 := llvm.ConstInt(b.ctx.Int32Type(), 255, false)
+		diffClamped := b.CreateSelect(
+			b.CreateICmp(llvm.IntSGT, diff, max8, ""),
+			max8, diff, "spmd.decomp.cmp.hi")
+		diffClamped = b.CreateSelect(
+			b.CreateICmp(llvm.IntSLT, diffClamped, zero32, ""),
+			zero32, diffClamped, "spmd.decomp.cmp.lo")
+
+		// Truncate to i8 and splat for the in-range comparison.
+		diffI8 := b.CreateTrunc(diffClamped, i8Type, "spmd.decomp.cmp.i8")
+		diffVec := b.splatScalar(diffI8, llvm.VectorType(i8Type, laneCount))
+
+		// Choose the comparison predicate for the in-range case.
+		// offset is unsigned [0, N-1]; always use unsigned predicates.
+		var pred llvm.IntPredicate
+		if decompIsLHS {
+			// (base + offset) CMP c → offset CMP diff
+			switch expr.Op {
+			case token.EQL:
+				pred = llvm.IntEQ
+			case token.NEQ:
+				pred = llvm.IntNE
+			case token.LSS:
+				pred = llvm.IntULT
+			case token.LEQ:
+				pred = llvm.IntULE
+			case token.GTR:
+				pred = llvm.IntUGT
+			case token.GEQ:
+				pred = llvm.IntUGE
+			}
+		} else {
+			// c CMP (base + offset) → diff CMP offset → swap predicate
+			switch expr.Op {
+			case token.EQL:
+				pred = llvm.IntEQ
+			case token.NEQ:
+				pred = llvm.IntNE
+			case token.LSS:
+				pred = llvm.IntUGT // c < (base+off) ↔ off > (c-base)
+			case token.LEQ:
+				pred = llvm.IntUGE
+			case token.GTR:
+				pred = llvm.IntULT
+			case token.GEQ:
+				pred = llvm.IntULE
+			}
+		}
+		cmpI1 := b.CreateICmp(pred, decomp.varyingOffset, diffVec, "spmd.decomp.cmp")
+
+		// Apply edge-case overrides: diff < 0 → negResult; diff >= laneCount → overResult.
+		result := b.CreateSelect(diffNeg, negResult, cmpI1, "spmd.decomp.cmp.neg.sel")
+		result = b.CreateSelect(diffOver, overResult, result, "spmd.decomp.cmp.over.sel")
+		return result, false
+	}
+
+	// Fallback: materialize to <N x i32> and apply the operation normally.
+	// On WASM this produces a 512-bit wide vector; use only when no 128-bit path exists.
+	materialized := b.spmdMaterializeDecomposed(decomp)
+	return materialized, false
+}
+
+// spmdDecomposedIndexAddr handles IndexAddr where the index is a decomposed SPMD value.
+// Two sub-cases:
+//  1. Identity offset <0,1,...,N-1>: this is contiguous access; delegate to spmdContiguousIndexAddrCore.
+//  2. Non-identity offset: build per-lane GEPs from (scalarBase + offset[lane]) for gather/scatter.
+func (b *builder) spmdDecomposedIndexAddr(expr *ssa.IndexAddr, decomp *spmdDecomposedIndex) (llvm.Value, error) {
+	laneCount := decomp.laneCount
+
+	// Check if the offset is the identity permutation <0,1,...,N-1>.
+	// This is true when the decomposed value is the raw bodyIterValue (i.e.,
+	// its varyingOffset was initialized by emitSPMDBodyPrologue as the constant
+	// lane offset sequence). We detect this by checking if the offset is a
+	// constant vector equal to the initial identity.
+	isIdentity := false
+	identityConst := b.spmdLaneOffsetConst(laneCount, b.ctx.Int8Type())
+	if decomp.varyingOffset == identityConst {
+		isIdentity = true
+	} else {
+		// Also check structural equality: the offset may be the same constant
+		// but a different Go wrapper. Compare by LLVM string representation.
+		if decomp.varyingOffset.IsConstant() {
+			isIdentity = (decomp.varyingOffset.String() == identityConst.String())
+		}
+	}
+
+	if isIdentity {
+		// Contiguous access: use the scalar base as the GEP index.
+		return b.spmdContiguousIndexAddrCore(expr, decomp.loop, decomp.scalarBase)
+	}
+
+	// Non-contiguous access: build per-lane GEPs using (scalarBase + offset[lane]).
+	// The offset is <N x i8>, so each lane's byte offset must be zero-extended to uintptr.
+	val := b.getValue(expr.X, getPos(expr))
+
+	var bufptr llvm.Value
+	var bufType llvm.Type
+	var elemType llvm.Type
+	switch ptrTyp := expr.X.Type().Underlying().(type) {
+	case *types.Pointer:
+		typ := ptrTyp.Elem().Underlying()
+		switch typ := typ.(type) {
+		case *types.Array:
+			bufptr = val
+			bufType = b.getLLVMType(typ)
+			elemType = b.getLLVMType(typ.Elem())
+			b.createNilCheck(expr.X, bufptr, "gep")
+		default:
+			return llvm.Value{}, b.makeError(expr.Pos(), "unsupported decomposed SPMD indexaddr type: "+typ.String())
+		}
+	case *types.Slice:
+		bufptr = b.CreateExtractValue(val, 0, "indexaddr.ptr")
+		bufType = b.getLLVMType(ptrTyp.Elem())
+		elemType = bufType
+	default:
+		return llvm.Value{}, b.makeError(expr.Pos(), "unsupported decomposed SPMD indexaddr type: "+ptrTyp.String())
+	}
+
+	// Bounds check: verify all lane indices (base + offset[lane]) are in bounds.
+	if !b.info.nobounds {
+		var buflen llvm.Value
+		switch ptrTyp := expr.X.Type().Underlying().(type) {
+		case *types.Pointer:
+			typ := ptrTyp.Elem().Underlying().(*types.Array)
+			buflen = llvm.ConstInt(b.uintptrType, uint64(typ.Len()), false)
+		case *types.Slice:
+			buflen = b.CreateExtractValue(val, 1, "indexaddr.len")
+		}
+		if !buflen.IsNil() {
+			anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
+			for lane := 0; lane < laneCount; lane++ {
+				offsetByte := b.CreateExtractElement(decomp.varyingOffset,
+					llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+				// Zero-extend offset byte to i32, then add scalar base.
+				offsetI32 := b.CreateZExt(offsetByte, b.ctx.Int32Type(), "")
+				laneIdx := b.CreateAdd(decomp.scalarBase, offsetI32, "")
+				if laneIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+					laneIdx = b.CreateSExt(laneIdx, b.uintptrType, "")
+				}
+				oob := b.CreateICmp(llvm.IntUGE, laneIdx, buflen, "")
+				anyOOB = b.CreateOr(anyOOB, oob, "")
+			}
+			b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+		}
+	}
+
+	// Build vector of pointers: each lane gets its own GEP from (base + offset[lane]).
+	ptrVec := llvm.Undef(llvm.VectorType(bufptr.Type(), laneCount))
+	for lane := 0; lane < laneCount; lane++ {
+		offsetByte := b.CreateExtractElement(decomp.varyingOffset,
+			llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+		offsetI32 := b.CreateZExt(offsetByte, b.ctx.Int32Type(), "")
+		laneIdx := b.CreateAdd(decomp.scalarBase, offsetI32, "")
+		if laneIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+			laneIdx = b.CreateSExt(laneIdx, b.uintptrType, "")
+		}
+		var gep llvm.Value
+		switch expr.X.Type().Underlying().(type) {
+		case *types.Pointer:
+			gep = b.CreateInBoundsGEP(bufType, bufptr, []llvm.Value{
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+				laneIdx,
+			}, "")
+		case *types.Slice:
+			gep = b.CreateInBoundsGEP(elemType, bufptr, []llvm.Value{laneIdx}, "")
+		}
+		ptrVec = b.CreateInsertElement(ptrVec, gep,
+			llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+	}
+	return ptrVec, nil
 }
 
 // detectSPMDForLoops scans for regular for-range loops (rangeint pattern) in an

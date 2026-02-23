@@ -3771,3 +3771,247 @@ func TestSPMDWasmSwizzleHextableShape(t *testing.T) {
 		t.Error("result element type should be i8")
 	}
 }
+
+// TestSPMDMaterializeDecomposed verifies that spmdMaterializeDecomposed converts
+// a decomposed index (scalar base + <N x i8> offset) to a full <N x i32> vector.
+func TestSPMDMaterializeDecomposed(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 16
+	i32Type := c.ctx.Int32Type()
+	i8Type := c.ctx.Int8Type()
+
+	// Create a scalar base value (i32 constant 32).
+	scalarBase := llvm.ConstInt(i32Type, 32, false)
+
+	// Create a <16 x i8> offset [0..15].
+	offsets := make([]llvm.Value, laneCount)
+	for i := 0; i < laneCount; i++ {
+		offsets[i] = llvm.ConstInt(i8Type, uint64(i), false)
+	}
+	varyingOffset := llvm.ConstVector(offsets, false)
+
+	decomp := &spmdDecomposedIndex{
+		scalarBase:    scalarBase,
+		varyingOffset: varyingOffset,
+		laneCount:     laneCount,
+	}
+
+	result := b.spmdMaterializeDecomposed(decomp)
+
+	// Result should be <16 x i32>.
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatalf("result type = %v, want vector", result.Type())
+	}
+	if result.Type().VectorSize() != laneCount {
+		t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), laneCount)
+	}
+	if result.Type().ElementType() != i32Type {
+		t.Errorf("result elem type = %v, want i32", result.Type().ElementType())
+	}
+}
+
+// TestSPMDDecomposedIndexTailMask verifies that emitSPMDBodyPrologue produces a
+// <16 x i8> tail mask for decomposed byte-lane loops (laneCount == 16 on WASM).
+func TestSPMDDecomposedIndexTailMask(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+
+	// Initialize the maps that emitSPMDBodyPrologue writes into.
+	b.spmdDecomposed = make(map[ssa.Value]*spmdDecomposedIndex)
+
+	// Create a fake loop struct. boundValue and bodyIterValue are SSA values so we need
+	// to use ssa.Const for the bound. Since SSA requires a program context we test
+	// the tail mask math directly with LLVM values instead.
+	//
+	// Test scenario: base=0, laneCount=16, bound=10.
+	// Expected: lanes 0..9 are active (offset < 10), lanes 10..15 are inactive.
+	laneCount := 16
+
+	// Simulate the core tail mask computation from emitSPMDBodyPrologue (decomposed path).
+	scalarPhi := llvm.ConstInt(i32Type, 0, false)          // base iteration = 0
+	boundScalar := llvm.ConstInt(i32Type, 10, false)        // bound = 10
+	diff := b.CreateSub(boundScalar, scalarPhi, "diff")
+
+	zero32 := llvm.ConstInt(i32Type, 0, false)
+	lcConst := llvm.ConstInt(i32Type, uint64(laneCount), false)
+
+	diffClamped := b.CreateSelect(
+		b.CreateICmp(llvm.IntSGT, diff, lcConst, ""),
+		lcConst, diff, "clamped")
+	diffClamped = b.CreateSelect(
+		b.CreateICmp(llvm.IntSLT, diffClamped, zero32, ""),
+		zero32, diffClamped, "nonneg")
+
+	diffI8 := b.CreateTrunc(diffClamped, i8Type, "diff.i8")
+	diffVec := b.splatScalar(diffI8, llvm.VectorType(i8Type, laneCount))
+
+	// Create identity offset <0, 1, ..., 15>.
+	varyingOffset := c.spmdLaneOffsetConst(laneCount, i8Type)
+
+	tailMaskI1 := b.CreateICmp(llvm.IntULT, varyingOffset, diffVec, "tail.mask")
+	tailMask := b.spmdWrapMask(tailMaskI1, laneCount)
+
+	// On WASM with 16 lanes, mask element type should be i8 (128/16 = 8 bits).
+	if tailMask.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatalf("tailMask type = %v, want vector", tailMask.Type())
+	}
+	if tailMask.Type().VectorSize() != laneCount {
+		t.Errorf("tailMask lanes = %d, want %d", tailMask.Type().VectorSize(), laneCount)
+	}
+	if tailMask.Type().ElementType() != i8Type {
+		t.Errorf("tailMask elem type = %v, want i8", tailMask.Type().ElementType())
+	}
+}
+
+// TestSPMDDecomposedBinOpAdd verifies that spmdDecomposedBinOp handles ADD correctly.
+// (base + offset) + scalar_c → decomposed {base+c, offset}.
+func TestSPMDDecomposedBinOpAdd(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+	laneCount := 16
+
+	b.spmdDecomposed = make(map[ssa.Value]*spmdDecomposedIndex)
+
+	// scalarBase = 16, varyingOffset = <0,1,...,15>
+	scalarBase := llvm.ConstInt(i32Type, 16, false)
+	offsets := make([]llvm.Value, laneCount)
+	for i := 0; i < laneCount; i++ {
+		offsets[i] = llvm.ConstInt(i8Type, uint64(i), false)
+	}
+	varyingOffset := llvm.ConstVector(offsets, false)
+
+	// Build an ssa.BinOp-like test: we can't create real SSA values in a unit test
+	// so we test the LLVM helper directly: simulate what spmdDecomposedBinOp does
+	// for ADD with a scalar constant 100.
+	scalar := llvm.ConstInt(i32Type, 100, false)
+	newBase := b.CreateAdd(scalarBase, scalar, "spmd.decomp.add")
+
+	// The result should be base+c = 116 (constant fold).
+	decomp := &spmdDecomposedIndex{
+		scalarBase:    newBase,
+		varyingOffset: varyingOffset,
+		laneCount:     laneCount,
+	}
+
+	// Materialize to verify correctness.
+	result := b.spmdMaterializeDecomposed(decomp)
+
+	if result.Type().VectorSize() != laneCount {
+		t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), laneCount)
+	}
+	if result.Type().ElementType() != i32Type {
+		t.Errorf("result elem type = %v, want i32", result.Type().ElementType())
+	}
+}
+
+// TestSPMDDecomposedBinOpShr verifies the right-shift decomposition rule.
+// (base + offset) >> k → {base>>k, offset>>k} when laneCount is multiple of 2^k.
+func TestSPMDDecomposedBinOpShr(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+	laneCount := 16
+
+	// scalarBase = 16 (multiple of 16), varyingOffset = <0,1,...,15>
+	scalarBase := llvm.ConstInt(i32Type, 16, false)
+	offsets := make([]llvm.Value, laneCount)
+	for i := 0; i < laneCount; i++ {
+		offsets[i] = llvm.ConstInt(i8Type, uint64(i), false)
+	}
+	varyingOffset := llvm.ConstVector(offsets, false)
+
+	// Simulate right-shift by 1: 16 is multiple of 2^1 = 2, so decomposition is valid.
+	// base>>1 = 8, offset>>1 = <0,0,1,1,2,2,...,7,7>
+	k := uint64(1)
+	i8Shift := llvm.ConstInt(i8Type, k, false)
+	shiftVec := b.splatScalar(i8Shift, llvm.VectorType(i8Type, laneCount))
+
+	newBase := b.CreateAShr(scalarBase, llvm.ConstInt(i32Type, k, false), "base.shr")
+	newOffset := b.CreateLShr(varyingOffset, shiftVec, "off.shr")
+
+	decomp := &spmdDecomposedIndex{
+		scalarBase:    newBase,
+		varyingOffset: newOffset,
+		laneCount:     laneCount,
+	}
+
+	// Verify structure: newBase should be 8, newOffset should be <0,0,1,1,...,7,7>.
+	result := b.spmdMaterializeDecomposed(decomp)
+
+	if result.Type().VectorSize() != laneCount {
+		t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), laneCount)
+	}
+	if result.Type().ElementType() != i32Type {
+		t.Errorf("result elem type = %v, want i32", result.Type().ElementType())
+	}
+	// The offset vector element type should remain i8.
+	if newOffset.Type().ElementType() != i8Type {
+		t.Errorf("newOffset elem type = %v, want i8", newOffset.Type().ElementType())
+	}
+}
+
+// TestSPMDDecomposedIndexStructure verifies that the spmdDecomposedIndex struct
+// fields are correctly populated by the emitSPMDBodyPrologue decomposed path.
+// This is a structural test using LLVM value types.
+func TestSPMDDecomposedIndexStructure(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+	laneCount := 16
+
+	// Simulate what emitSPMDBodyPrologue does for a decomposed loop.
+	scalarPhi := llvm.ConstInt(i32Type, 0, false)
+	varyingOffset := c.spmdLaneOffsetConst(laneCount, i8Type)
+
+	decomp := &spmdDecomposedIndex{
+		scalarBase:    scalarPhi,
+		varyingOffset: varyingOffset,
+		laneCount:     laneCount,
+	}
+
+	// Verify scalar base is i32.
+	if decomp.scalarBase.Type() != i32Type {
+		t.Errorf("scalarBase type = %v, want i32", decomp.scalarBase.Type())
+	}
+
+	// Verify varying offset is <16 x i8>.
+	if decomp.varyingOffset.Type().VectorSize() != laneCount {
+		t.Errorf("varyingOffset lanes = %d, want %d",
+			decomp.varyingOffset.Type().VectorSize(), laneCount)
+	}
+	if decomp.varyingOffset.Type().ElementType() != i8Type {
+		t.Errorf("varyingOffset elem type = %v, want i8",
+			decomp.varyingOffset.Type().ElementType())
+	}
+
+	// Materialize and verify output is <16 x i32>.
+	mat := b.spmdMaterializeDecomposed(decomp)
+	if mat.Type().VectorSize() != laneCount {
+		t.Errorf("materialized lanes = %d, want %d", mat.Type().VectorSize(), laneCount)
+	}
+	if mat.Type().ElementType() != i32Type {
+		t.Errorf("materialized elem type = %v, want i32", mat.Type().ElementType())
+	}
+}

@@ -179,6 +179,7 @@ type builder struct {
 	afterDefersBlock      []llvm.BasicBlock
 	spmdLoopState         *spmdLoopState                     // SPMD loop analysis results (nil if no SPMD)
 	spmdValueOverride     map[ssa.Value]llvm.Value            // SPMD value substitutions (e.g., iter phi -> lane indices)
+	spmdDecomposed        map[ssa.Value]*spmdDecomposedIndex  // decomposed index values (scalar base + <N x i8> offset) for wide lanes
 	spmdVaryingIfs        map[int]*spmdVaryingIf              // if-block index -> varying if info
 	spmdThenExitRedirects map[int]llvm.BasicBlock             // then-exit block index -> else-entry LLVM block
 	spmdMergeSelects      map[int]*spmdVaryingIf              // merge block index -> varying if info
@@ -1512,17 +1513,24 @@ func (b *builder) createFunction() {
 		if b.spmdLoopState != nil {
 			if loop, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
 				b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
+				b.spmdDecomposed = make(map[ssa.Value]*spmdDecomposedIndex)
 				// SPMD: rangeindex body blocks have no iter phi, so emit prologue here.
 				// For rangeint, the prologue is triggered later when the iter phi is compiled.
 				if loop.isRangeIndex {
 					b.emitSPMDBodyPrologue(loop)
-					b.spmdValueOverride[loop.bodyIterValue] = loop.laneIndices
+					if loop.isDecomposed {
+						// Decomposed path: do NOT set spmdValueOverride for the body iter value.
+						// Instead, spmdDecomposed[loop.bodyIterValue] was set in emitSPMDBodyPrologue.
+					} else {
+						b.spmdValueOverride[loop.bodyIterValue] = loop.laneIndices
+					}
 					b.spmdMaskStack = []llvm.Value{loop.tailMask}
 				}
 			} else if b.spmdValueOverride != nil && b.isBlockInSPMDBody(block) != nil {
 				// Keep existing overrides for if.then/if.else/if.done inside SPMD body.
 			} else {
 				b.spmdValueOverride = nil
+				b.spmdDecomposed = nil
 				b.spmdMaskStack = nil
 			}
 		} else if b.spmdFuncIsBody {
@@ -2632,6 +2640,15 @@ func (b *builder) getValue(expr ssa.Value, pos token.Pos) llvm.Value {
 			return override
 		}
 	}
+	// SPMD: check for decomposed index values. Materialize as <N x i32> fallback.
+	// In practice, BinOp and IndexAddr handlers intercept decomposed values before
+	// getValue is called, so this path only triggers for unexpected uses of a
+	// decomposed index (e.g., passing it directly to a function argument).
+	if b.spmdDecomposed != nil {
+		if decomp, ok := b.spmdDecomposed[expr]; ok {
+			return b.spmdMaterializeDecomposed(decomp)
+		}
+	}
 	switch expr := expr.(type) {
 	case *ssa.Const:
 		if pos == token.NoPos {
@@ -2728,6 +2745,47 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			return buf, nil
 		}
 	case *ssa.BinOp:
+		// SPMD: intercept decomposed index operations BEFORE calling getValue on operands.
+		// If either operand is a decomposed index (scalar base + <N x i8> offset), apply
+		// algebraic decomposition rules to avoid materializing a wide <N x i32> vector.
+		if b.spmdDecomposed != nil {
+			if decompX, ok := b.spmdDecomposed[expr.X]; ok {
+				result, isMaterialized := b.spmdDecomposedBinOp(expr, decompX, true)
+				if !isMaterialized {
+					// Comparison or materialized value: wrap mask if needed and return.
+					if b.spmdIsWASM() &&
+						result.Type().TypeKind() == llvm.VectorTypeKind &&
+						result.Type().ElementType() == b.ctx.Int1Type() {
+						result = b.spmdWrapMask(result, result.Type().VectorSize())
+					}
+					return result, nil
+				}
+				// isMaterialized == true means the BinOp result was stored as a new
+				// decomposed entry in b.spmdDecomposed[expr]. createExpr stores the
+				// result in b.locals, so we must return an LLVM value. We materialize
+				// the decomposed representation here for b.locals; downstream BinOp and
+				// IndexAddr handlers check spmdDecomposed first and use the compact form,
+				// bypassing the materialized value stored in b.locals.
+				if decomp, ok := b.spmdDecomposed[expr]; ok {
+					return b.spmdMaterializeDecomposed(decomp), nil
+				}
+			}
+			if decompY, ok := b.spmdDecomposed[expr.Y]; ok {
+				result, isMaterialized := b.spmdDecomposedBinOp(expr, decompY, false)
+				if !isMaterialized {
+					if b.spmdIsWASM() &&
+						result.Type().TypeKind() == llvm.VectorTypeKind &&
+						result.Type().ElementType() == b.ctx.Int1Type() {
+						result = b.spmdWrapMask(result, result.Type().VectorSize())
+					}
+					return result, nil
+				}
+				if decomp, ok := b.spmdDecomposed[expr]; ok {
+					return b.spmdMaterializeDecomposed(decomp), nil
+				}
+			}
+		}
+
 		x := b.getValue(expr.X, getPos(expr))
 		y := b.getValue(expr.Y, getPos(expr))
 		// SPMD: replace +1 with +laneCount for SPMD loop increment.
@@ -2933,6 +2991,17 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			panic("unknown *ssa.Index type")
 		}
 	case *ssa.IndexAddr:
+		// SPMD: detect decomposed index access (byte-lane loops with laneCount > 4).
+		// This must come before the contiguous detection path since decomposed indices
+		// are not registered in spmdValueOverride.
+		if b.spmdDecomposed != nil {
+			if decomp, ok := b.spmdDecomposed[expr.Index]; ok {
+				if result, err := b.spmdDecomposedIndexAddr(expr, decomp); err == nil {
+					return result, nil
+				}
+			}
+		}
+
 		// SPMD: detect contiguous access patterns for vector load/store optimization.
 		// When the index is a known SPMD loop iterator (or a scalar+iter expression),
 		// generate a scalar GEP for masked load/store instead of per-lane gather/scatter.
