@@ -273,6 +273,55 @@ func (c *compilerContext) spmdEffectiveLaneCount(spmdType *types.SPMDType, elemL
 	return c.spmdLaneCount(elemLLVM)
 }
 
+// spmdRangeIndexLaneCount computes the lane count for a range-over-slice SPMD loop
+// by examining the slice element type instead of the iterator's int type.
+// For []byte slices, this yields 128/8=16 lanes (native v128) instead of 128/32=4.
+// Falls back to the iterator type when no slice element type can be determined.
+//
+// Strategy 2 (IndexAddr scan) requires the index to be exactly incrBinOp — it does
+// not trace through ChangeType chains. This is sufficient for the common range-over-slice
+// pattern where go/ssa uses incrBinOp directly as the IndexAddr index.
+func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.BasicBlock, incrBinOp *ssa.BinOp) int {
+	// Strategy 1: if boundValue is a call to builtin len, extract the slice element type.
+	if call, ok := boundValue.(*ssa.Call); ok {
+		if builtin, ok := call.Call.Value.(*ssa.Builtin); ok && builtin.Name() == "len" {
+			if len(call.Call.Args) == 1 {
+				arg := call.Call.Args[0]
+				if sliceType, ok := arg.Type().Underlying().(*types.Slice); ok {
+					elemLLVM := b.getLLVMType(sliceType.Elem())
+					return b.spmdLaneCount(elemLLVM)
+				}
+			}
+		}
+	}
+
+	// Strategy 2: scan the body block for an IndexAddr whose index traces back
+	// to incrBinOp, and extract the slice element type from its base.
+	for _, instr := range bodyBlock.Instrs {
+		ia, ok := instr.(*ssa.IndexAddr)
+		if !ok {
+			continue
+		}
+		// The index must be the increment BinOp (the SPMD iterator).
+		if ia.Index != ssa.Value(incrBinOp) {
+			continue
+		}
+		if sliceType, ok := ia.X.Type().Underlying().(*types.Slice); ok {
+			elemLLVM := b.getLLVMType(sliceType.Elem())
+			return b.spmdLaneCount(elemLLVM)
+		}
+		if ptrType, ok := ia.X.Type().Underlying().(*types.Pointer); ok {
+			if arrType, ok := ptrType.Elem().Underlying().(*types.Array); ok {
+				elemLLVM := b.getLLVMType(arrType.Elem())
+				return b.spmdLaneCount(elemLLVM)
+			}
+		}
+	}
+
+	// Fallback: use the iterator type (int → 4 lanes on wasm32).
+	return b.spmdLaneCount(b.getLLVMType(incrBinOp.Type()))
+}
+
 // splatScalar broadcasts a scalar value to fill all lanes of a vector type.
 func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
 	undef := llvm.Undef(vecType)
@@ -651,9 +700,9 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			continue
 		}
 
-		// Compute lane count from the increment value's type.
-		elemType := b.getLLVMType(incrBinOp.Type())
-		laneCount := b.spmdLaneCount(elemType)
+		// Compute lane count from the slice element type (if available) for optimal
+		// SIMD width. For []byte slices this yields 16 lanes instead of 4.
+		laneCount := b.spmdRangeIndexLaneCount(boundValue, block, incrBinOp)
 
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
@@ -2010,12 +2059,13 @@ func (c *compilerContext) spmdIsWASM() bool {
 	return strings.HasPrefix(c.Triple, "wasm")
 }
 
-// spmdMaskElemType returns the LLVM element type used for SPMD mask vectors.
-// On WASM targets this is i32 (all-ones = active, all-zeros = inactive).
-// On other targets this is i1 (the native LLVM boolean vector element type).
-func (c *compilerContext) spmdMaskElemType() llvm.Type {
+// spmdMaskElemType returns the LLVM element type for SPMD mask vectors.
+// On WASM targets, the mask element type is sized to keep the mask in a single
+// 128-bit v128 register: i32 for 4 lanes, i16 for 8, i8 for 16.
+// On other targets this is always i1 (native LLVM boolean vector element).
+func (c *compilerContext) spmdMaskElemType(laneCount int) llvm.Type {
 	if c.spmdIsWASM() {
-		return c.ctx.Int32Type()
+		return c.ctx.IntType(128 / laneCount) // 4→i32, 8→i16, 16→i8
 	}
 	return c.ctx.Int1Type()
 }
@@ -2041,25 +2091,27 @@ func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
 			// Found a varying parameter. Compute lane count respecting constraints.
 			elemType := c.getLLVMType(spmdType.Elem())
 			laneCount := c.spmdEffectiveLaneCount(spmdType, elemType)
-			return llvm.VectorType(c.spmdMaskElemType(), laneCount)
+			return llvm.VectorType(c.spmdMaskElemType(laneCount), laneCount)
 		}
 	}
 	return llvm.Type{} // No varying parameters
 }
 
-// spmdWrapMask sign-extends an <N x i1> comparison result to <N x i32> on WASM.
+// spmdWrapMask sign-extends an <N x i1> comparison result to the WASM mask type
+// (e.g., <4 x i32> for 4 lanes, <8 x i16> for 8 lanes, <16 x i8> for 16 lanes).
 // On non-WASM targets this is a no-op. LLVM's WASM backend folds sext(cmp)
 // into a single WASM comparison instruction, so there is no runtime cost.
 func (b *builder) spmdWrapMask(cmp llvm.Value, laneCount int) llvm.Value {
 	if !b.spmdIsWASM() {
 		return cmp
 	}
-	maskType := llvm.VectorType(b.ctx.Int32Type(), laneCount)
+	maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
 	return b.CreateSExt(cmp, maskType, "")
 }
 
-// spmdUnwrapMaskForIntrinsic truncates <N x i32> back to <N x i1> for LLVM masked
-// memory intrinsics (masked.load, masked.store, masked.gather, masked.scatter).
+// spmdUnwrapMaskForIntrinsic truncates the WASM mask (e.g., <N x i32>, <N x i16>,
+// or <N x i8>) back to <N x i1> for LLVM masked memory intrinsics
+// (masked.load, masked.store, masked.gather, masked.scatter).
 // These intrinsics require an <N x i1> mask regardless of the target.
 // On non-WASM targets the mask is already <N x i1> and this is a no-op.
 func (b *builder) spmdUnwrapMaskForIntrinsic(mask llvm.Value, laneCount int) llvm.Value {
@@ -2072,27 +2124,26 @@ func (b *builder) spmdUnwrapMaskForIntrinsic(mask llvm.Value, laneCount int) llv
 
 // spmdMaskSelect emits a masked select for SPMD value merging.
 // On non-WASM targets this calls CreateSelect directly (mask is <N x i1>).
-// On WASM targets the mask is <N x i32> (all-ones / all-zeros), so we use
-// bitwise AND/OR: result = (mask & trueVal) | (~mask & falseVal).
+// On WASM targets the mask element type matches the data width to fit in a
+// single v128 register (i32 for 4 lanes, i16 for 8, i8 for 16). The select
+// uses bitwise AND/OR: result = (mask & trueVal) | (~mask & falseVal).
 // Float vector types are bitcast to the matching integer type for the bitwise ops.
 //
 // The bitwise path is only valid when mask and data have the same total bit
-// width (e.g., <4 x i32> mask with <4 x i32> or <4 x f32> data). For types
-// with a different total bit width (e.g., <2 x i32> mask with <2 x i64> data),
-// we fall back to truncating the mask to <N x i1> and using LLVM's native
-// CreateSelect, which handles arbitrary widths correctly.
+// width (e.g., <16 x i8> mask with <16 x i8> data, or <4 x i32> mask with
+// <4 x f32> data). For mismatched widths we fall back to truncating the mask
+// to <N x i1> and using LLVM's native CreateSelect.
 func (b *builder) spmdMaskSelect(mask, trueVal, falseVal llvm.Value) llvm.Value {
 	if !b.spmdIsWASM() {
 		return b.CreateSelect(mask, trueVal, falseVal, "")
 	}
 
 	valType := trueVal.Type()
-	maskType := mask.Type() // <N x i32>
+	maskType := mask.Type() // e.g., <4 x i32>, <8 x i16>, or <16 x i8>
 
 	// Efficient bitwise select only when mask and data have equal total bit width
-	// (e.g., <4 x i32> mask with <4 x i32> or <4 x f32> data).
-	// For mismatched widths (e.g., <2 x i32> mask with <2 x i64> data),
-	// fall back to trunc+CreateSelect which LLVM handles correctly.
+	// (e.g., <16 x i8> mask with <16 x i8> data, <4 x i32> mask with <4 x f32> data).
+	// For mismatched widths, fall back to trunc+CreateSelect which LLVM handles correctly.
 	if b.targetData.TypeAllocSize(maskType) == b.targetData.TypeAllocSize(valType) {
 		var aBits, bBits llvm.Value
 		needBitcast := valType != maskType
@@ -3069,7 +3120,7 @@ func (b *builder) detectSPMDForLoops() map[int]*spmdForLoopInfo {
 
 			elemType := b.getLLVMType(iterPhi.Type())
 			laneCount := b.spmdLaneCount(elemType)
-			maskType := llvm.VectorType(b.spmdMaskElemType(), laneCount)
+			maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
 
 			// Create break mask alloca at function entry.
 			savedBlock := b.GetInsertBlock()
@@ -3147,7 +3198,7 @@ func (b *builder) detectSPMDForLoops() map[int]*spmdForLoopInfo {
 
 		// Create alloca for the break mask at the function entry block.
 		// We'll initialize it to all-false later in createFunction().
-		maskType := llvm.VectorType(b.spmdMaskElemType(), laneCount)
+		maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
 
 		// Save current insert point, create alloca at function entry.
 		savedBlock := b.GetInsertBlock()

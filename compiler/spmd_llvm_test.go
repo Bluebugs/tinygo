@@ -547,7 +547,7 @@ func TestSPMDVectorAnyTrue(t *testing.T) {
 	// all-ones (0xFFFFFFFF) means active and all-zeros means inactive.
 	// On WASM, spmdVectorAnyTrue uses the native @llvm.wasm.anytrue intrinsic
 	// (v128.any_true) and still returns a scalar i1.
-	maskElemType := c.spmdMaskElemType() // i32 on WASM
+	maskElemType := c.spmdMaskElemType(4) // i32 on WASM for 4 lanes
 	allOnes := llvm.ConstAllOnes(maskElemType)
 	allZeros := llvm.ConstNull(maskElemType)
 
@@ -781,8 +781,8 @@ func TestSPMDMaskType(t *testing.T) {
 				return types.NewSignatureType(nil, nil, nil, params, nil, false)
 			},
 			wantMaskType:  true,
-			wantLaneCount: 16, // 128 bits / 8 bits = 16 lanes
-			wantElemWidth: 32, // i32 for WASM mask
+			wantLaneCount: 16,                // 128 bits / 8 bits = 16 lanes
+			wantElemWidth: 128 / 16, // i8 for WASM mask at 16 lanes (128/16=8 bits)
 		},
 		{
 			name: "varying_float64_param",
@@ -793,8 +793,8 @@ func TestSPMDMaskType(t *testing.T) {
 				return types.NewSignatureType(nil, nil, nil, params, nil, false)
 			},
 			wantMaskType:  true,
-			wantLaneCount: 2, // 128 bits / 64 bits = 2 lanes
-			wantElemWidth: 32, // i32 for WASM mask
+			wantLaneCount: 2,                // 128 bits / 64 bits = 2 lanes
+			wantElemWidth: 128 / 2, // i64 for WASM mask at 2 lanes (128/2=64 bits)
 		},
 		{
 			name: "mixed_params_with_varying",
@@ -2225,7 +2225,7 @@ func TestSPMDVectorAllTrue(t *testing.T) {
 	// all-ones (0xFFFFFFFF) means active and all-zeros means inactive.
 	// On WASM, spmdVectorAllTrue uses the native @llvm.wasm.alltrue intrinsic
 	// (i32x4.all_true) and still returns a scalar i1.
-	maskType := llvm.VectorType(c.spmdMaskElemType(), 4) // <4 x i32> on WASM
+	maskType := llvm.VectorType(c.spmdMaskElemType(4), 4) // <4 x i32> on WASM for 4 lanes
 
 	t.Run("all_true", func(t *testing.T) {
 		allOnes := llvm.ConstAllOnes(maskType)
@@ -2254,7 +2254,7 @@ func TestSPMDCallMaskNarrowedByVaryingIf(t *testing.T) {
 
 	// Set up SPMD function body context.
 	// The test context is WASM, so masks use the <N x i32> format.
-	maskType := llvm.VectorType(c.spmdMaskElemType(), 4) // <4 x i32> on WASM
+	maskType := llvm.VectorType(c.spmdMaskElemType(4), 4) // <4 x i32> on WASM for 4 lanes
 	entryMask := llvm.ConstAllOnes(maskType)
 	b.spmdEntryMask = entryMask
 	b.spmdMaskStack = []llvm.Value{entryMask}
@@ -2288,21 +2288,42 @@ func TestSPMDIsWASM(t *testing.T) {
 	}
 }
 
-// TestSPMDMaskElemType verifies that the mask element type is i32 on WASM.
+// TestSPMDMaskElemType verifies that the mask element type is lane-count-dependent on WASM.
+// For 4 lanes (i32 elements): mask elem = i32 (128/4 = 32 bits).
+// For 16 lanes (i8 elements): mask elem = i8 (128/16 = 8 bits).
 func TestSPMDMaskElemType(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
 
-	elemType := c.spmdMaskElemType()
-	if elemType.TypeKind() != llvm.IntegerTypeKind {
-		t.Errorf("spmdMaskElemType() kind = %v, want IntegerTypeKind", elemType.TypeKind())
+	// 4-lane test: int elements → i32 mask elem (128/4 = 32 bits)
+	elemType4 := c.spmdMaskElemType(4)
+	if elemType4.TypeKind() != llvm.IntegerTypeKind {
+		t.Errorf("spmdMaskElemType(4) kind = %v, want IntegerTypeKind", elemType4.TypeKind())
 	}
-	if elemType.IntTypeWidth() != 32 {
-		t.Errorf("spmdMaskElemType() width = %d, want 32 (i32 on WASM)", elemType.IntTypeWidth())
+	if elemType4.IntTypeWidth() != 32 {
+		t.Errorf("spmdMaskElemType(4) width = %d, want 32 (i32 on WASM for 4 lanes)", elemType4.IntTypeWidth())
+	}
+
+	// 8-lane test: int16 elements → i16 mask elem (128/8 = 16 bits)
+	elemType8 := c.spmdMaskElemType(8)
+	if elemType8.TypeKind() != llvm.IntegerTypeKind {
+		t.Errorf("spmdMaskElemType(8) kind = %v, want IntegerTypeKind", elemType8.TypeKind())
+	}
+	if elemType8.IntTypeWidth() != 16 {
+		t.Errorf("spmdMaskElemType(8) width = %d, want 16 (i16 on WASM for 8 lanes)", elemType8.IntTypeWidth())
+	}
+
+	// 16-lane test: byte elements → i8 mask elem (128/16 = 8 bits)
+	elemType16 := c.spmdMaskElemType(16)
+	if elemType16.TypeKind() != llvm.IntegerTypeKind {
+		t.Errorf("spmdMaskElemType(16) kind = %v, want IntegerTypeKind", elemType16.TypeKind())
+	}
+	if elemType16.IntTypeWidth() != 8 {
+		t.Errorf("spmdMaskElemType(16) width = %d, want 8 (i8 on WASM for 16 lanes)", elemType16.IntTypeWidth())
 	}
 }
 
-// TestSPMDWrapMask verifies that spmdWrapMask sign-extends <N x i1> to <N x i32> on WASM.
+// TestSPMDWrapMask verifies that spmdWrapMask sign-extends <N x i1> to the WASM mask type.
 func TestSPMDWrapMask(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
