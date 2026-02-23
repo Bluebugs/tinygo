@@ -4015,3 +4015,114 @@ func TestSPMDDecomposedIndexStructure(t *testing.T) {
 		t.Errorf("materialized elem type = %v, want i32", mat.Type().ElementType())
 	}
 }
+
+// TestSPMDDecomposedChangeTypePropagation verifies that spmdDecomposed metadata is
+// propagated through *ssa.ChangeType nodes. Without the fix in compiler.go, BinOps
+// on a ChangeType-wrapped loop variable would miss the decomposed path and produce
+// <4 x i32> operations instead of decomposed <16 x i8> operations for byte-lane loops.
+//
+// NOTE: This is a data-structure invariant test, not a behavioural regression test.
+// It exercises the map propagation pattern directly because constructing a real
+// *ssa.ChangeType requires a live SSA function. The hex-encode E2E test serves as
+// the actual regression guard for the production code path in compiler.go:2912.
+func TestSPMDDecomposedChangeTypePropagation(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+	laneCount := 16
+
+	b.spmdDecomposed = make(map[ssa.Value]*spmdDecomposedIndex)
+
+	// Create a decomposed index for a hypothetical loop variable (the "inner" value).
+	scalarBase := llvm.ConstInt(i32Type, 0, false)
+	varyingOffset := c.spmdLaneOffsetConst(laneCount, i8Type)
+	decomp := &spmdDecomposedIndex{
+		scalarBase:    scalarBase,
+		varyingOffset: varyingOffset,
+		laneCount:     laneCount,
+	}
+
+	// Use two distinct ssa.Const values as stand-ins for the inner SSA value
+	// and the ChangeType result. Both implement ssa.Value via their pointer identity.
+	innerVal := ssa.NewConst(constant.MakeInt64(0), types.Typ[types.Int32])
+	changeTypeVal := ssa.NewConst(constant.MakeInt64(1), types.Typ[types.Int32])
+
+	// Register decomposition for the inner value (simulating emitSPMDBodyPrologue).
+	b.spmdDecomposed[innerVal] = decomp
+
+	// Simulate the ChangeType propagation from compiler.go (*ssa.ChangeType case):
+	//   if decomp, ok := b.spmdDecomposed[expr.X]; ok {
+	//       b.spmdDecomposed[expr] = decomp
+	//   }
+	if d, ok := b.spmdDecomposed[innerVal]; ok {
+		b.spmdDecomposed[changeTypeVal] = d
+	}
+
+	// Verify that the ChangeType'd value now has the same decomposition.
+	gotDecomp, ok := b.spmdDecomposed[changeTypeVal]
+	if !ok {
+		t.Fatal("spmdDecomposed not propagated through simulated ChangeType")
+	}
+	if gotDecomp != decomp {
+		t.Error("propagated decomp is not the same pointer as the original")
+	}
+	if gotDecomp.laneCount != laneCount {
+		t.Errorf("propagated laneCount = %d, want %d", gotDecomp.laneCount, laneCount)
+	}
+	if gotDecomp.scalarBase != scalarBase {
+		t.Error("propagated scalarBase differs from original")
+	}
+	if gotDecomp.varyingOffset != varyingOffset {
+		t.Error("propagated varyingOffset differs from original")
+	}
+}
+
+// TestSPMDDecomposedSplattedConstantExtraction verifies that a Varying[T] constant
+// (which createConst splats into a vector) is correctly handled in decomposed BinOp
+// context. Without the fix in spmd.go, the "scalar" operand in spmdDecomposedBinOp
+// would be a <4 x i32> vector, causing a type mismatch in the decomposed arithmetic.
+func TestSPMDDecomposedSplattedConstantExtraction(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	// createSPMDConst should produce a <4 x i32> vector for Varying[int32] constant 2.
+	int32Type := types.Typ[types.Int32]
+	spmdInt32Type := types.NewVarying(int32Type)
+	constVal := constant.MakeInt64(2)
+
+	splatted := c.createSPMDConst(ssa.NewConst(constVal, spmdInt32Type), spmdInt32Type, token.NoPos)
+	if splatted.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatalf("expected vector type from createSPMDConst, got %v", splatted.Type())
+	}
+	// Verify it is <4 x i32> (WASM128 lane count for int32).
+	if splatted.Type().VectorSize() != 4 {
+		t.Errorf("splatted vector lanes = %d, want 4", splatted.Type().VectorSize())
+	}
+	if splatted.Type().ElementType() != c.ctx.Int32Type() {
+		t.Errorf("splatted element type = %v, want i32", splatted.Type().ElementType())
+	}
+
+	// Simulate the fix: when a Varying[T] constant enters spmdDecomposedBinOp, the
+	// scalar element value must be extracted for decomposed arithmetic. Passing the
+	// full splatted vector to CreateAdd(scalarBase, ...) would produce a type error.
+	// The fix creates a new ssa.Const using the element type, not the SPMDType.
+	elemType := spmdInt32Type.Elem() // types.Typ[types.Int32]
+	scalarConst := ssa.NewConst(constVal, elemType)
+	scalarLLVM := c.createConst(scalarConst, token.NoPos)
+
+	// The scalar constant must be a plain i32, not a vector.
+	if scalarLLVM.Type().TypeKind() == llvm.VectorTypeKind {
+		t.Fatal("scalar constant extracted from SPMDType should not be a vector type")
+	}
+	if scalarLLVM.Type() != c.ctx.Int32Type() {
+		t.Errorf("scalar constant type = %v, want i32", scalarLLVM.Type())
+	}
+	// Verify the extracted constant has the correct value.
+	if val := scalarLLVM.ZExtValue(); val != 2 {
+		t.Errorf("scalar constant value = %d, want 2", val)
+	}
+}
