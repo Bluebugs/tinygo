@@ -3609,3 +3609,144 @@ func TestSPMDVectorIndexArrayLLVM(t *testing.T) {
 		})
 	}
 }
+
+func TestSPMDSwizzleDetection(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+
+	// Test spmdSwizzlePrepareIndex with various lane counts and index widths.
+	tests := []struct {
+		name      string
+		laneCount int
+		indexType llvm.Type
+		wantWidth int // expected result vector size (always 16)
+	}{
+		{"16xi8_direct", 16, i8Type, 16},
+		{"4xi32_trunc_pad", 4, c.ctx.Int32Type(), 16},
+		{"8xi16_trunc_pad", 8, c.ctx.Int16Type(), 16},
+		{"4xi8_pad", 4, i8Type, 16},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build vector index
+			vecType := llvm.VectorType(tt.indexType, tt.laneCount)
+			indexVec := llvm.Undef(vecType)
+			for i := 0; i < tt.laneCount; i++ {
+				indexVec = b.CreateInsertElement(indexVec, llvm.ConstInt(tt.indexType, uint64(i), false),
+					llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false), "")
+			}
+
+			result := b.spmdSwizzlePrepareIndex(indexVec, tt.laneCount)
+			if result.Type().VectorSize() != tt.wantWidth {
+				t.Errorf("vector size = %d, want %d", result.Type().VectorSize(), tt.wantWidth)
+			}
+			if result.Type().ElementType() != i8Type {
+				t.Errorf("element type should be i8")
+			}
+		})
+	}
+}
+
+func TestSPMDWasmSwizzle(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+
+	tests := []struct {
+		name       string
+		tableBytes []byte
+		laneCount  int
+		indexType  llvm.Type
+		wantLanes  int // expected result vector lanes
+	}{
+		{"16byte_table_16lanes", []byte("0123456789abcdef"), 16, i8Type, 16},
+		{"16byte_table_4lanes", []byte("0123456789abcdef"), 4, c.ctx.Int32Type(), 4},
+		{"8byte_table_padded", []byte("01234567"), 4, i8Type, 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build vector index
+			vecType := llvm.VectorType(tt.indexType, tt.laneCount)
+			indexVec := llvm.Undef(vecType)
+			for i := 0; i < tt.laneCount; i++ {
+				indexVec = b.CreateInsertElement(indexVec, llvm.ConstInt(tt.indexType, uint64(i%len(tt.tableBytes)), false),
+					llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false), "")
+			}
+
+			result := b.spmdWasmSwizzle(tt.tableBytes, indexVec, tt.laneCount)
+
+			if result.Type().VectorSize() != tt.wantLanes {
+				t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), tt.wantLanes)
+			}
+			if result.Type().ElementType() != i8Type {
+				t.Errorf("result element type should be i8")
+			}
+		})
+	}
+}
+
+func TestSPMDSwizzleRejectsNonWASM(t *testing.T) {
+	// Create a non-WASM target context.
+	target, err := llvm.GetTargetFromTriple("x86_64-unknown-linux-gnu")
+	if err != nil {
+		t.Skipf("x86_64 target not available: %v", err)
+	}
+	machine := target.CreateTargetMachine("x86_64-unknown-linux-gnu", "", "",
+		llvm.CodeGenLevelDefault, llvm.RelocDefault, llvm.CodeModelDefault)
+	config := &Config{
+		Triple:   "x86_64-unknown-linux-gnu",
+		Features: "",
+	}
+	c := newCompilerContext("test", machine, config, false)
+	defer c.dispose()
+
+	if c.spmdIsWASM() {
+		t.Fatal("expected non-WASM context")
+	}
+}
+
+func TestSPMDWasmSwizzleHextableShape(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	if !c.spmdIsWASM() {
+		t.Fatal("expected WASM context for swizzle test")
+	}
+
+	// Simulate: const hextable = "0123456789abcdef"
+	strBytes := "0123456789abcdef"
+	if len(strBytes) > 16 {
+		t.Fatal("string too long for swizzle")
+	}
+
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Build a <4 x i32> index vector [0, 1, 2, 3]
+	i32Type := c.ctx.Int32Type()
+	vecType := llvm.VectorType(i32Type, 4)
+	indexVec := llvm.Undef(vecType)
+	for i := 0; i < 4; i++ {
+		indexVec = b.CreateInsertElement(indexVec, llvm.ConstInt(i32Type, uint64(i), false),
+			llvm.ConstInt(i32Type, uint64(i), false), "")
+	}
+
+	result := b.spmdWasmSwizzle([]byte(strBytes), indexVec, 4)
+
+	// Result should be <4 x i8> (narrowed from <16 x i8>)
+	if result.Type().VectorSize() != 4 {
+		t.Errorf("result lanes = %d, want 4", result.Type().VectorSize())
+	}
+	if result.Type().ElementType() != c.ctx.Int8Type() {
+		t.Error("result element type should be i8")
+	}
+}

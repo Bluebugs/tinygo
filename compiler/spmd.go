@@ -6,6 +6,7 @@ package compiler
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"sort"
@@ -3514,6 +3515,18 @@ func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.
 		b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
 	}
 
+	// SPMD: on WASM, use i8x16.swizzle for const string lookups of <=16 bytes.
+	if b.spmdIsWASM() {
+		if constVal, ok := expr.X.(*ssa.Const); ok {
+			if constVal.Value != nil && constVal.Value.Kind() == constant.String {
+				strVal := constant.StringVal(constVal.Value)
+				if len(strVal) <= 16 {
+					return b.spmdWasmSwizzle([]byte(strVal), index, laneCount), nil
+				}
+			}
+		}
+	}
+
 	// Per-lane: GEP, load, insert into result vector.
 	bufElemType := b.ctx.Int8Type()
 	result := llvm.Undef(llvm.VectorType(bufElemType, laneCount))
@@ -3600,3 +3613,80 @@ func (b *builder) spmdExtendIndex(value llvm.Value, goType types.Type, targetTyp
 	return b.CreateSExt(value, targetType, "")
 }
 
+// spmdWasmSwizzle generates a WASM i8x16.swizzle instruction to look up bytes
+// from a constant table using a vector of indices. The table is zero-padded to 16 bytes.
+// For lane counts < 16, the result is narrowed using a shuffle extract.
+func (b *builder) spmdWasmSwizzle(tableBytes []byte, index llvm.Value, laneCount int) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+	v16i8 := llvm.VectorType(i8Type, 16)
+
+	// Build <16 x i8> constant from table bytes, zero-pad if < 16.
+	tableElems := make([]llvm.Value, 16)
+	for i := 0; i < 16; i++ {
+		if i < len(tableBytes) {
+			tableElems[i] = llvm.ConstInt(i8Type, uint64(tableBytes[i]), false)
+		} else {
+			tableElems[i] = llvm.ConstInt(i8Type, 0, false)
+		}
+	}
+	tableVec := llvm.ConstVector(tableElems, false)
+
+	// Prepare index as <16 x i8>.
+	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount)
+
+	// Call @llvm.wasm.swizzle(<16 x i8>, <16 x i8>).
+	// Note: the intrinsic has no type suffix — always @llvm.wasm.swizzle.
+	intrinsicName := "llvm.wasm.swizzle"
+	fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	result := b.createCall(fnType, fn, []llvm.Value{tableVec, idxVec}, "spmd.swizzle")
+
+	// If laneCount < 16, extract the first laneCount lanes.
+	if laneCount < 16 {
+		maskElems := make([]llvm.Value, laneCount)
+		for i := 0; i < laneCount; i++ {
+			maskElems[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+		}
+		maskVec := llvm.ConstVector(maskElems, false)
+		result = b.CreateShuffleVector(result, llvm.Undef(v16i8), maskVec, "")
+	}
+
+	return result
+}
+
+// spmdSwizzlePrepareIndex converts a vector index to <16 x i8> for i8x16.swizzle.
+// If the index element type is wider than i8 (e.g., <4 x i32>), it is truncated to
+// <N x i8>. If N < 16, the vector is padded to 16 lanes using a shuffle; the padding
+// lanes receive undef values from the second shuffle operand, which are safe because
+// spmdWasmSwizzle extracts only the first laneCount lanes from the swizzle result.
+func (b *builder) spmdSwizzlePrepareIndex(index llvm.Value, laneCount int) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+
+	// Truncate to i8 if wider (safe since table indices are 0-15).
+	elemWidth := index.Type().ElementType().IntTypeWidth()
+	if elemWidth > 8 {
+		narrowType := llvm.VectorType(i8Type, laneCount)
+		index = b.CreateTrunc(index, narrowType, "")
+	}
+
+	if laneCount == 16 {
+		return index
+	}
+
+	// Pad to 16 lanes using a shuffle. Padding lanes pick from the undef second operand
+	// and produce undef values; the swizzle result for those lanes is discarded by the
+	// extract shuffle in spmdWasmSwizzle, so undef padding is safe.
+	maskElems := make([]llvm.Value, 16)
+	for i := 0; i < 16; i++ {
+		if i < laneCount {
+			maskElems[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+		} else {
+			maskElems[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(laneCount), false) // pick from the undef second operand
+		}
+	}
+	maskVec := llvm.ConstVector(maskElems, false)
+	return b.CreateShuffleVector(index, llvm.Undef(llvm.VectorType(i8Type, laneCount)), maskVec, "")
+}
