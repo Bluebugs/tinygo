@@ -1747,7 +1747,15 @@ func (b *builder) createFunction() {
 					// We can't put it in the merge block (phi's block) because the then/else
 					// values are defined in blocks that come after the merge in the CFG,
 					// and LLVM requires instructions to dominate all their uses.
-					survivingBB := override.llvmBlock
+					// Re-read the exit block at resolution time: createRuntimeAssert may have
+					// inserted bounds-check blocks after the override was registered, changing
+					// blockInfo[...].exit from the value captured at registration time.
+					var survivingBB llvm.BasicBlock
+					if override.info.hasElse {
+						survivingBB = b.blockInfo[block.Preds[override.elseEdgeIdx].Index].exit
+					} else {
+						survivingBB = b.blockInfo[block.Preds[override.thenEdgeIdx].Index].exit
+					}
 					term := survivingBB.LastInstruction()
 					if !term.IsNil() {
 						b.SetInsertPointBefore(term)
@@ -2899,6 +2907,11 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		if b.spmdLoopState != nil {
 			if loop, ok := b.spmdLoopState.activeLoops[expr.X]; ok {
 				b.spmdLoopState.activeLoops[expr] = loop
+			}
+		}
+		if b.spmdDecomposed != nil {
+			if decomp, ok := b.spmdDecomposed[expr.X]; ok {
+				b.spmdDecomposed[expr] = decomp
 			}
 		}
 		return changeTypeResult, nil

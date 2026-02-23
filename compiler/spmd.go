@@ -977,7 +977,9 @@ type spmdCondChain struct {
 //     only one LLVM predecessor remains. The original "redirected" edge no longer
 //     has a live LLVM predecessor, so a plain phi would be invalid.
 //     skipEdgeIdx is the edge whose LLVM predecessor was redirected away.
-//     elseEdgeIdx is the surviving edge; its llvmBlock carries the select result.
+//     elseEdgeIdx is the surviving edge; phi resolution reads blockInfo[...].exit
+//     at resolution time to get the correct exit block (which may differ from the
+//     block at registration time due to createRuntimeAssert inserting bounds checks).
 //
 // The select is always created during phi resolution (not phi creation) to avoid
 // circular dependencies when edge values reference the phi itself.
@@ -987,7 +989,6 @@ type spmdMergePhiOverride struct {
 	thenEdgeIdx  int            // phi edge index for the then-branch value
 	elseEdgeIdx  int            // phi edge index for the else-branch value; for 2-edge cases also the surviving LLVM pred
 	info         *spmdVaryingIf // varying-if info (holds the vector condition)
-	llvmBlock    llvm.BasicBlock // LLVM exit block of the surviving predecessor
 }
 
 // spmdMaskTransition describes how the execution mask changes at a block boundary.
@@ -1890,17 +1891,14 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 	llvmPhi := b.CreatePHI(phiType, "")
 	b.phis = append(b.phis, phiNode{phi, llvmPhi})
 
-	// Determine the surviving LLVM exit block and which SSA edge to skip.
-	var survivingLLVMBlock llvm.BasicBlock
+	// Determine which SSA edge to skip (the one whose LLVM predecessor was redirected away).
+	// The surviving LLVM exit block is read from blockInfo at phi resolution time (not here)
+	// because createRuntimeAssert may insert bounds-check blocks after this point.
 	var skipEdgeIdx int
 	if !info.hasElse {
-		// ifBlock edge is redirected away; thenExit is the only LLVM pred.
-		skipEdgeIdx = elseIdx // elseIdx == ifBlock edge
-		survivingLLVMBlock = b.blockInfo[preds[thenIdx].Index].exit
+		skipEdgeIdx = elseIdx // ifBlock edge is redirected away; thenExit is the only LLVM pred.
 	} else {
-		// thenExit was redirected to elseEntry; elseExit is the only LLVM pred.
-		skipEdgeIdx = thenIdx
-		survivingLLVMBlock = b.blockInfo[preds[elseIdx].Index].exit
+		skipEdgeIdx = thenIdx // thenExit was redirected to elseEntry; elseExit is the only LLVM pred.
 	}
 
 	b.spmdMergePhiOverrides[phi] = spmdMergePhiOverride{
@@ -1908,7 +1906,6 @@ func (b *builder) spmdCreateMergeSelect(phi *ssa.Phi) (llvm.Value, bool) {
 		thenEdgeIdx: thenIdx,
 		elseEdgeIdx: elseIdx,
 		info:        info,
-		llvmBlock:   survivingLLVMBlock,
 	}
 
 	return llvmPhi, true
@@ -1953,14 +1950,13 @@ func (b *builder) spmdCreateMultiPredMergeSelect(phi *ssa.Phi, info *spmdVarying
 
 	// Record override: during phi resolution, skip the then-edge (it has no LLVM
 	// predecessor after linearization) and replace the else-edge with
-	// select(cond, thenVal, elseVal). Use the else-block's LLVM exit as the
-	// predecessor because after linearization if.then jumps to if.else.
+	// select(cond, thenVal, elseVal). The else-block's LLVM exit is read from
+	// blockInfo at resolution time (not here) to handle bounds-check block insertion.
 	b.spmdMergePhiOverrides[phi] = spmdMergePhiOverride{
 		skipEdgeIdx: thenIdx,
 		thenEdgeIdx: thenIdx,
 		elseEdgeIdx: elseIdx,
 		info:        info,
-		llvmBlock:   b.blockInfo[preds[elseIdx].Index].exit,
 	}
 
 	return llvmPhi, true
@@ -2042,7 +2038,6 @@ func (b *builder) spmdCreateChainMergeSelect(phi *ssa.Phi, info *spmdVaryingIf) 
 		thenEdgeIdx:  thenIdx,
 		elseEdgeIdx:  defaultIdx,
 		info:         info,
-		llvmBlock:    b.blockInfo[preds[thenIdx].Index].exit,
 	}
 
 	return llvmPhi, true
@@ -3143,9 +3138,23 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 	// Only decompose when the other operand is a scalar constant or uniform value.
 	scalarLLVM := b.getValue(scalarSSA, getPos(expr))
 	if scalarLLVM.Type().TypeKind() == llvm.VectorTypeKind {
-		// Both sides are varying; fall through to materialization below.
-		materialized := b.spmdMaterializeDecomposed(decomp)
-		return materialized, false
+		// The scalar operand was splatted into a vector (e.g., a constant of
+		// Varying[int] type creates <4 x i32>). If the SSA value is a constant,
+		// extract the element value to use as the scalar for decomposed arithmetic.
+		if constSSA, ok := scalarSSA.(*ssa.Const); ok {
+			if spmdT, ok := constSSA.Type().(*types.SPMDType); ok && spmdT.IsVarying() {
+				scalarConst := ssa.NewConst(constSSA.Value, spmdT.Elem())
+				scalarLLVM = b.createConst(scalarConst, getPos(expr))
+			} else {
+				// Both sides are truly varying; fall through to materialization.
+				materialized := b.spmdMaterializeDecomposed(decomp)
+				return materialized, false
+			}
+		} else {
+			// Both sides are varying; fall through to materialization below.
+			materialized := b.spmdMaterializeDecomposed(decomp)
+			return materialized, false
+		}
 	}
 
 	switch expr.Op {
