@@ -503,6 +503,13 @@ func (b *builder) spmdComputeAlignedBound(bound llvm.Value, laneCount int) llvm.
 	return b.CreateAnd(bound, mask, "spmd.aligned.bound")
 }
 
+// spmdPeeledMainMask returns a ConstAllOnes mask for the main (unmasked) loop phase.
+// When LLVM sees masked.store/load with this mask, it optimizes to plain store/load.
+func (b *builder) spmdPeeledMainMask(laneCount int) llvm.Value {
+	maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
+	return llvm.ConstAllOnes(maskType)
+}
+
 // spmdCreateTailBlocks creates the LLVM basic blocks needed for the tail body
 // of a peeled loop. This includes a tail.check block and a .tail version of
 // each body and interior block. Loop blocks are excluded since the tail does
@@ -910,6 +917,14 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 			}
 		}
 
+		// SPMD loop peeling: in main phase, use all-ones mask instead of computing tail mask.
+		if b.spmdPeeledLoops != nil {
+			if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseMain {
+				loop.tailMask = b.spmdPeeledMainMask(loop.laneCount)
+				return
+			}
+		}
+
 		// Compute tail mask using <N x i8> comparison to stay within 128-bit registers.
 		// diff = bound - base (scalar i32); clamp to [0, laneCount]; truncate to i8.
 		// Then compare: offset < clamp(diff) using unsigned <N x i8> comparison.
@@ -956,6 +971,15 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 
 	// Compute lane indices: <iter, iter+1, iter+2, ..., iter+laneCount-1>.
 	laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
+
+	// SPMD loop peeling: in main phase, use all-ones mask instead of computing tail mask.
+	if b.spmdPeeledLoops != nil {
+		if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseMain {
+			loop.laneIndices = laneIndices
+			loop.tailMask = b.spmdPeeledMainMask(loop.laneCount)
+			return
+		}
+	}
 
 	// Get the bound value and splat it.
 	boundScalar := b.getValue(loop.boundValue, token.NoPos)

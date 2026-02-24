@@ -4942,3 +4942,32 @@ func TestSPMDShiftedLoadCodegen(t *testing.T) {
 		}
 	})
 }
+
+func TestSPMDPeeledMainMask(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+
+	tests := []struct {
+		name      string
+		laneCount int
+	}{
+		{"4_lanes", 4},
+		{"16_lanes", 16},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mask := b.spmdPeeledMainMask(tt.laneCount)
+			if mask.IsNil() {
+				t.Fatal("spmdPeeledMainMask returned nil")
+			}
+			// Verify it matches ConstAllOnes of the expected type.
+			maskType := llvm.VectorType(c.spmdMaskElemType(tt.laneCount), tt.laneCount)
+			expected := llvm.ConstAllOnes(maskType)
+			if mask.Type() != expected.Type() {
+				t.Errorf("mask type mismatch: got %v, want %v", mask.Type(), expected.Type())
+			}
+		})
+	}
+}
