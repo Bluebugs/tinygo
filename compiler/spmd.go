@@ -1013,6 +1013,19 @@ type spmdContiguousInfo struct {
 	loop      *spmdActiveLoop // owning loop (for lane count)
 }
 
+// spmdShiftedLoadInfo describes a gather that can be optimized to a smaller
+// contiguous load + shuffle expansion. For pattern s[(base + iter) >> shift]:
+//   - The effective indices are: (base + [0,1,...,N-1]) >> shift
+//   - uniqueCount = number of unique indices = ceil(laneCount / (1<<shift))
+//   - shuffleMask maps each lane to its position in the loaded vector
+type spmdShiftedLoadInfo struct {
+	scalarPtr   llvm.Value      // scalar GEP to s[base >> shift]
+	uniqueCount int             // number of unique elements to load
+	shuffleMask []int           // lane i -> index in loaded vector
+	elemType    llvm.Type       // element type being loaded
+	loop        *spmdActiveLoop // owning SPMD loop
+}
+
 // spmdCoalescedStore represents a pair of stores in then/else branches of a varying
 // if/else that write to the same destination. Instead of two masked stores, codegen
 // emits select(cond, thenVal, elseVal) + one store with the parent mask.
@@ -3210,6 +3223,116 @@ func (b *builder) spmdContiguousIndexAddrCore(expr *ssa.IndexAddr, loop *spmdAct
 		b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop}
 	}
 	return ptr, nil
+}
+
+// spmdAnalyzeShiftedIndex checks if an SSA index value is a right-shifted
+// contiguous expression: (base + iter) >> const_k, where k > 0. This pattern
+// means adjacent lanes access overlapping elements (e.g., src[i>>1] loads
+// only laneCount>>k unique values). Returns info for load+shuffle optimization.
+func (b *builder) spmdAnalyzeShiftedIndex(index ssa.Value) (*spmdShiftedLoadInfo, bool) {
+	binop, ok := index.(*ssa.BinOp)
+	if !ok || binop.Op != token.SHR {
+		return nil, false
+	}
+
+	shiftAmt, ok := ssaConstUint64(binop.Y)
+	if !ok || shiftAmt == 0 {
+		return nil, false
+	}
+
+	// Unwrap ChangeType on the shifted operand (e.g., ChangeType(incr) in
+	// range-over-slice patterns where the iter is wrapped to SPMDType).
+	shiftedOperand := binop.X
+	for {
+		if ct, ok := shiftedOperand.(*ssa.ChangeType); ok {
+			shiftedOperand = ct.X
+		} else {
+			break
+		}
+	}
+
+	// The shifted operand (after unwrapping) must be a direct loop iterator.
+	// We only accept the direct phi match (not scalar+iter ADD patterns) because
+	// the fixed shuffle mask {0,0,1,1,...} assumes the scalar base is always
+	// aligned to 2^shiftAmt. This is guaranteed for direct loop iterators
+	// (incremented by laneCount >= 2^shiftAmt) but not for arbitrary offsets.
+	loop, ok := b.spmdLoopState.activeLoops[shiftedOperand]
+	if !ok {
+		return nil, false
+	}
+
+	laneCount := loop.laneCount
+
+	// Guard: shift amount must be less than the scalar integer width to avoid
+	// LLVM poison values from oversized lshr.
+	scalarBase := loop.scalarIterVal
+	if scalarBase.IsNil() || shiftAmt >= uint64(scalarBase.Type().IntTypeWidth()) {
+		return nil, false
+	}
+
+	// Build shuffle mask: lane i maps to i >> shiftAmt.
+	shuffleMask := make([]int, laneCount)
+	for i := 0; i < laneCount; i++ {
+		shuffleMask[i] = i >> shiftAmt
+	}
+	uniqueCount := shuffleMask[laneCount-1] + 1
+
+	// Compute the shifted scalar base pointer index: scalarBase >> shiftAmt.
+	shiftConst := llvm.ConstInt(scalarBase.Type(), shiftAmt, false)
+	shiftedBase := b.CreateLShr(scalarBase, shiftConst, "shifted.base.idx")
+
+	return &spmdShiftedLoadInfo{
+		scalarPtr:   shiftedBase, // will be completed with GEP in IndexAddr handler
+		uniqueCount: uniqueCount,
+		shuffleMask: shuffleMask,
+		loop:        loop,
+	}, true
+}
+
+// spmdShiftedLoad generates a narrow contiguous load + shufflevector expansion
+// for a shifted-index gather pattern. For uniqueCount==1, emits scalar load + splat.
+// For uniqueCount < laneCount, emits a narrow vector load + shuffle duplication.
+// The execution mask is applied via select on the final expanded result.
+func (b *builder) spmdShiftedLoad(info *spmdShiftedLoadInfo, mask llvm.Value) llvm.Value {
+	laneCount := info.loop.laneCount
+	elemType := info.elemType
+
+	if info.uniqueCount == 1 {
+		// Broadcast: load single scalar element, splat to all lanes.
+		scalar := b.CreateLoad(elemType, info.scalarPtr, "shifted.scalar")
+		vecType := llvm.VectorType(elemType, laneCount)
+		result := b.splatScalar(scalar, vecType)
+		return b.spmdShiftedApplyMask(result, mask)
+	}
+
+	// General case: load uniqueCount elements as a narrow vector, then shuffle.
+	loadVecType := llvm.VectorType(elemType, info.uniqueCount)
+	loaded := b.CreateLoad(loadVecType, info.scalarPtr, "shifted.narrow")
+
+	// Build the shuffle mask constant vector.
+	maskElems := make([]llvm.Value, laneCount)
+	i32Type := b.ctx.Int32Type()
+	for i := 0; i < laneCount; i++ {
+		maskElems[i] = llvm.ConstInt(i32Type, uint64(info.shuffleMask[i]), false)
+	}
+	shuffleMaskVec := llvm.ConstVector(maskElems, false)
+
+	// shufflevector expands the narrow loaded vector to full lane width.
+	undef := llvm.Undef(loadVecType)
+	result := b.CreateShuffleVector(loaded, undef, shuffleMaskVec, "shifted.expand")
+
+	return b.spmdShiftedApplyMask(result, mask)
+}
+
+// spmdShiftedApplyMask applies the execution mask to a shifted load result.
+// When the mask is not all-ones, emits select(mask, result, zeroinitializer).
+func (b *builder) spmdShiftedApplyMask(result, mask llvm.Value) llvm.Value {
+	if mask.IsNil() {
+		return result
+	}
+	// For non-trivial masks, use select(mask, result, zero).
+	// When mask is all-ones this is a no-op that LLVM optimizes away.
+	return b.spmdMaskSelect(mask, result, llvm.ConstNull(result.Type()))
 }
 
 // spmdDecomposedBinOp handles a BinOp where one operand is a decomposed index

@@ -4588,3 +4588,283 @@ func TestSPMDIndexMaxValueTypeFallback(t *testing.T) {
 		})
 	}
 }
+
+// TestSPMDShiftedIndexDetection verifies that spmdAnalyzeShiftedIndex correctly
+// detects right-shifted contiguous index patterns like i>>1, i>>2, and rejects
+// non-matching patterns like i>>0, i+1, or non-constant shifts.
+func TestSPMDShiftedIndexDetection(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Create a fake SPMD loop with laneCount=16 (byte lanes on WASM).
+	iterPhi := &ssa.Phi{}
+	loop := &spmdActiveLoop{
+		iterPhi:       iterPhi,
+		laneCount:     16,
+		scalarIterVal: llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+	}
+	b.spmdLoopState = &spmdLoopState{
+		activeLoops: map[ssa.Value]*spmdActiveLoop{
+			iterPhi: loop,
+		},
+	}
+	b.spmdValueOverride = map[ssa.Value]llvm.Value{
+		iterPhi: llvm.Undef(llvm.VectorType(c.ctx.Int32Type(), 16)),
+	}
+
+	// Helper to create a constant SSA value with an integer value.
+	mkConst := func(val uint64) *ssa.Const {
+		cnst := ssa.NewConst(constant.MakeUint64(val), types.Typ[types.Int])
+		return cnst
+	}
+
+	tests := []struct {
+		name            string
+		index           ssa.Value
+		wantMatch       bool
+		wantUniqueCount int
+		wantShuffleLast int // expected shuffleMask[laneCount-1]
+	}{
+		{
+			name: "i>>1 (16 lanes)",
+			index: &ssa.BinOp{
+				Op: token.SHR,
+				X:  iterPhi,
+				Y:  mkConst(1),
+			},
+			wantMatch:       true,
+			wantUniqueCount: 8,
+			wantShuffleLast: 7,
+		},
+		{
+			name: "i>>2 (16 lanes)",
+			index: &ssa.BinOp{
+				Op: token.SHR,
+				X:  iterPhi,
+				Y:  mkConst(2),
+			},
+			wantMatch:       true,
+			wantUniqueCount: 4,
+			wantShuffleLast: 3,
+		},
+		{
+			name: "i>>3 (16 lanes)",
+			index: &ssa.BinOp{
+				Op: token.SHR,
+				X:  iterPhi,
+				Y:  mkConst(3),
+			},
+			wantMatch:       true,
+			wantUniqueCount: 2,
+			wantShuffleLast: 1,
+		},
+		{
+			name: "i>>4 (16 lanes, broadcast)",
+			index: &ssa.BinOp{
+				Op: token.SHR,
+				X:  iterPhi,
+				Y:  mkConst(4),
+			},
+			wantMatch:       true,
+			wantUniqueCount: 1,
+			wantShuffleLast: 0,
+		},
+		{
+			name: "i>>0 (no shift, reject)",
+			index: &ssa.BinOp{
+				Op: token.SHR,
+				X:  iterPhi,
+				Y:  mkConst(0),
+			},
+			wantMatch: false,
+		},
+		{
+			name: "i+1 (not SHR, reject)",
+			index: &ssa.BinOp{
+				Op: token.ADD,
+				X:  iterPhi,
+				Y:  mkConst(1),
+			},
+			wantMatch: false,
+		},
+		{
+			name:      "plain iter (not BinOp, reject)",
+			index:     iterPhi,
+			wantMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info, ok := b.spmdAnalyzeShiftedIndex(tt.index)
+			if ok != tt.wantMatch {
+				t.Fatalf("spmdAnalyzeShiftedIndex match = %v, want %v", ok, tt.wantMatch)
+			}
+			if !ok {
+				return
+			}
+			if info.uniqueCount != tt.wantUniqueCount {
+				t.Errorf("uniqueCount = %d, want %d", info.uniqueCount, tt.wantUniqueCount)
+			}
+			if len(info.shuffleMask) != 16 {
+				t.Fatalf("shuffleMask length = %d, want 16", len(info.shuffleMask))
+			}
+			if info.shuffleMask[15] != tt.wantShuffleLast {
+				t.Errorf("shuffleMask[15] = %d, want %d", info.shuffleMask[15], tt.wantShuffleLast)
+			}
+			// Verify shuffle mask monotonically non-decreasing.
+			for i := 1; i < 16; i++ {
+				if info.shuffleMask[i] < info.shuffleMask[i-1] {
+					t.Errorf("shuffleMask not monotonic: [%d]=%d < [%d]=%d",
+						i, info.shuffleMask[i], i-1, info.shuffleMask[i-1])
+				}
+			}
+		})
+	}
+}
+
+// TestSPMDShiftedLoadCodegen verifies that spmdShiftedLoad generates correct
+// LLVM IR: narrow vector load + shufflevector for uniqueCount > 1, and
+// scalar load + splat for uniqueCount == 1.
+func TestSPMDShiftedLoadCodegen(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+
+	t.Run("shr1_16lanes_i8", func(t *testing.T) {
+		// Simulate i>>1 with 16 byte lanes: 8 unique elements.
+		// Create an alloca to serve as the base pointer.
+		arrayType := llvm.ArrayType(i8Type, 8)
+		ptr := b.CreateAlloca(arrayType, "test.arr")
+		basePtr := b.CreateInBoundsGEP(arrayType, ptr, []llvm.Value{
+			llvm.ConstInt(i32Type, 0, false),
+			llvm.ConstInt(i32Type, 0, false),
+		}, "base")
+
+		shuffleMask := make([]int, 16)
+		for i := 0; i < 16; i++ {
+			shuffleMask[i] = i >> 1
+		}
+
+		info := &spmdShiftedLoadInfo{
+			scalarPtr:   basePtr,
+			uniqueCount: 8,
+			shuffleMask: shuffleMask,
+			elemType:    i8Type,
+			loop:        &spmdActiveLoop{laneCount: 16},
+		}
+
+		result := b.spmdShiftedLoad(info, llvm.Value{})
+		if result.IsNil() {
+			t.Fatal("spmdShiftedLoad returned nil")
+		}
+		if result.Type().TypeKind() != llvm.VectorTypeKind {
+			t.Fatalf("result type = %v, want vector", result.Type())
+		}
+		if result.Type().VectorSize() != 16 {
+			t.Errorf("result lanes = %d, want 16", result.Type().VectorSize())
+		}
+		if result.Type().ElementType() != i8Type {
+			t.Errorf("result elem = %v, want i8", result.Type().ElementType())
+		}
+	})
+
+	t.Run("shr4_16lanes_broadcast", func(t *testing.T) {
+		// Simulate i>>4 with 16 byte lanes: 1 unique element (broadcast).
+		ptr := b.CreateAlloca(i8Type, "test.scalar")
+
+		shuffleMask := make([]int, 16)
+		// All zeros for broadcast.
+
+		info := &spmdShiftedLoadInfo{
+			scalarPtr:   ptr,
+			uniqueCount: 1,
+			shuffleMask: shuffleMask,
+			elemType:    i8Type,
+			loop:        &spmdActiveLoop{laneCount: 16},
+		}
+
+		result := b.spmdShiftedLoad(info, llvm.Value{})
+		if result.IsNil() {
+			t.Fatal("spmdShiftedLoad returned nil")
+		}
+		if result.Type().TypeKind() != llvm.VectorTypeKind {
+			t.Fatalf("result type = %v, want vector", result.Type())
+		}
+		if result.Type().VectorSize() != 16 {
+			t.Errorf("result lanes = %d, want 16", result.Type().VectorSize())
+		}
+	})
+
+	t.Run("shr1_4lanes_i32", func(t *testing.T) {
+		// Simulate i>>1 with 4 i32 lanes: 2 unique elements.
+		arrayType := llvm.ArrayType(i32Type, 2)
+		ptr := b.CreateAlloca(arrayType, "test.arr32")
+		basePtr := b.CreateInBoundsGEP(arrayType, ptr, []llvm.Value{
+			llvm.ConstInt(i32Type, 0, false),
+			llvm.ConstInt(i32Type, 0, false),
+		}, "base32")
+
+		shuffleMask := []int{0, 0, 1, 1}
+
+		info := &spmdShiftedLoadInfo{
+			scalarPtr:   basePtr,
+			uniqueCount: 2,
+			shuffleMask: shuffleMask,
+			elemType:    i32Type,
+			loop:        &spmdActiveLoop{laneCount: 4},
+		}
+
+		result := b.spmdShiftedLoad(info, llvm.Value{})
+		if result.IsNil() {
+			t.Fatal("spmdShiftedLoad returned nil")
+		}
+		if result.Type().VectorSize() != 4 {
+			t.Errorf("result lanes = %d, want 4", result.Type().VectorSize())
+		}
+		if result.Type().ElementType() != i32Type {
+			t.Errorf("result elem = %v, want i32", result.Type().ElementType())
+		}
+	})
+
+	t.Run("masked_shr1_16lanes", func(t *testing.T) {
+		// Test with a non-nil mask: should produce select(mask, result, zero).
+		arrayType := llvm.ArrayType(i8Type, 8)
+		ptr := b.CreateAlloca(arrayType, "test.masked")
+		basePtr := b.CreateInBoundsGEP(arrayType, ptr, []llvm.Value{
+			llvm.ConstInt(i32Type, 0, false),
+			llvm.ConstInt(i32Type, 0, false),
+		}, "base.masked")
+
+		shuffleMask := make([]int, 16)
+		for i := 0; i < 16; i++ {
+			shuffleMask[i] = i >> 1
+		}
+
+		info := &spmdShiftedLoadInfo{
+			scalarPtr:   basePtr,
+			uniqueCount: 8,
+			shuffleMask: shuffleMask,
+			elemType:    i8Type,
+			loop:        &spmdActiveLoop{laneCount: 16},
+		}
+
+		// Create a mask: <16 x i8> all-ones (WASM format for 16 lanes).
+		maskType := llvm.VectorType(c.spmdMaskElemType(16), 16)
+		mask := llvm.ConstAllOnes(maskType)
+
+		result := b.spmdShiftedLoad(info, mask)
+		if result.IsNil() {
+			t.Fatal("spmdShiftedLoad with mask returned nil")
+		}
+		if result.Type().VectorSize() != 16 {
+			t.Errorf("result lanes = %d, want 16", result.Type().VectorSize())
+		}
+	})
+}

@@ -187,6 +187,7 @@ type builder struct {
 	spmdMaskStack           []llvm.Value                       // execution mask stack for nested varying if/else
 	spmdMaskTransitions     map[int]*spmdMaskTransition        // block index -> mask transition to apply
 	spmdContiguousPtr       map[ssa.Value]*spmdContiguousInfo  // IndexAddr SSA value -> contiguous access info
+	spmdShiftedPtr          map[ssa.Value]*spmdShiftedLoadInfo // IndexAddr SSA value -> shifted load info (load+shuffle)
 	spmdCoalescedStores     map[*ssa.Store]*spmdCoalescedStore // store → coalescing info (then/else pairs)
 	spmdFuncIsBody          bool                               // true if entire function body is an SPMD region (varying params, no go-for loops)
 	spmdForLoops            map[int]*spmdForLoopInfo           // body block index -> for-loop info (SPMD func body only)
@@ -1487,6 +1488,7 @@ func (b *builder) createFunction() {
 		b.spmdMergeSelects = make(map[int]*spmdVaryingIf)
 		b.spmdMaskTransitions = make(map[int]*spmdMaskTransition)
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
+		b.spmdShiftedPtr = make(map[ssa.Value]*spmdShiftedLoadInfo)
 		b.spmdCoalescedStores = make(map[*ssa.Store]*spmdCoalescedStore)
 		b.spmdBreakRedirects = make(map[int]spmdBreakRedirect)
 		b.spmdBreakPhiOverrides = make(map[*ssa.Phi]llvm.Value)
@@ -3072,6 +3074,68 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			panic("unknown *ssa.Index type")
 		}
 	case *ssa.IndexAddr:
+		// SPMD: shifted-contiguous path FIRST — before decomposed or contiguous checks.
+		// Detects index patterns like (iter_expr) >> const_k (e.g., i>>1) where adjacent
+		// lanes access overlapping elements. Generates narrow load + shuffle instead of
+		// expensive per-lane gather. Must run before decomposed check since the SHR result
+		// may already be in spmdDecomposed map from algebraic folding.
+		if b.spmdLoopState != nil && b.spmdValueOverride != nil {
+			if info, ok := b.spmdAnalyzeShiftedIndex(expr.Index); ok {
+				val := b.getValue(expr.X, getPos(expr))
+				shiftedBase := info.scalarPtr // scalar index: scalarBase >> k
+
+				// Get element type and compute scalar GEP.
+				var ptr llvm.Value
+				switch ptrTyp := expr.X.Type().Underlying().(type) {
+				case *types.Pointer:
+					typ := ptrTyp.Elem().Underlying()
+					switch typ := typ.(type) {
+					case *types.Array:
+						bufType := b.getLLVMType(typ)
+						elemType := b.getLLVMType(typ.Elem())
+						b.createNilCheck(expr.X, val, "gep")
+						shiftedBase = b.extendInteger(shiftedBase, expr.Index.Type(), b.uintptrType)
+						ptr = b.CreateInBoundsGEP(bufType, val, []llvm.Value{
+							llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+							shiftedBase,
+						}, "shifted.ptr")
+						info.elemType = elemType
+
+						// Bounds check: verify that base + uniqueCount <= array length.
+						if !b.info.nobounds {
+							arrLen := llvm.ConstInt(b.uintptrType, uint64(typ.Len()), false)
+							endIdx := b.CreateAdd(shiftedBase, llvm.ConstInt(b.uintptrType, uint64(info.uniqueCount), false), "")
+							oob := b.CreateICmp(llvm.IntUGT, endIdx, arrLen, "")
+							b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+						}
+					default:
+						goto shiftedFallthrough
+					}
+				case *types.Slice:
+					bufptr := b.CreateExtractValue(val, 0, "indexaddr.ptr")
+					elemType := b.getLLVMType(ptrTyp.Elem())
+					shiftedBase = b.extendInteger(shiftedBase, expr.Index.Type(), b.uintptrType)
+					ptr = b.CreateInBoundsGEP(elemType, bufptr, []llvm.Value{shiftedBase}, "shifted.ptr")
+					info.elemType = elemType
+
+					// Bounds check: verify that base + uniqueCount <= slice length.
+					if !b.info.nobounds {
+						buflen := b.CreateExtractValue(val, 1, "indexaddr.len")
+						endIdx := b.CreateAdd(shiftedBase, llvm.ConstInt(b.uintptrType, uint64(info.uniqueCount), false), "")
+						oob := b.CreateICmp(llvm.IntUGT, endIdx, buflen, "")
+						b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+					}
+				default:
+					goto shiftedFallthrough
+				}
+
+				info.scalarPtr = ptr
+				b.spmdShiftedPtr[expr] = info
+				return ptr, nil
+			}
+		shiftedFallthrough:
+		}
+
 		// SPMD: detect decomposed index access (byte-lane loops with laneCount > 4).
 		// This must come before the contiguous detection path since decomposed indices
 		// are not registered in spmdValueOverride.
@@ -4423,6 +4487,16 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(ci.loop.laneCount), ci.loop.laneCount))
 				}
 				return b.spmdMaskedLoad(vecType, ci.scalarPtr, mask), nil
+			}
+		}
+
+		// SPMD: shifted-contiguous load via narrow load + shuffle expansion.
+		// When x is detected as a shifted SPMD IndexAddr (e.g., src[i>>1]),
+		// load fewer unique elements and expand with shufflevector.
+		if b.spmdShiftedPtr != nil {
+			if info, ok := b.spmdShiftedPtr[unop.X]; ok {
+				mask := b.spmdCurrentMask()
+				return b.spmdShiftedLoad(info, mask), nil
 			}
 		}
 
