@@ -1698,6 +1698,110 @@ func (b *builder) createFunction() {
 		}
 	}
 
+	// SPMD: resolve deferred switch phis BEFORE loop peeling tail emission.
+	// emitSPMDTailBody re-processes body blocks including switch comparisons,
+	// which overwrites chain.cases[i].caseMask. Deferred phi resolution must
+	// read the main-phase caseMask values, so it runs first.
+	erasedSwitchPhis := make(map[*ssa.Phi]bool, len(b.spmdDeferredSwitchPhis))
+	for _, dsp := range b.spmdDeferredSwitchPhis {
+		chain := &b.spmdSwitchChains[dsp.chainIdx]
+		// Set insert point to the switch.done block, just before the terminator.
+		doneBlock := b.blockInfo[chain.doneBlock].entry
+		term := doneBlock.LastInstruction()
+		if !term.IsNil() {
+			b.SetInsertPointBefore(term)
+		} else {
+			b.SetInsertPointAtEnd(doneBlock)
+		}
+		selectVal, ok := b.spmdCreateSwitchMergeSelect(dsp.phi, dsp.chainIdx)
+		if ok {
+			dsp.llvm.ReplaceAllUsesWith(selectVal)
+			dsp.llvm.EraseFromParentAsInstruction()
+			// Update locals cache so subsequent getValue calls return the select.
+			b.locals[dsp.phi] = selectVal
+			erasedSwitchPhis[dsp.phi] = true
+		}
+	}
+
+	// SPMD loop peeling: emit tail.check and tail body for each peeled loop,
+	// then wire the tail.check phi incoming values.
+	if b.spmdPeeledLoops != nil {
+		seen := make(map[*spmdPeeledLoop]bool)
+		for _, peeled := range b.spmdPeeledLoops {
+			if seen[peeled] {
+				continue
+			}
+			seen[peeled] = true
+
+			loop := peeled.loop
+
+			// Find the loop block's false successor (the original exit block).
+			// The *ssa.If in the loop block has Succs[1] as the exit; during main
+			// phase compilation that was redirected to tailCheckBlock, but the
+			// original SSA Succs[1] still points to the exit block.
+			for loopIdx, loopMatch := range b.spmdLoopState.loopBlocks {
+				if loopMatch == loop {
+					loopBlock := b.fn.Blocks[loopIdx]
+					if len(loopBlock.Succs) > 1 {
+						peeled.tailExitBlock = b.blockInfo[loopBlock.Succs[1].Index].entry
+					}
+					break
+				}
+			}
+
+			if peeled.tailExitBlock.IsNil() {
+				panic("spmd: loop peeling: tailExitBlock not found for loop")
+			}
+
+			// Emit the tail.check block (phi + conditional branch).
+			b.emitSPMDTailCheck(peeled)
+
+			// Emit the tail body blocks (re-process SSA body blocks with tail phase).
+			b.emitSPMDTailBody(peeled)
+
+			// Wire tail.check phi incoming values now that emitSPMDTailBody has
+			// restored b.locals and b.blockInfo to their post-main-loop state.
+			iterType := b.getLLVMType(loop.boundValue.Type())
+			zero := llvm.ConstInt(iterType, 0, false)
+
+			// Find the block that jumps into the body block (the entry predecessor).
+			// For rangeint: the block before the body block (not the loop block).
+			// For rangeindex: same — the block whose successor is the body block,
+			// excluding the loop block itself.
+			var entryPredExit llvm.BasicBlock
+			for _, block := range b.fn.DomPreorder() {
+				if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
+					for _, pred := range block.Preds {
+						if _, isLoop := b.spmdLoopState.loopBlocks[pred.Index]; !isLoop {
+							entryPredExit = b.blockInfo[pred.Index].exit
+							break
+						}
+					}
+					break
+				}
+			}
+
+			// Find the loop block's exit LLVM block and the main incrBinOp value.
+			var mainLoopExit llvm.BasicBlock
+			var mainIterNext llvm.Value
+			for loopIdx, loopMatch := range b.spmdLoopState.loopBlocks {
+				if loopMatch == loop {
+					mainLoopExit = b.blockInfo[loopIdx].exit
+					mainIterNext = b.locals[loopMatch.incrBinOp]
+					break
+				}
+			}
+
+			if peeled.tailIterPhi.IsNil() || entryPredExit.IsNil() || mainLoopExit.IsNil() || mainIterNext.IsNil() {
+				panic("spmd: loop peeling: failed to wire tail.check phi incoming values")
+			}
+			peeled.tailIterPhi.AddIncoming(
+				[]llvm.Value{zero, mainIterNext},
+				[]llvm.BasicBlock{entryPredExit, mainLoopExit},
+			)
+		}
+	}
+
 	// The rundefers instruction needs to be created after all defer
 	// instructions have been created. Otherwise it won't handle all defer
 	// cases.
@@ -1845,31 +1949,6 @@ func (b *builder) createFunction() {
 					break
 				}
 			}
-		}
-	}
-
-	// SPMD: resolve deferred switch phis now that all case masks are computed.
-	// In DomPreorder, switch.done may be visited before switch.next blocks,
-	// so case masks are only available after all blocks have been processed.
-	// This runs AFTER the phi resolution loop and BEFORE NeedsStackObjects.
-	erasedSwitchPhis := make(map[*ssa.Phi]bool, len(b.spmdDeferredSwitchPhis))
-	for _, dsp := range b.spmdDeferredSwitchPhis {
-		chain := &b.spmdSwitchChains[dsp.chainIdx]
-		// Set insert point to the switch.done block, just before the terminator.
-		doneBlock := b.blockInfo[chain.doneBlock].entry
-		term := doneBlock.LastInstruction()
-		if !term.IsNil() {
-			b.SetInsertPointBefore(term)
-		} else {
-			b.SetInsertPointAtEnd(doneBlock)
-		}
-		selectVal, ok := b.spmdCreateSwitchMergeSelect(dsp.phi, dsp.chainIdx)
-		if ok {
-			dsp.llvm.ReplaceAllUsesWith(selectVal)
-			dsp.llvm.EraseFromParentAsInstruction()
-			// Update locals cache so subsequent getValue calls return the select.
-			b.locals[dsp.phi] = selectVal
-			erasedSwitchPhis[dsp.phi] = true
 		}
 	}
 
@@ -2081,6 +2160,41 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			b.CreateCondBr(cond, blockThen, blockElse)
 		}
 	case *ssa.Jump:
+		// SPMD loop peeling: tail body Jump to loop block → redirect to tail exit.
+		// During tail phase emission, jumps that would normally go back to the loop
+		// block (the loop-back edge) must be redirected to tailExitBlock instead,
+		// since the tail runs at most once.
+		if b.spmdPeeledLoops != nil && b.spmdLoopState != nil {
+			succIdx := instr.Block().Succs[0].Index
+			if loop, ok := b.spmdLoopState.loopBlocks[succIdx]; ok {
+				if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseTail {
+					b.CreateBr(peeled.tailExitBlock)
+					break
+				}
+			}
+		}
+		// SPMD loop peeling: entry block Jump to body → conditional on alignedBound > 0.
+		// The aligned bound is computed here (in the entry block) so that the main loop
+		// runs only when there is at least one full vector worth of elements.
+		// If alignedBound == 0, skip directly to tail.check.
+		if b.spmdPeeledLoops != nil && b.spmdLoopState != nil {
+			succIdx := instr.Block().Succs[0].Index
+			if loop, ok := b.spmdLoopState.bodyBlocks[succIdx]; ok {
+				if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseMain {
+					// Compute aligned bound: bound & ~(laneCount-1).
+					// This is where Task 7 places the computation so it dominates both the
+					// main loop body and the tail.check block.
+					boundScalar := b.getValue(loop.boundValue, getPos(instr))
+					peeled.alignedBound = b.spmdComputeAlignedBound(boundScalar, loop.laneCount)
+
+					mainBody := b.blockInfo[succIdx].entry
+					zero := llvm.ConstInt(peeled.alignedBound.Type(), 0, false)
+					hasMain := b.CreateICmp(llvm.IntSGT, peeled.alignedBound, zero, "spmd.has.main")
+					b.CreateCondBr(hasMain, mainBody, peeled.tailCheckBlock)
+					break
+				}
+			}
+		}
 		// SPMD: check for switch body block Jump (redirect to next comparison or done).
 		if chainIdx, ok := b.spmdSwitchBodyBlocks[instr.Block().Index]; ok {
 			b.spmdPopMask() // pop the case mask pushed at body entry

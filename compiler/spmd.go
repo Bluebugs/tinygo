@@ -4845,3 +4845,194 @@ func spmdIndexMaxValue(v ssa.Value) (uint64, bool) {
 
 	return 0, false
 }
+
+// emitSPMDTailCheck emits the tail.check block that bridges the main loop exit
+// to either the tail body (if there are remaining elements) or the exit block.
+// The phi incoming values are wired later (after emitSPMDTailBody returns)
+// because the main loop's incrBinOp value is available in b.locals at that point.
+func (b *builder) emitSPMDTailCheck(peeled *spmdPeeledLoop) {
+	loop := peeled.loop
+
+	b.SetInsertPointAtEnd(peeled.tailCheckBlock)
+
+	// Create phi for iterator value: comes from entry (0) or main loop (mainIterNext).
+	// Incoming values are added by the caller after emitSPMDTailBody returns.
+	// Use the bound value's type (not hardcoded i32) for future 64-bit target support.
+	iterType := b.getLLVMType(loop.boundValue.Type())
+	phi := b.CreatePHI(iterType, "spmd.tail.iter")
+	peeled.tailIterPhi = phi
+
+	// Branch: tailIter < bound → tail.body, else → exit.
+	boundScalar := b.getValue(loop.boundValue, token.NoPos)
+	hasTail := b.CreateICmp(llvm.IntSLT, phi, boundScalar, "spmd.has.tail")
+
+	// Find the tail body entry block (first body block in DomPreorder).
+	var tailBodyEntry llvm.BasicBlock
+	for _, block := range b.fn.DomPreorder() {
+		if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
+			if info, exists := peeled.tailBlockInfo[block.Index]; exists {
+				tailBodyEntry = info.entry
+				break
+			}
+		}
+	}
+	if tailBodyEntry.IsNil() {
+		b.CreateBr(peeled.tailExitBlock)
+		return
+	}
+
+	b.CreateCondBr(hasTail, tailBodyEntry, peeled.tailExitBlock)
+}
+
+// emitSPMDTailBody re-processes the SPMD body blocks to emit the tail iteration
+// with a computed tail mask. The tail runs at most once (no loop-back).
+// All builder state is saved and restored so the main-phase state is preserved.
+func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
+	loop := peeled.loop
+
+	// Switch to tail phase.
+	peeled.phase = spmdLoopPhaseTail
+
+	// Save builder state.
+	savedLocals := b.locals
+	savedOverride := b.spmdValueOverride
+	savedDecomposed := b.spmdDecomposed
+	savedContiguous := b.spmdContiguousPtr
+	savedShifted := b.spmdShiftedPtr
+	savedMaskStack := b.spmdMaskStack
+	savedBlockInfo := make([]blockInfo, len(b.blockInfo))
+	copy(savedBlockInfo, b.blockInfo)
+
+	// Clone locals: keep values defined outside the SPMD body (from dominating blocks).
+	b.locals = make(map[ssa.Value]llvm.Value)
+	for k, v := range savedLocals {
+		if k.Parent() != b.fn {
+			// Value from another function — keep unconditionally.
+			b.locals[k] = v
+			continue
+		}
+		// Only ssa.Instruction values have a Block() method; globals/freeVars do not.
+		if instr, ok := k.(ssa.Instruction); ok {
+			block := instr.Block()
+			if block != nil && peeled.bodyBlockSet[block.Index] {
+				// Value defined inside the body block set — don't copy to tail locals.
+				continue
+			}
+		}
+		// Value defined outside the body block set (or not an instruction) — available in tail.
+		b.locals[k] = v
+	}
+
+	// Override the body iterator value to the tailIterPhi from tail.check.
+	// For rangeint, bodyIterValue is the iterPhi (in body block).
+	// For rangeindex, bodyIterValue is the incrBinOp (in loop block, already in locals).
+	if loop.bodyIterValue != nil {
+		b.locals[loop.bodyIterValue] = peeled.tailIterPhi
+	}
+
+	// Swap blockInfo to tail blocks.
+	for idx, info := range peeled.tailBlockInfo {
+		b.blockInfo[idx] = info
+	}
+
+	// Fresh SPMD maps for tail phase.
+	b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
+	b.spmdDecomposed = make(map[ssa.Value]*spmdDecomposedIndex)
+	b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
+	b.spmdShiftedPtr = make(map[ssa.Value]*spmdShiftedLoadInfo)
+	b.spmdMaskStack = nil
+
+	// Process body blocks in DomPreorder order (tail phase).
+	for _, block := range b.fn.DomPreorder() {
+		if !peeled.bodyBlockSet[block.Index] {
+			continue
+		}
+		b.currentBlock = block
+		b.currentBlockInfo = &b.blockInfo[block.Index]
+		b.SetInsertPointAtEnd(b.currentBlockInfo.entry)
+
+		// Body block entry: reset overrides and emit prologue if rangeindex.
+		if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
+			b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
+			b.spmdDecomposed = make(map[ssa.Value]*spmdDecomposedIndex)
+
+			if loop.isRangeIndex {
+				// rangeindex body: bodyIterValue already overridden to tailIterPhi in b.locals.
+				// emitSPMDBodyPrologue reads b.locals[loop.bodyIterValue] directly.
+				b.emitSPMDBodyPrologue(loop)
+				if !loop.isDecomposed {
+					b.spmdValueOverride[loop.bodyIterValue] = loop.laneIndices
+				}
+				b.spmdMaskStack = []llvm.Value{loop.tailMask}
+			}
+		} else if b.spmdValueOverride != nil && b.isBlockInSPMDBody(block) != nil {
+			// Keep existing overrides for if.then/if.else/if.done inside tail body.
+		} else {
+			// Interior block that doesn't belong to the body: clear overrides.
+			// (Shouldn't happen since bodyBlockSet covers interior blocks too.)
+		}
+
+		// Apply mask transitions for interior blocks (if.then/else/done).
+		// Mask transitions are keyed by SSA block index and apply to the tail
+		// blocks as well since they encode the same logical control flow.
+		if b.spmdMaskTransitions != nil {
+			if tr, ok := b.spmdMaskTransitions[block.Index]; ok {
+				switch tr.kind {
+				case "pushThen":
+					parentMask := b.spmdCurrentMask()
+					if !parentMask.IsNil() {
+						thenMask := b.CreateAnd(parentMask, tr.cond, "spmd.then.mask")
+						b.spmdPushMask(thenMask)
+					}
+				case "swapElse":
+					b.spmdPopMask()
+					parentMask := b.spmdCurrentMask()
+					if !parentMask.IsNil() {
+						notCond := b.CreateNot(tr.cond, "")
+						elseMask := b.CreateAnd(parentMask, notCond, "spmd.else.mask")
+						b.spmdPushMask(elseMask)
+					}
+				case "pop":
+					b.spmdPopMask()
+				case "pushDirect":
+					b.spmdPushMask(tr.cond)
+				}
+			}
+		}
+
+		// Process instructions.
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.DebugRef); ok {
+				continue
+			}
+
+			// Task 6: Skip the rangeint iter phi in tail — use tailIterPhi directly.
+			// For rangeindex, bodyIterValue is incrBinOp (not a phi), handled via b.locals above.
+			if phi, ok := instr.(*ssa.Phi); ok {
+				if loopMatch, matched := b.spmdLoopState.activeLoops[phi]; matched && loopMatch == loop {
+					// Override phi to use tailIterPhi from tail.check.
+					b.locals[phi] = peeled.tailIterPhi
+					// Emit prologue for rangeint pattern (rangeindex handled at body block entry).
+					b.emitSPMDBodyPrologue(loop)
+					b.spmdValueOverride[phi] = loop.laneIndices
+					b.spmdMaskStack = []llvm.Value{loop.tailMask}
+					continue // skip normal createInstruction for this phi
+				}
+			}
+
+			b.createInstruction(instr)
+		}
+	}
+
+	// Restore builder state.
+	b.locals = savedLocals
+	b.spmdValueOverride = savedOverride
+	b.spmdDecomposed = savedDecomposed
+	b.spmdContiguousPtr = savedContiguous
+	b.spmdShiftedPtr = savedShifted
+	b.spmdMaskStack = savedMaskStack
+	copy(b.blockInfo, savedBlockInfo)
+
+	// Restore to main phase.
+	peeled.phase = spmdLoopPhaseMain
+}
