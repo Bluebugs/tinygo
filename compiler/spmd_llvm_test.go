@@ -1345,6 +1345,53 @@ func TestSPMDLoopPeelingEligibility(t *testing.T) {
 	}
 }
 
+func TestSPMDAlignedBound(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	i32Type := c.ctx.Int32Type()
+
+	// Use a function with an i32 parameter so the bound is a non-constant
+	// LLVM value. LLVM would constant-fold AND(const, const) into a constant,
+	// so we need a runtime value to verify an actual AND instruction is emitted.
+	fn := llvm.AddFunction(c.mod, "test_aligned_bound",
+		llvm.FunctionType(c.ctx.VoidType(), []llvm.Type{i32Type}, false))
+	bb := llvm.AddBasicBlock(fn, "entry")
+	b := &builder{compilerContext: c}
+	b.Builder = c.ctx.NewBuilder()
+	b.SetInsertPointAtEnd(bb)
+	defer b.Dispose()
+
+	bound := fn.Param(0) // non-constant i32 runtime value
+	bound.SetName("bound")
+
+	tests := []struct {
+		name      string
+		laneCount int
+	}{
+		{"4_lanes", 4},
+		{"8_lanes", 8},
+		{"16_lanes", 16},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := b.spmdComputeAlignedBound(bound, tt.laneCount)
+			if result.IsNil() {
+				t.Fatal("spmdComputeAlignedBound returned nil")
+			}
+			// The result must be an AND binary instruction (not a constant).
+			// Using a runtime bound prevents LLVM from constant-folding.
+			if result.IsABinaryOperator().IsNil() {
+				t.Errorf("expected AND binary operator, got non-instruction (opcode=%v)", result.InstructionOpcode())
+			}
+			if result.InstructionOpcode() != llvm.And {
+				t.Errorf("expected AND opcode (%v), got %v", llvm.And, result.InstructionOpcode())
+			}
+		})
+	}
+}
+
 func TestSPMDMaskStack(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()

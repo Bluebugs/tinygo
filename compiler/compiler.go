@@ -201,6 +201,7 @@ type builder struct {
 	spmdDeferredSwitchPhis  []spmdDeferredSwitchPhi            // switch.done phis deferred until all case masks are ready
 	spmdCondChains          map[int]*spmdCondChain             // outerIfBlock.Index -> chain
 	spmdCondChainInner      map[int]*spmdCondChain             // innerBlock.Index -> chain (lookup)
+	spmdPeeledLoops         map[*spmdActiveLoop]*spmdPeeledLoop // peeled loop state (nil if not peeled)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1502,6 +1503,25 @@ func (b *builder) createFunction() {
 		// selects when they're compiled. Without this, phis would be compiled
 		// before spmdMergeSelects is populated.
 		b.preDetectVaryingIfs()
+
+		// SPMD: set up loop peeling for eligible loops.
+		// Tail LLVM blocks are created here (before the DomPreorder pass)
+		// so that branch targets can reference them during compilation.
+		if b.spmdLoopState != nil {
+			b.spmdPeeledLoops = make(map[*spmdActiveLoop]*spmdPeeledLoop)
+			seen := make(map[*spmdActiveLoop]bool)
+			for _, loop := range b.spmdLoopState.activeLoops {
+				if seen[loop] {
+					continue
+				}
+				seen[loop] = true
+				if b.spmdShouldPeelLoop(loop) {
+					peeled := b.spmdCreateTailBlocks(loop)
+					peeled.phase = spmdLoopPhaseMain
+					b.spmdPeeledLoops[loop] = peeled
+				}
+			}
+		}
 	}
 
 	// Fill blocks with instructions.

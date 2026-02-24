@@ -494,6 +494,63 @@ func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
 	return loop.laneCount > 0
 }
 
+// spmdComputeAlignedBound computes bound & ~(laneCount-1) to get the last
+// multiple of laneCount that is <= bound. This is the exit condition for the
+// main (unmasked) loop; the remaining 0 to laneCount-1 elements are handled
+// by the tail.
+func (b *builder) spmdComputeAlignedBound(bound llvm.Value, laneCount int) llvm.Value {
+	mask := llvm.ConstInt(bound.Type(), ^uint64(laneCount-1), true)
+	return b.CreateAnd(bound, mask, "spmd.aligned.bound")
+}
+
+// spmdCreateTailBlocks creates the LLVM basic blocks needed for the tail body
+// of a peeled loop. This includes a tail.check block and a .tail version of
+// each body and interior block. Loop blocks are excluded since the tail does
+// not loop.
+//
+// This must be called after b.llvmFn is set and the main LLVM blocks have
+// been created. The returned *spmdPeeledLoop has phase set to spmdLoopPhaseMain
+// by default.
+func (b *builder) spmdCreateTailBlocks(loop *spmdActiveLoop) *spmdPeeledLoop {
+	peeled := &spmdPeeledLoop{
+		loop:          loop,
+		tailBlockInfo: make(map[int]blockInfo),
+		bodyBlockSet:  make(map[int]bool),
+	}
+
+	// Identify all SSA blocks belonging to this loop body or interior to it.
+	// Body blocks are tracked directly in spmdLoopState.bodyBlocks.
+	// Interior blocks (if.then/else/done) are identified via isBlockInSPMDBody
+	// which uses dominator analysis. Loop blocks are excluded — the tail does
+	// not loop back.
+	for _, block := range b.fn.DomPreorder() {
+		if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
+			peeled.bodyBlockSet[block.Index] = true
+			continue
+		}
+		if _, isLoop := b.spmdLoopState.loopBlocks[block.Index]; isLoop {
+			// Loop block is not part of the tail body (tail doesn't loop).
+			continue
+		}
+		// Check if this block is interior to the loop body (if.then/else/done etc).
+		// isBlockInSPMDBody returns non-nil for blocks dominated by an SPMD body block.
+		// Skip SPMD function bodies here — those use a different code path.
+		if !b.spmdFuncIsBody && b.isBlockInSPMDBody(block) != nil {
+			peeled.bodyBlockSet[block.Index] = true
+		}
+	}
+
+	// Create tail.check block and tail versions of each body/interior block.
+	peeled.tailCheckBlock = b.ctx.AddBasicBlock(b.llvmFn, "spmd.tail.check")
+	for idx := range peeled.bodyBlockSet {
+		block := b.fn.Blocks[idx]
+		tailBlock := b.ctx.AddBasicBlock(b.llvmFn, block.Comment+".tail")
+		peeled.tailBlockInfo[idx] = blockInfo{entry: tailBlock, exit: tailBlock}
+	}
+
+	return peeled
+}
+
 // spmdDecomposedIndex tracks a base+offset decomposed SPMD index value.
 // Used for byte-lane loops (laneCount > 4) where the full materialized vector
 // (<16 x i32>) would exceed WASM's 128-bit register width.
