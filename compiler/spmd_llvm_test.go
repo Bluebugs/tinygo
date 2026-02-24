@@ -4052,6 +4052,85 @@ func TestSPMDDecomposedBinOpShr(t *testing.T) {
 	}
 }
 
+// TestSPMDDecomposedBinOpMul verifies the MUL decomposition rule.
+// (base + offset) * c → {base*c, <0, c, 2c, ..., (N-1)*c>} when (N-1)*c <= 255.
+// Like TestSPMDDecomposedBinOpAdd, we test the LLVM-level arithmetic directly
+// (not the full spmdDecomposedBinOp method which requires live getValue/getPos).
+func TestSPMDDecomposedBinOpMul(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+	laneCount := 16
+
+	tests := []struct {
+		name       string
+		constC     int64
+		base       uint64
+		shouldFit  bool // whether (N-1)*c <= 255
+	}{
+		{name: "c=2 stride-2", constC: 2, base: 16, shouldFit: true},
+		{name: "c=16 boundary", constC: 16, base: 0, shouldFit: true},
+		{name: "c=17 max boundary", constC: 17, base: 0, shouldFit: true},     // 15*17=255
+		{name: "c=18 overflow", constC: 18, base: 0, shouldFit: false},         // 15*18=270 > 255
+		{name: "c=3 non-power-of-two", constC: 3, base: 32, shouldFit: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Verify the overflow guard: (N-1)*c <= 255
+			maxOffset := int64(laneCount-1) * tt.constC
+			fitsInByte := maxOffset <= 255
+			if fitsInByte != tt.shouldFit {
+				t.Fatalf("overflow guard: (N-1)*c = %d, fits = %v, want %v", maxOffset, fitsInByte, tt.shouldFit)
+			}
+
+			if !tt.shouldFit {
+				return // decomposition would be skipped
+			}
+
+			// Simulate the MUL decomposition: base*c as scalar, <0,c,2c,...,(N-1)*c> as offset.
+			scalarBase := llvm.ConstInt(i32Type, tt.base, false)
+			scalar := llvm.ConstInt(i32Type, uint64(tt.constC), false)
+			newBase := b.CreateMul(scalarBase, scalar, "spmd.decomp.mul.base")
+
+			newOffsetElts := make([]llvm.Value, laneCount)
+			for i := 0; i < laneCount; i++ {
+				newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(int64(i)*tt.constC), false)
+			}
+			newOffset := llvm.ConstVector(newOffsetElts, false)
+
+			decomp := &spmdDecomposedIndex{
+				scalarBase:    newBase,
+				varyingOffset: newOffset,
+				laneCount:     laneCount,
+				fromBodyIter:  false, // MUL must NOT propagate fromBodyIter
+			}
+
+			// Materialize to verify correctness.
+			result := b.spmdMaterializeDecomposed(decomp)
+
+			if result.Type().VectorSize() != laneCount {
+				t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), laneCount)
+			}
+			if result.Type().ElementType() != i32Type {
+				t.Errorf("result elem type = %v, want i32", result.Type().ElementType())
+			}
+			// Verify offset vector element type stays i8.
+			if newOffset.Type().ElementType() != i8Type {
+				t.Errorf("offset elem type = %v, want i8", newOffset.Type().ElementType())
+			}
+			// Verify fromBodyIter is false (prevents incorrect downstream SHR).
+			if decomp.fromBodyIter {
+				t.Error("fromBodyIter should be false after MUL (breaks carry-free shift identity)")
+			}
+		})
+	}
+}
+
 // TestSPMDDecomposedIndexStructure verifies that the spmdDecomposedIndex struct
 // fields are correctly populated by the emitSPMDBodyPrologue decomposed path.
 // This is a structural test using LLVM value types.

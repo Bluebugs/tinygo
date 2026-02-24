@@ -3613,6 +3613,42 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 		}
 		return llvm.Value{}, true // signal: stored in spmdDecomposed
 
+	case token.MUL:
+		// (base + offset) * c = base*c + offset*c  (MUL is commutative, so both LHS and RHS work)
+		//
+		// We compute the new offset as a COMPILE-TIME constant vector to avoid creating
+		// <N x i8> multiply IR (WASM has no i8x16.mul). This requires that (N-1)*c fits
+		// in i8 (<= 255) so the scaled offsets stay within the byte range.
+		//
+		// fromBodyIter is NOT propagated: the scaled offset <0, c, 2c, ..., (N-1)*c>
+		// breaks the carry-free shift identity used by downstream SHR/AND/REM unless
+		// c is a power of two. Conservatively set to false to prevent incorrect code.
+		if constVal, ok := scalarSSA.(*ssa.Const); ok {
+			if c, ok := constant.Int64Val(constVal.Value); ok && c > 0 {
+				maxOffset := int64(laneCount-1) * c
+				if maxOffset <= 255 {
+					// Scale the scalar base.
+					newBase := b.CreateMul(decomp.scalarBase, scalarLLVM, "spmd.decomp.mul.base")
+					// Compute scaled offset as a constant vector: <0, c, 2c, ..., (N-1)*c>.
+					newOffsetElts := make([]llvm.Value, laneCount)
+					for i := 0; i < laneCount; i++ {
+						newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(int64(i)*c), false)
+					}
+					newOffset := llvm.ConstVector(newOffsetElts, false)
+					if b.spmdDecomposed != nil {
+						b.spmdDecomposed[expr] = &spmdDecomposedIndex{
+							scalarBase:    newBase,
+							varyingOffset: newOffset,
+							laneCount:     laneCount,
+							loop:          decomp.loop,
+							fromBodyIter:  false,
+						}
+					}
+					return llvm.Value{}, true
+				}
+			}
+		}
+
 	case token.SHR:
 		if !decompIsLHS {
 			break
@@ -3861,6 +3897,14 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 
 	// Fallback: materialize to <N x i32> and apply the operation normally.
 	// On WASM this produces a 512-bit wide vector; use only when no 128-bit path exists.
+	//
+	// TODO(spmd): This fallback only materializes the decomposed OPERAND but does NOT
+	// apply the BinOp operation. The caller (compiler.go) returns this value directly
+	// as the BinOp result, which produces incorrect LLVM IR for non-comparison operations
+	// (e.g., a scatter with mismatched pointer vector width). The correct fix is to apply
+	// the BinOp after materializing, but this requires access to the full BinOp context.
+	// For now, the MUL case above handles the most common stride-2 pattern (i*2, i*2+1)
+	// without hitting this fallback. See: docs/plans for deferred fallback fix.
 	materialized := b.spmdMaterializeDecomposed(decomp)
 	return materialized, false
 }
