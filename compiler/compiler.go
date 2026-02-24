@@ -2183,6 +2183,18 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 					// Broadcast scalars to vectors if needed.
 					thenVal, elseVal = b.spmdBroadcastMatch(thenVal, elseVal)
 
+					// If both values are still scalar (uniform constants), splat
+					// them to vectors matching the condition's lane count.
+					// Invariant: cond is always a vector (varying-if condition).
+					if thenVal.Type().TypeKind() != llvm.VectorTypeKind &&
+						elseVal.Type().TypeKind() != llvm.VectorTypeKind &&
+						cond.Type().TypeKind() == llvm.VectorTypeKind {
+						laneCount := cond.Type().VectorSize()
+						vecType := llvm.VectorType(thenVal.Type(), laneCount)
+						thenVal = b.splatScalar(thenVal, vecType)
+						elseVal = b.splatScalar(elseVal, vecType)
+					}
+
 					// Select using the varying if condition.
 					selected := b.spmdMaskSelect(cond, thenVal, elseVal)
 

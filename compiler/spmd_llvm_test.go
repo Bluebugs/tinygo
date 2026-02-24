@@ -4464,6 +4464,75 @@ func TestSPMDStoreCoalescing(t *testing.T) {
 	}
 }
 
+// TestSPMDStoreCoalescingScalarScalar verifies that when both then-value and
+// else-value are scalar constants (uniform), the coalesced store codegen path
+// correctly splats them to vectors before the mask select.
+func TestSPMDStoreCoalescingScalarScalar(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	vecType := llvm.VectorType(i32Type, laneCount)
+	maskType := llvm.VectorType(c.ctx.Int32Type(), laneCount)
+
+	// Both values are scalar constants (the scenario the fix addresses).
+	cond := llvm.ConstAllOnes(maskType)
+	thenScalar := llvm.ConstInt(i32Type, 100, false)
+	elseScalar := llvm.ConstInt(i32Type, 200, false)
+
+	// Simulate the codegen path: broadcastMatch, then scalar-scalar splat.
+	thenVal, elseVal := b.spmdBroadcastMatch(thenScalar, elseScalar)
+	// After broadcastMatch, both should still be scalar (neither is vector).
+	if thenVal.Type().TypeKind() == llvm.VectorTypeKind {
+		t.Fatal("expected thenVal to remain scalar after broadcastMatch")
+	}
+	if elseVal.Type().TypeKind() == llvm.VectorTypeKind {
+		t.Fatal("expected elseVal to remain scalar after broadcastMatch")
+	}
+
+	// Apply the scalar-scalar splat (matching the codegen fix).
+	if thenVal.Type().TypeKind() != llvm.VectorTypeKind &&
+		elseVal.Type().TypeKind() != llvm.VectorTypeKind &&
+		cond.Type().TypeKind() == llvm.VectorTypeKind {
+		lc := cond.Type().VectorSize()
+		vt := llvm.VectorType(thenVal.Type(), lc)
+		thenVal = b.splatScalar(thenVal, vt)
+		elseVal = b.splatScalar(elseVal, vt)
+	}
+
+	// Now both must be vectors.
+	if thenVal.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatal("expected thenVal to be vector after splat")
+	}
+	if elseVal.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatal("expected elseVal to be vector after splat")
+	}
+	if thenVal.Type() != vecType {
+		t.Errorf("expected thenVal type %v, got %v", vecType, thenVal.Type())
+	}
+	if elseVal.Type() != vecType {
+		t.Errorf("expected elseVal type %v, got %v", vecType, elseVal.Type())
+	}
+
+	// Verify the full chain works: select + masked store.
+	arrType := llvm.ArrayType(i32Type, 16)
+	arrPtr := b.CreateAlloca(arrType, "d")
+	zero := llvm.ConstInt(i32Type, 0, false)
+	scalarPtr := b.CreateInBoundsGEP(arrType, arrPtr, []llvm.Value{zero, zero}, "d.ptr")
+	parentMask := llvm.ConstAllOnes(maskType)
+
+	selected := b.spmdMaskSelect(cond, thenVal, elseVal)
+	b.spmdMaskedStore(selected, scalarPtr, parentMask)
+
+	maskedStoreFn := c.mod.NamedFunction("llvm.masked.store.v4i32.p0")
+	if maskedStoreFn.IsNil() {
+		t.Fatal("expected llvm.masked.store.v4i32.p0 to be declared")
+	}
+}
+
 // TestSPMDIndexMaxValueTypeFallback verifies that spmdIndexMaxValue applies the
 // type-based upper bound for unsigned fixed-size types when expression analysis
 // is not available. This test exercises the logic path directly via typeBitWidth
