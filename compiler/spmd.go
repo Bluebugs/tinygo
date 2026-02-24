@@ -459,6 +459,41 @@ type spmdActiveLoop struct {
 	scalarIterVal llvm.Value // scalar LLVM value (before override to lane indices)
 }
 
+// spmdLoopPhase tracks whether we're emitting the main loop body (all-ones mask)
+// or the tail body (computed mask) during loop peeling.
+type spmdLoopPhase int
+
+const (
+	spmdLoopPhaseMain spmdLoopPhase = iota
+	spmdLoopPhaseTail
+)
+
+// spmdPeeledLoop holds state for an SPMD loop that has been split into
+// a main loop (full vectors, plain stores) and a tail (0-1 masked iterations).
+type spmdPeeledLoop struct {
+	loop           *spmdActiveLoop
+	alignedBound   llvm.Value       // bound & ~(laneCount-1)
+	tailCheckBlock llvm.BasicBlock  // phi + branch: hasTail → tail.body | exit
+	tailBlockInfo  map[int]blockInfo // SSA block index → tail LLVM blocks
+	tailExitBlock  llvm.BasicBlock  // convergence point (original loop exit)
+	tailIterPhi    llvm.Value       // phi in tailCheck for the iter value at main loop exit
+	bodyBlockSet   map[int]bool     // set of SSA block indices belonging to this loop body
+	phase          spmdLoopPhase    // current emission phase (Main or Tail)
+}
+
+// spmdShouldPeelLoop returns true if the given SPMD loop is eligible for peeling.
+// Loops inside SPMD function bodies (with break masks) are excluded because their
+// break mask interacts with the iteration mask in ways that peeling doesn't handle.
+func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
+	// Don't peel loops in SPMD function bodies — they have break masks
+	// that interact with the iteration mask.
+	if b.spmdFuncIsBody {
+		return false
+	}
+	// Lane count must be > 0 (sanity).
+	return loop.laneCount > 0
+}
+
 // spmdDecomposedIndex tracks a base+offset decomposed SPMD index value.
 // Used for byte-lane loops (laneCount > 4) where the full materialized vector
 // (<16 x i32>) would exceed WASM's 128-bit register width.

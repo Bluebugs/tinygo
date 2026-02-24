@@ -1318,6 +1318,33 @@ func TestSPMDIsFloat(t *testing.T) {
 	}
 }
 
+func TestSPMDLoopPeelingEligibility(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name     string
+		loop     spmdActiveLoop
+		funcBody bool // spmdFuncIsBody
+		want     bool
+	}{
+		{"rangeint_no_break", spmdActiveLoop{laneCount: 16}, false, true},
+		{"rangeindex_no_break", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, false, true},
+		{"spmd_func_body", spmdActiveLoop{laneCount: 4}, true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := newTestBuilder(t, c)
+			b.spmdFuncIsBody = tt.funcBody
+			got := b.spmdShouldPeelLoop(&tt.loop)
+			if got != tt.want {
+				t.Errorf("spmdShouldPeelLoop() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSPMDMaskStack(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
