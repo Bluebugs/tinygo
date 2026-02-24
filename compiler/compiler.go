@@ -1764,20 +1764,41 @@ func (b *builder) createFunction() {
 			iterType := b.getLLVMType(loop.boundValue.Type())
 			zero := llvm.ConstInt(iterType, 0, false)
 
-			// Find the block that jumps into the body block (the entry predecessor).
-			// For rangeint: the block before the body block (not the loop block).
-			// For rangeindex: same — the block whose successor is the body block,
-			// excluding the loop block itself.
+			// Find the entry predecessor block — the block that enters the SPMD loop
+			// from outside (not a back-edge from inside the loop).
+			// For rangeint: entry → body → loop → body. Body preds include entry.
+			// For rangeindex: entry → loop → body → loop. Body pred is only loop.
+			//   So for rangeindex, look at the loop block's predecessors instead.
 			var entryPredExit llvm.BasicBlock
-			for _, block := range b.fn.DomPreorder() {
-				if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
-					for _, pred := range block.Preds {
-						if _, isLoop := b.spmdLoopState.loopBlocks[pred.Index]; !isLoop {
-							entryPredExit = b.blockInfo[pred.Index].exit
-							break
+			if loop.isRangeIndex {
+				// rangeindex: find the loop block's predecessor that isn't the body.
+				for loopIdx, loopMatch := range b.spmdLoopState.loopBlocks {
+					if loopMatch == loop {
+						loopBlock := b.fn.Blocks[loopIdx]
+						for _, pred := range loopBlock.Preds {
+							if _, isBody := b.spmdLoopState.bodyBlocks[pred.Index]; !isBody {
+								if peeled.bodyBlockSet[pred.Index] {
+									continue // interior block, skip
+								}
+								entryPredExit = b.blockInfo[pred.Index].exit
+								break
+							}
 						}
+						break
 					}
-					break
+				}
+			} else {
+				// rangeint: find the body block's predecessor that isn't the loop block.
+				for _, block := range b.fn.DomPreorder() {
+					if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
+						for _, pred := range block.Preds {
+							if _, isLoop := b.spmdLoopState.loopBlocks[pred.Index]; !isLoop {
+								entryPredExit = b.blockInfo[pred.Index].exit
+								break
+							}
+						}
+						break
+					}
 				}
 			}
 
@@ -1793,7 +1814,8 @@ func (b *builder) createFunction() {
 			}
 
 			if peeled.tailIterPhi.IsNil() || entryPredExit.IsNil() || mainLoopExit.IsNil() || mainIterNext.IsNil() {
-				panic("spmd: loop peeling: failed to wire tail.check phi incoming values")
+				panic(fmt.Sprintf("spmd: loop peeling: failed to wire tail.check phi: tailIterPhi=%v entryPredExit=%v mainLoopExit=%v mainIterNext=%v fn=%s isRangeIndex=%v",
+					!peeled.tailIterPhi.IsNil(), !entryPredExit.IsNil(), !mainLoopExit.IsNil(), !mainIterNext.IsNil(), b.fn.Name(), loop.isRangeIndex))
 			}
 			peeled.tailIterPhi.AddIncoming(
 				[]llvm.Value{zero, mainIterNext},
@@ -2173,25 +2195,38 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 				}
 			}
 		}
-		// SPMD loop peeling: entry block Jump to body → conditional on alignedBound > 0.
+		// SPMD loop peeling: entry block Jump to body/loop → conditional on alignedBound > 0.
 		// The aligned bound is computed here (in the entry block) so that the main loop
 		// runs only when there is at least one full vector worth of elements.
 		// If alignedBound == 0, skip directly to tail.check.
+		// For rangeindex: entry → loop (succIdx is loop block).
+		// (rangeint loops are excluded from peeling by spmdShouldPeelLoop.)
+		// IMPORTANT: Only match the actual entry block, NOT body/interior blocks
+		// that also jump to the loop block (e.g., if.then, if.else in rangeindex).
 		if b.spmdPeeledLoops != nil && b.spmdLoopState != nil {
 			succIdx := instr.Block().Succs[0].Index
-			if loop, ok := b.spmdLoopState.bodyBlocks[succIdx]; ok {
+			var loop *spmdActiveLoop
+			if l, ok := b.spmdLoopState.bodyBlocks[succIdx]; ok {
+				loop = l
+			} else if l, ok := b.spmdLoopState.loopBlocks[succIdx]; ok {
+				loop = l
+			}
+			if loop != nil {
 				if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseMain {
-					// Compute aligned bound: bound & ~(laneCount-1).
-					// This is where Task 7 places the computation so it dominates both the
-					// main loop body and the tail.check block.
-					boundScalar := b.getValue(loop.boundValue, getPos(instr))
-					peeled.alignedBound = b.spmdComputeAlignedBound(boundScalar, loop.laneCount)
+					// Skip body/interior blocks — only the entry block gets the conditional.
+					if !peeled.bodyBlockSet[instr.Block().Index] {
+						// Compute aligned bound: bound & ~(laneCount-1).
+						// This is where Task 7 places the computation so it dominates both the
+						// main loop body and the tail.check block.
+						boundScalar := b.getValue(loop.boundValue, getPos(instr))
+						peeled.alignedBound = b.spmdComputeAlignedBound(boundScalar, loop.laneCount)
 
-					mainBody := b.blockInfo[succIdx].entry
-					zero := llvm.ConstInt(peeled.alignedBound.Type(), 0, false)
-					hasMain := b.CreateICmp(llvm.IntSGT, peeled.alignedBound, zero, "spmd.has.main")
-					b.CreateCondBr(hasMain, mainBody, peeled.tailCheckBlock)
-					break
+						mainEntry := b.blockInfo[succIdx].entry
+						zero := llvm.ConstInt(peeled.alignedBound.Type(), 0, false)
+						hasMain := b.CreateICmp(llvm.IntSGT, peeled.alignedBound, zero, "spmd.has.main")
+						b.CreateCondBr(hasMain, mainEntry, peeled.tailCheckBlock)
+						break
+					}
 				}
 			}
 		}

@@ -482,16 +482,55 @@ type spmdPeeledLoop struct {
 }
 
 // spmdShouldPeelLoop returns true if the given SPMD loop is eligible for peeling.
-// Loops inside SPMD function bodies (with break masks) are excluded because their
-// break mask interacts with the iteration mask in ways that peeling doesn't handle.
+// Currently restricted to rangeindex (range-over-slice) loops without accumulator
+// phis, because:
+// - rangeint loops have a different CFG (entry→body→loop) that isn't handled yet
+// - Accumulator phis in the loop block need rewiring across main/tail loops
+// - SPMD function bodies with break masks are excluded
 func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
 	// Don't peel loops in SPMD function bodies — they have break masks
 	// that interact with the iteration mask.
 	if b.spmdFuncIsBody {
 		return false
 	}
+	// Only peel rangeindex (range-over-slice) loops.
+	// rangeint loops (range N) have a different CFG structure
+	// (entry→body→loop→body vs entry→loop→body→loop) that isn't
+	// handled by the entry-condbr and tail.check phi wiring yet.
+	if !loop.isRangeIndex {
+		return false
+	}
+	// Don't peel loops inside closures (anonymous functions).
+	// Closures have complex entry blocks (captured variables, recover setup)
+	// that the entry predecessor detection doesn't handle.
+	if b.fn != nil && b.fn.Parent() != nil {
+		return false
+	}
 	// Lane count must be > 0 (sanity).
-	return loop.laneCount > 0
+	if loop.laneCount <= 0 {
+		return false
+	}
+	// Check for accumulator phis in the loop block.
+	// For rangeindex, the loop block (rangeindex.loop) has the iterator phi
+	// plus any accumulator phis (e.g., `total = phi [entry: 0, body: total+value]`).
+	// Peeling doesn't rewire accumulator phis across main/tail loops, so any
+	// loop with more than one phi in the loop block is ineligible.
+	if loop.incrBinOp == nil {
+		return false // defensive: incrBinOp must be set for any real loop
+	}
+	loopBlock := loop.incrBinOp.Block()
+	phiCount := 0
+	for _, instr := range loopBlock.Instrs {
+		if _, isPhi := instr.(*ssa.Phi); isPhi {
+			phiCount++
+			if phiCount > 1 {
+				return false // has accumulator phis beyond the iterator, don't peel
+			}
+		} else {
+			break // phis are always first in the block
+		}
+	}
+	return true
 }
 
 // spmdComputeAlignedBound computes bound & ~(laneCount-1) to get the last
@@ -4903,6 +4942,28 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 	savedBlockInfo := make([]blockInfo, len(b.blockInfo))
 	copy(savedBlockInfo, b.blockInfo)
 
+	// Save varying if condition values. The tail body re-processes the varying If
+	// instruction, which calls spmdDetectVaryingIf and overwrites info.cond with
+	// the tail-phase condition LLVM value. But the main-phase merge phi overrides
+	// reference info.cond and are resolved AFTER this function returns (during phi
+	// resolution). Without save/restore, the main-phase select would use a
+	// tail-phase value that doesn't dominate the main-phase block.
+	savedVaryingIfConds := make(map[int]llvm.Value)
+	for idx, info := range b.spmdVaryingIfs {
+		savedVaryingIfConds[idx] = info.cond
+	}
+	savedMaskTransitionConds := make(map[int]llvm.Value)
+	for idx, tr := range b.spmdMaskTransitions {
+		savedMaskTransitionConds[idx] = tr.cond
+	}
+	// Save then-exit redirects. spmdDetectVaryingIf writes to spmdThenExitRedirects
+	// using tail-phase blockInfo, which would store tail LLVM blocks. While main-phase
+	// Jumps are compiled before tail emission, save/restore prevents future misuse.
+	savedThenExitRedirects := make(map[int]llvm.BasicBlock)
+	for idx, block := range b.spmdThenExitRedirects {
+		savedThenExitRedirects[idx] = block
+	}
+
 	// Clone locals: keep values defined outside the SPMD body (from dominating blocks).
 	b.locals = make(map[ssa.Value]llvm.Value)
 	for k, v := range savedLocals {
@@ -5032,6 +5093,22 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 	b.spmdShiftedPtr = savedShifted
 	b.spmdMaskStack = savedMaskStack
 	copy(b.blockInfo, savedBlockInfo)
+
+	// Restore varying if conditions overwritten by tail-phase spmdDetectVaryingIf.
+	for idx, cond := range savedVaryingIfConds {
+		if info, ok := b.spmdVaryingIfs[idx]; ok {
+			info.cond = cond
+		}
+	}
+	for idx, cond := range savedMaskTransitionConds {
+		if tr, ok := b.spmdMaskTransitions[idx]; ok {
+			tr.cond = cond
+		}
+	}
+	// Restore then-exit redirects overwritten by tail-phase spmdDetectVaryingIf.
+	for idx, block := range savedThenExitRedirects {
+		b.spmdThenExitRedirects[idx] = block
+	}
 
 	// Restore to main phase.
 	peeled.phase = spmdLoopPhaseMain

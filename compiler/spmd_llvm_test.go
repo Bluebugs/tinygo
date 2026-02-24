@@ -1328,9 +1328,18 @@ func TestSPMDLoopPeelingEligibility(t *testing.T) {
 		funcBody bool // spmdFuncIsBody
 		want     bool
 	}{
-		{"rangeint_no_break", spmdActiveLoop{laneCount: 16}, false, true},
-		{"rangeindex_no_break", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, false, true},
+		// rangeint loops are not eligible for peeling (different CFG structure).
+		{"rangeint_no_break", spmdActiveLoop{laneCount: 16}, false, false},
+		// rangeindex loops are eligible in principle, but without a real SSA BinOp
+		// (incrBinOp == nil) the nil guard returns false. Full eligibility for
+		// rangeindex loops with proper SSA graphs is exercised by integration tests.
+		{"rangeindex_nil_incrBinOp", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, false, false},
+		// SPMD function bodies are always ineligible, regardless of loop kind.
 		{"spmd_func_body", spmdActiveLoop{laneCount: 4}, true, false},
+		// SPMD function body + rangeindex: funcBody check short-circuits before incrBinOp access.
+		{"spmd_func_body_rangeindex", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, true, false},
+		// Zero lane count is ineligible.
+		{"zero_lane_count", spmdActiveLoop{laneCount: 0, isRangeIndex: true}, false, false},
 	}
 
 	for _, tt := range tests {
