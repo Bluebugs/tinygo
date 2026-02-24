@@ -149,56 +149,57 @@ func (c *compilerContext) dispose() {
 type builder struct {
 	*compilerContext
 	llvm.Builder
-	fn                    *ssa.Function
-	llvmFnType            llvm.Type
-	llvmFn                llvm.Value
-	info                  functionInfo
-	locals                map[ssa.Value]llvm.Value // local variables
-	blockInfo             []blockInfo
-	currentBlock          *ssa.BasicBlock
-	currentBlockInfo      *blockInfo
-	tarjanStack           []uint
-	tarjanIndex           uint
-	phis                  []phiNode
-	deferPtr              llvm.Value
-	deferFrame            llvm.Value
-	stackChainAlloca      llvm.Value
-	landingpad            llvm.BasicBlock
-	difunc                llvm.Metadata
-	dilocals              map[*types.Var]llvm.Metadata
-	initInlinedAt         llvm.Metadata            // fake inlinedAt position
-	initPseudoFuncs       map[string]llvm.Metadata // fake "inlined" functions for proper init debug locations
-	allDeferFuncs         []interface{}
-	deferFuncs            map[*ssa.Function]int
-	deferInvokeFuncs      map[string]int
-	deferClosureFuncs     map[*ssa.Function]int
-	deferExprFuncs        map[ssa.Value]int
-	selectRecvBuf         map[*ssa.Select]llvm.Value
-	deferBuiltinFuncs     map[ssa.Value]deferBuiltin
-	runDefersBlock        []llvm.BasicBlock
-	afterDefersBlock      []llvm.BasicBlock
-	spmdLoopState         *spmdLoopState                     // SPMD loop analysis results (nil if no SPMD)
-	spmdValueOverride     map[ssa.Value]llvm.Value            // SPMD value substitutions (e.g., iter phi -> lane indices)
-	spmdDecomposed        map[ssa.Value]*spmdDecomposedIndex  // decomposed index values (scalar base + <N x i8> offset) for wide lanes
-	spmdVaryingIfs        map[int]*spmdVaryingIf              // if-block index -> varying if info
-	spmdThenExitRedirects map[int]llvm.BasicBlock             // then-exit block index -> else-entry LLVM block
-	spmdMergeSelects      map[int]*spmdVaryingIf              // merge block index -> varying if info
-	spmdEntryMask         llvm.Value                          // SPMD function entry mask (zero if not SPMD function)
-	spmdMaskStack         []llvm.Value                        // execution mask stack for nested varying if/else
-	spmdMaskTransitions   map[int]*spmdMaskTransition         // block index -> mask transition to apply
-	spmdContiguousPtr     map[ssa.Value]*spmdContiguousInfo   // IndexAddr SSA value -> contiguous access info
-	spmdFuncIsBody        bool                                // true if entire function body is an SPMD region (varying params, no go-for loops)
-	spmdForLoops          map[int]*spmdForLoopInfo            // body block index -> for-loop info (SPMD func body only)
-	spmdBreakRedirects    map[int]spmdBreakRedirect           // then-block index -> break redirect info
-	spmdBreakPhiOverrides map[*ssa.Phi]llvm.Value             // phi -> final value (for break result phis at rangeint.done)
-	spmdMergePhiOverrides map[*ssa.Phi]spmdMergePhiOverride   // phi -> override info (for multi-predecessor merge phis)
-	spmdSwitchChains        []spmdSwitchChain                   // detected varying switch chains
-	spmdSwitchIfBlocks      map[int]int                         // ifBlock.Index -> chain index in spmdSwitchChains
-	spmdSwitchBodyBlocks    map[int]int                         // bodyBlock.Index -> chain index in spmdSwitchChains
-	spmdSwitchRemainingMask llvm.Value                          // remaining mask during switch chain compilation
-	spmdDeferredSwitchPhis  []spmdDeferredSwitchPhi             // switch.done phis deferred until all case masks are ready
-	spmdCondChains          map[int]*spmdCondChain              // outerIfBlock.Index -> chain
-	spmdCondChainInner      map[int]*spmdCondChain              // innerBlock.Index -> chain (lookup)
+	fn                      *ssa.Function
+	llvmFnType              llvm.Type
+	llvmFn                  llvm.Value
+	info                    functionInfo
+	locals                  map[ssa.Value]llvm.Value // local variables
+	blockInfo               []blockInfo
+	currentBlock            *ssa.BasicBlock
+	currentBlockInfo        *blockInfo
+	tarjanStack             []uint
+	tarjanIndex             uint
+	phis                    []phiNode
+	deferPtr                llvm.Value
+	deferFrame              llvm.Value
+	stackChainAlloca        llvm.Value
+	landingpad              llvm.BasicBlock
+	difunc                  llvm.Metadata
+	dilocals                map[*types.Var]llvm.Metadata
+	initInlinedAt           llvm.Metadata            // fake inlinedAt position
+	initPseudoFuncs         map[string]llvm.Metadata // fake "inlined" functions for proper init debug locations
+	allDeferFuncs           []interface{}
+	deferFuncs              map[*ssa.Function]int
+	deferInvokeFuncs        map[string]int
+	deferClosureFuncs       map[*ssa.Function]int
+	deferExprFuncs          map[ssa.Value]int
+	selectRecvBuf           map[*ssa.Select]llvm.Value
+	deferBuiltinFuncs       map[ssa.Value]deferBuiltin
+	runDefersBlock          []llvm.BasicBlock
+	afterDefersBlock        []llvm.BasicBlock
+	spmdLoopState           *spmdLoopState                     // SPMD loop analysis results (nil if no SPMD)
+	spmdValueOverride       map[ssa.Value]llvm.Value           // SPMD value substitutions (e.g., iter phi -> lane indices)
+	spmdDecomposed          map[ssa.Value]*spmdDecomposedIndex // decomposed index values (scalar base + <N x i8> offset) for wide lanes
+	spmdVaryingIfs          map[int]*spmdVaryingIf             // if-block index -> varying if info
+	spmdThenExitRedirects   map[int]llvm.BasicBlock            // then-exit block index -> else-entry LLVM block
+	spmdMergeSelects        map[int]*spmdVaryingIf             // merge block index -> varying if info
+	spmdEntryMask           llvm.Value                         // SPMD function entry mask (zero if not SPMD function)
+	spmdMaskStack           []llvm.Value                       // execution mask stack for nested varying if/else
+	spmdMaskTransitions     map[int]*spmdMaskTransition        // block index -> mask transition to apply
+	spmdContiguousPtr       map[ssa.Value]*spmdContiguousInfo  // IndexAddr SSA value -> contiguous access info
+	spmdCoalescedStores     map[*ssa.Store]*spmdCoalescedStore // store → coalescing info (then/else pairs)
+	spmdFuncIsBody          bool                               // true if entire function body is an SPMD region (varying params, no go-for loops)
+	spmdForLoops            map[int]*spmdForLoopInfo           // body block index -> for-loop info (SPMD func body only)
+	spmdBreakRedirects      map[int]spmdBreakRedirect          // then-block index -> break redirect info
+	spmdBreakPhiOverrides   map[*ssa.Phi]llvm.Value            // phi -> final value (for break result phis at rangeint.done)
+	spmdMergePhiOverrides   map[*ssa.Phi]spmdMergePhiOverride  // phi -> override info (for multi-predecessor merge phis)
+	spmdSwitchChains        []spmdSwitchChain                  // detected varying switch chains
+	spmdSwitchIfBlocks      map[int]int                        // ifBlock.Index -> chain index in spmdSwitchChains
+	spmdSwitchBodyBlocks    map[int]int                        // bodyBlock.Index -> chain index in spmdSwitchChains
+	spmdSwitchRemainingMask llvm.Value                         // remaining mask during switch chain compilation
+	spmdDeferredSwitchPhis  []spmdDeferredSwitchPhi            // switch.done phis deferred until all case masks are ready
+	spmdCondChains          map[int]*spmdCondChain             // outerIfBlock.Index -> chain
+	spmdCondChainInner      map[int]*spmdCondChain             // innerBlock.Index -> chain (lookup)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1486,6 +1487,7 @@ func (b *builder) createFunction() {
 		b.spmdMergeSelects = make(map[int]*spmdVaryingIf)
 		b.spmdMaskTransitions = make(map[int]*spmdMaskTransition)
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
+		b.spmdCoalescedStores = make(map[*ssa.Store]*spmdCoalescedStore)
 		b.spmdBreakRedirects = make(map[int]spmdBreakRedirect)
 		b.spmdBreakPhiOverrides = make(map[*ssa.Phi]llvm.Value)
 		b.spmdMergePhiOverrides = make(map[*ssa.Phi]spmdMergePhiOverride)
@@ -2157,6 +2159,60 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 	case *ssa.Send:
 		b.createChanSend(instr)
 	case *ssa.Store:
+		// SPMD: check for coalesced store (matching stores in then/else branches).
+		if b.spmdCoalescedStores != nil {
+			if coal, ok := b.spmdCoalescedStores[instr]; ok {
+				if instr == coal.thenStore {
+					// Then-store: skip emission. The else-store will emit the coalesced store.
+					return
+				}
+				if instr == coal.elseStore {
+					// Else-store: emit select(cond, thenVal, elseVal) + single store.
+					// coal.ifInfo.cond is populated during *ssa.If compilation
+					// (before this store in DomPreorder), so it is normally valid here.
+					// Guard against edge cases (e.g., LOR chain ordering) where
+					// the condition may not yet be set.
+					cond := coal.ifInfo.cond
+					if cond.IsNil() {
+						break // Fall through to normal store handling.
+					}
+
+					thenVal := b.getValue(coal.thenStore.Val, getPos(instr))
+					elseVal := b.getValue(coal.elseStore.Val, getPos(instr))
+
+					// Broadcast scalars to vectors if needed.
+					thenVal, elseVal = b.spmdBroadcastMatch(thenVal, elseVal)
+
+					// Select using the varying if condition.
+					selected := b.spmdMaskSelect(cond, thenVal, elseVal)
+
+					// Use parent mask (before the varying if pushed its mask).
+					parentMask := b.spmdParentMask()
+					if parentMask.IsNil() {
+						// Fallback: if no parent mask, use all-ones.
+						laneCount := selected.Type().VectorSize()
+						parentMask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount))
+					}
+
+					// Emit single store with parent mask.
+					llvmAddr := b.getValue(instr.Addr, getPos(instr))
+					if b.spmdContiguousPtr != nil {
+						if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
+							b.spmdMaskedStore(selected, ci.scalarPtr, parentMask)
+							return
+						}
+					}
+					if llvmAddr.Type().TypeKind() == llvm.VectorTypeKind {
+						b.spmdMaskedScatter(selected, llvmAddr, parentMask)
+						return
+					}
+					// Fallback: plain store (non-SPMD address).
+					b.CreateStore(selected, llvmAddr)
+					return
+				}
+			}
+		}
+
 		llvmAddr := b.getValue(instr.Addr, getPos(instr))
 		llvmVal := b.getValue(instr.Val, getPos(instr))
 

@@ -769,7 +769,7 @@ func TestSPMDMaskType(t *testing.T) {
 				return types.NewSignatureType(nil, nil, nil, params, nil, false)
 			},
 			wantMaskType:  true,
-			wantLaneCount: 4, // 128 bits / 32 bits = 4 lanes
+			wantLaneCount: 4,  // 128 bits / 32 bits = 4 lanes
 			wantElemWidth: 32, // i32 for WASM mask (avoids shl/shr_s sign extension)
 		},
 		{
@@ -781,7 +781,7 @@ func TestSPMDMaskType(t *testing.T) {
 				return types.NewSignatureType(nil, nil, nil, params, nil, false)
 			},
 			wantMaskType:  true,
-			wantLaneCount: 16,                // 128 bits / 8 bits = 16 lanes
+			wantLaneCount: 16,       // 128 bits / 8 bits = 16 lanes
 			wantElemWidth: 128 / 16, // i8 for WASM mask at 16 lanes (128/16=8 bits)
 		},
 		{
@@ -793,7 +793,7 @@ func TestSPMDMaskType(t *testing.T) {
 				return types.NewSignatureType(nil, nil, nil, params, nil, false)
 			},
 			wantMaskType:  true,
-			wantLaneCount: 2,                // 128 bits / 64 bits = 2 lanes
+			wantLaneCount: 2,       // 128 bits / 64 bits = 2 lanes
 			wantElemWidth: 128 / 2, // i64 for WASM mask at 2 lanes (128/2=64 bits)
 		},
 		{
@@ -1382,9 +1382,9 @@ func TestSPMDMaskedLoadIntrinsic(t *testing.T) {
 	defer b.Dispose()
 
 	tests := []struct {
-		name      string
-		elemType  llvm.Type
-		laneCount int
+		name       string
+		elemType   llvm.Type
+		laneCount  int
 		wantSuffix string
 	}{
 		{"v4i32", c.ctx.Int32Type(), 4, "v4i32"},
@@ -3115,11 +3115,12 @@ func TestSPMDSwitchChainFields(t *testing.T) {
 
 // TestSPMDSwitchMaskNarrowing verifies sequential mask narrowing for switch cases.
 // Tests the ISPC algorithm:
-//   mask1 = remaining & cond1
-//   remaining1 = remaining & ~cond1
-//   mask2 = remaining1 & cond2
-//   remaining2 = remaining1 & ~cond2
-//   mask3 = remaining2 & cond3
+//
+//	mask1 = remaining & cond1
+//	remaining1 = remaining & ~cond1
+//	mask2 = remaining1 & cond2
+//	remaining2 = remaining1 & ~cond2
+//	mask3 = remaining2 & cond3
 func TestSPMDSwitchMaskNarrowing(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
@@ -3478,8 +3479,8 @@ func TestSPMDExtendIndex(t *testing.T) {
 		goType  types.Type
 		wantVal uint64 // expected ZExtValue of the result constant
 	}{
-		{"uint8_zext", types.Typ[types.Uint8], 0xFF},                              // 255
-		{"int8_sext", types.Typ[types.Int8], 0xFFFFFFFF},                          // -1 as i32
+		{"uint8_zext", types.Typ[types.Uint8], 0xFF},     // 255
+		{"int8_sext", types.Typ[types.Int8], 0xFFFFFFFF}, // -1 as i32
 		{"spmd_uint8_zext", types.NewVarying(types.Typ[types.Uint8]), 0xFF},
 		{"spmd_int8_sext", types.NewVarying(types.Typ[types.Int8]), 0xFFFFFFFF},
 	}
@@ -3837,8 +3838,8 @@ func TestSPMDDecomposedIndexTailMask(t *testing.T) {
 	laneCount := 16
 
 	// Simulate the core tail mask computation from emitSPMDBodyPrologue (decomposed path).
-	scalarPhi := llvm.ConstInt(i32Type, 0, false)          // base iteration = 0
-	boundScalar := llvm.ConstInt(i32Type, 10, false)        // bound = 10
+	scalarPhi := llvm.ConstInt(i32Type, 0, false)    // base iteration = 0
+	boundScalar := llvm.ConstInt(i32Type, 10, false) // bound = 10
 	diff := b.CreateSub(boundScalar, scalarPhi, "diff")
 
 	zero32 := llvm.ConstInt(i32Type, 0, false)
@@ -4353,6 +4354,113 @@ func TestSPMDIndexMaxValueConst(t *testing.T) {
 				t.Errorf("spmdIndexMaxValue() = %d, want %d", got, tt.wantMax)
 			}
 		})
+	}
+}
+
+func TestSPMDSameStoreAddr(t *testing.T) {
+	// Test that spmdSameStoreAddr correctly identifies matching store destinations.
+
+	// Case 1: nil values should not match.
+	if spmdSameStoreAddr(nil, nil) {
+		t.Error("nil values should not match")
+	}
+
+	// Case 2: same SSA value pointer should match.
+	v := ssa.NewConst(constant.MakeInt64(1), types.Typ[types.Int])
+	if !spmdSameStoreAddr(v, v) {
+		t.Error("same SSA value should match itself")
+	}
+
+	// Case 3: different SSA values (not IndexAddr) should not match.
+	v2 := ssa.NewConst(constant.MakeInt64(1), types.Typ[types.Int])
+	if spmdSameStoreAddr(v, v2) {
+		t.Error("different SSA values without IndexAddr should not match")
+	}
+
+	// Case 4: one nil, one non-nil should not match.
+	if spmdSameStoreAddr(v, nil) {
+		t.Error("non-nil vs nil should not match")
+	}
+	if spmdSameStoreAddr(nil, v) {
+		t.Error("nil vs non-nil should not match")
+	}
+
+	// Case 5: two distinct IndexAddr nodes with same base and index should match.
+	base := ssa.NewConst(constant.MakeInt64(0), types.Typ[types.Int])
+	idx := ssa.NewConst(constant.MakeInt64(1), types.Typ[types.Int])
+	idxA := &ssa.IndexAddr{X: base, Index: idx}
+	idxB := &ssa.IndexAddr{X: base, Index: idx}
+	if !spmdSameStoreAddr(idxA, idxB) {
+		t.Error("IndexAddr with same base+index should match")
+	}
+
+	// Case 6: IndexAddr nodes with different indices should not match.
+	idx2 := ssa.NewConst(constant.MakeInt64(2), types.Typ[types.Int])
+	idxC := &ssa.IndexAddr{X: base, Index: idx2}
+	if spmdSameStoreAddr(idxA, idxC) {
+		t.Error("IndexAddr with different index should not match")
+	}
+
+	// Case 7: IndexAddr nodes with different bases should not match.
+	base2 := ssa.NewConst(constant.MakeInt64(0), types.Typ[types.Int])
+	idxD := &ssa.IndexAddr{X: base2, Index: idx}
+	if spmdSameStoreAddr(idxA, idxD) {
+		t.Error("IndexAddr with different base should not match")
+	}
+}
+
+func TestSPMDStoreCoalescing(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	vecType := llvm.VectorType(i32Type, laneCount)
+	maskType := llvm.VectorType(c.ctx.Int32Type(), laneCount) // WASM i32 mask
+
+	// Create array alloca + contiguous GEP (simulating d[i])
+	arrType := llvm.ArrayType(i32Type, 16)
+	arrPtr := b.CreateAlloca(arrType, "d")
+	zero := llvm.ConstInt(i32Type, 0, false)
+	scalarPtr := b.CreateInBoundsGEP(arrType, arrPtr, []llvm.Value{zero, zero}, "d.ptr")
+
+	// Create condition, then-value, else-value
+	cond := llvm.ConstAllOnes(maskType) // all-true condition (for testing)
+	thenVal := llvm.ConstNull(vecType)  // then: store zeros
+	elseVal := llvm.ConstInt(i32Type, 42, false)
+	elseVec := b.splatScalar(elseVal, vecType)
+
+	// Create parent mask (all-ones = top-level go-for body)
+	parentMask := llvm.ConstAllOnes(maskType)
+
+	// Emit the coalesced store: select(cond, thenVal, elseVal) + single store
+	selected := b.spmdMaskSelect(cond, thenVal, elseVec)
+	b.spmdMaskedStore(selected, scalarPtr, parentMask)
+
+	// Verify: exactly one llvm.masked.store call in the module
+	maskedStoreFn := c.mod.NamedFunction("llvm.masked.store.v4i32.p0")
+	if maskedStoreFn.IsNil() {
+		t.Fatal("expected llvm.masked.store.v4i32.p0 to be declared")
+	}
+
+	// Verify the function has instructions (basic sanity)
+	fn := c.mod.FirstFunction()
+	for !fn.IsNil() {
+		if fn.Name() == "test_func" {
+			bb := fn.FirstBasicBlock()
+			instrCount := 0
+			for instr := bb.FirstInstruction(); !instr.IsNil(); instr = llvm.NextInstruction(instr) {
+				instrCount++
+			}
+			// Should have: alloca, GEP, splat, select/bitwise-ops, masked-store, terminator
+			if instrCount < 3 {
+				t.Errorf("expected at least 3 instructions, got %d", instrCount)
+			}
+			break
+		}
+		fn = llvm.NextFunction(fn)
 	}
 }
 

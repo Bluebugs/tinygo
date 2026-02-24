@@ -914,6 +914,16 @@ func (b *builder) spmdCurrentMask() llvm.Value {
 	return llvm.Value{}
 }
 
+// spmdParentMask returns the mask one level below the top of the stack.
+// This is the mask that was active before the current varying if pushed its mask.
+// Returns nil Value if the stack has fewer than 2 elements.
+func (b *builder) spmdParentMask() llvm.Value {
+	if len(b.spmdMaskStack) >= 2 {
+		return b.spmdMaskStack[len(b.spmdMaskStack)-2]
+	}
+	return llvm.Value{}
+}
+
 // spmdVaryingIf holds analysis results for a varying (vector) if/else construct.
 type spmdVaryingIf struct {
 	cond              llvm.Value // vector condition: <N x i1> on non-WASM, <N x i32> on WASM
@@ -935,9 +945,9 @@ type spmdSwitchCase struct {
 // spmdSwitchChain holds a detected varying switch chain.
 type spmdSwitchChain struct {
 	cases       []spmdSwitchCase
-	defaultBody int        // block index of default case body (-1 if none)
-	doneBlock   int        // block index of switch.done merge
-	tagValue    ssa.Value  // the switch tag SSA value (for reference)
+	defaultBody int       // block index of default case body (-1 if none)
+	doneBlock   int       // block index of switch.done merge
+	tagValue    ssa.Value // the switch tag SSA value (for reference)
 }
 
 // spmdDeferredSwitchPhi tracks a phi at switch.done that needs deferred resolution.
@@ -1001,6 +1011,95 @@ type spmdMaskTransition struct {
 type spmdContiguousInfo struct {
 	scalarPtr llvm.Value      // scalar GEP result (base of contiguous access)
 	loop      *spmdActiveLoop // owning loop (for lane count)
+}
+
+// spmdCoalescedStore represents a pair of stores in then/else branches of a varying
+// if/else that write to the same destination. Instead of two masked stores, codegen
+// emits select(cond, thenVal, elseVal) + one store with the parent mask.
+type spmdCoalescedStore struct {
+	thenStore *ssa.Store     // store in then-branch (skipped during codegen)
+	elseStore *ssa.Store     // store in else-branch (emits the coalesced store)
+	ifInfo    *spmdVaryingIf // the varying if that contains them
+}
+
+// spmdSameStoreAddr checks whether two SSA values represent the same store destination.
+// Returns true if they are the same SSA value, or both are *ssa.IndexAddr with the
+// same base (.X) and index (.Index).
+func spmdSameStoreAddr(a, b ssa.Value) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	idxA, okA := a.(*ssa.IndexAddr)
+	idxB, okB := b.(*ssa.IndexAddr)
+	if okA && okB && idxA.X == idxB.X && idxA.Index == idxB.Index {
+		return true
+	}
+	return false
+}
+
+// spmdCollectBranchStores collects all *ssa.Store instructions reachable from
+// entryBlock without crossing the merge block or the barrier (if-block).
+// Returns a map from store destination (Addr) to the last store to that address.
+func (b *builder) spmdCollectBranchStores(entryBlock, merge, barrier *ssa.BasicBlock) map[ssa.Value]*ssa.Store {
+	stores := make(map[ssa.Value]*ssa.Store)
+	visited := make(map[int]bool)
+
+	var walk func(*ssa.BasicBlock)
+	walk = func(block *ssa.BasicBlock) {
+		if block == nil || block == merge || block == barrier || visited[block.Index] {
+			return
+		}
+		visited[block.Index] = true
+		for _, instr := range block.Instrs {
+			if store, ok := instr.(*ssa.Store); ok {
+				stores[store.Addr] = store
+			}
+		}
+		for _, succ := range block.Succs {
+			walk(succ)
+		}
+	}
+	walk(entryBlock)
+	return stores
+}
+
+// spmdAnalyzeCoalescedStores detects matching stores in the then and else branches
+// of a varying if/else and records them in spmdCoalescedStores for codegen.
+func (b *builder) spmdAnalyzeCoalescedStores(info *spmdVaryingIf) {
+	if !info.hasElse {
+		return // No else branch → nothing to coalesce
+	}
+
+	ifBlock := b.fn.Blocks[info.ifBlockIndex]
+	thenEntry := b.fn.Blocks[info.thenEntryIndex]
+	elseEntry := b.fn.Blocks[info.elseEntryIndex]
+	merge := b.fn.Blocks[info.mergeIndex]
+
+	thenStores := b.spmdCollectBranchStores(thenEntry, merge, ifBlock)
+	elseStores := b.spmdCollectBranchStores(elseEntry, merge, ifBlock)
+
+	// Match then-stores to else-stores by destination address.
+	for thenAddr, thenStore := range thenStores {
+		for elseAddr, elseStore := range elseStores {
+			if spmdSameStoreAddr(thenAddr, elseAddr) {
+				// Verify both values have the same type.
+				if !types.Identical(thenStore.Val.Type(), elseStore.Val.Type()) {
+					continue
+				}
+				coal := &spmdCoalescedStore{
+					thenStore: thenStore,
+					elseStore: elseStore,
+					ifInfo:    info,
+				}
+				b.spmdCoalescedStores[thenStore] = coal
+				b.spmdCoalescedStores[elseStore] = coal
+				break // One match per then-store
+			}
+		}
+	}
 }
 
 // isBlockInSPMDBody checks if a given SSA block is inside an SPMD loop body.
@@ -1188,7 +1287,7 @@ func (b *builder) spmdDetectCondChains() {
 		// Create new chain.
 		var thenTarget, elseTarget int
 		if op == token.LAND {
-			thenTarget = block.Succs[0].Index  // innermost then
+			thenTarget = block.Succs[0].Index      // innermost then
 			elseTarget = outerBlock.Succs[1].Index // shared false (== inner false)
 		} else {
 			thenTarget = outerBlock.Succs[0].Index // shared true (== inner true)
@@ -1249,6 +1348,10 @@ func (b *builder) preDetectVaryingIfs() {
 		// Check if condition is varying (SPMDType).
 		if _, ok := ifInstr.Cond.Type().(*types.SPMDType); ok {
 			b.spmdAnalyzeVaryingIf(block)
+			// Detect matching stores in then/else branches for coalescing.
+			if info, ok := b.spmdVaryingIfs[block.Index]; ok {
+				b.spmdAnalyzeCoalescedStores(info)
+			}
 		}
 	}
 }
@@ -2520,7 +2623,7 @@ func spmdRotateWithinMask(totalLanes, groupSize, offset int) []uint64 {
 		lane := i % groupSize
 		// Positive offset rotates left: lane i gets value from lane (i+offset) % groupSize.
 		// The modulo handles wrap-around and negative offsets.
-		src := ((lane + offset) % groupSize + groupSize) % groupSize
+		src := ((lane+offset)%groupSize + groupSize) % groupSize
 		mask[i] = uint64(group*groupSize + src)
 	}
 	return mask
@@ -2970,23 +3073,23 @@ func (b *builder) spmdMaskedScatter(val, ptrs, mask llvm.Value) {
 
 // spmdBreakResult tracks a phi at rangeint.done that receives a break value.
 type spmdBreakResult struct {
-	phi          *ssa.Phi   // the phi at rangeint.done
-	alloca       llvm.Value // alloca for accumulated break result
-	breakEdge    int        // index into phi.Edges for the break edge
-	breakVal     ssa.Value  // SSA value on break edge
-	defaultVal   ssa.Value  // SSA value on non-break edge (entry or if.done)
-	defaultEdge  int        // index of the default edge
+	phi         *ssa.Phi   // the phi at rangeint.done
+	alloca      llvm.Value // alloca for accumulated break result
+	breakEdge   int        // index into phi.Edges for the break edge
+	breakVal    ssa.Value  // SSA value on break edge
+	defaultVal  ssa.Value  // SSA value on non-break edge (entry or if.done)
+	defaultEdge int        // index of the default edge
 }
 
 // spmdForLoopInfo tracks a regular for-range loop inside an SPMD function body.
 type spmdForLoopInfo struct {
-	loopBlockIndex  int                  // rangeint.loop block index (or bodyBlockIndex for merged pattern)
-	bodyBlockIndex  int                  // rangeint.body block index
-	doneBlockIndex  int                  // rangeint.done block index
-	breakMaskAlloca llvm.Value           // alloca for <N x i1> break mask (persists across iterations)
-	laneCount       int                  // SIMD lane count
-	breakResults    []spmdBreakResult    // phis at done block with break values
-	earlyExitBlocks []llvm.BasicBlock    // blocks that jump to done on all-lanes-broken
+	loopBlockIndex  int               // rangeint.loop block index (or bodyBlockIndex for merged pattern)
+	bodyBlockIndex  int               // rangeint.body block index
+	doneBlockIndex  int               // rangeint.done block index
+	breakMaskAlloca llvm.Value        // alloca for <N x i1> break mask (persists across iterations)
+	laneCount       int               // SIMD lane count
+	breakResults    []spmdBreakResult // phis at done block with break values
+	earlyExitBlocks []llvm.BasicBlock // blocks that jump to done on all-lanes-broken
 }
 
 // spmdBreakRedirect tracks a varying if statement where the then-branch breaks from a loop.
@@ -3377,7 +3480,7 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 				// c >/>= (base+offset): when c < base → all false; when c >= base+N → all true.
 				negResult = allFalse
 				overResult = allTrue
-			// EQL and NEQ are symmetric; negResult/overResult already set correctly above.
+				// EQL and NEQ are symmetric; negResult/overResult already set correctly above.
 			}
 		}
 
@@ -3912,9 +4015,10 @@ func (b *builder) spmdIsVaryingBreak(ifBlock *ssa.BasicBlock) (*spmdForLoopInfo,
 // case mask via sequential narrowing and registers mask transitions.
 //
 // Algorithm (ISPC approach):
-//   remainingMask = currentMask (for first case) or b.spmdSwitchRemainingMask (subsequent)
-//   caseMask = remainingMask & cond
-//   remainingMask = remainingMask & ~cond
+//
+//	remainingMask = currentMask (for first case) or b.spmdSwitchRemainingMask (subsequent)
+//	caseMask = remainingMask & cond
+//	remainingMask = remainingMask & ~cond
 //
 // For the last case, also handles the default body by pushing the remaining mask.
 func (b *builder) spmdCompileSwitchIf(block *ssa.BasicBlock, cond llvm.Value, chainIdx int) {
@@ -4013,9 +4117,10 @@ func (b *builder) spmdIsSwitchDoneBlock(blockIdx int) int {
 // masks computed during switch compilation.
 //
 // Algorithm:
-//   result = defaultValue (or zero if no default)
-//   for each case i (first to last):
-//     result = select(caseMask[i], caseValue[i], result)
+//
+//	result = defaultValue (or zero if no default)
+//	for each case i (first to last):
+//	  result = select(caseMask[i], caseValue[i], result)
 func (b *builder) spmdCreateSwitchMergeSelect(phi *ssa.Phi, chainIdx int) (llvm.Value, bool) {
 	chain := &b.spmdSwitchChains[chainIdx]
 
