@@ -1988,6 +1988,16 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		block := instr.Block()
 		blockThen := b.blockInfo[block.Succs[0].Index].entry
 		blockElse := b.blockInfo[block.Succs[1].Index].entry
+		// SPMD loop peeling: redirect the loop block's false (exit) branch to tail.check.
+		// This applies only to the main phase — in the tail phase the loop block is not
+		// emitted at all, so there is no branch to redirect.
+		if b.spmdPeeledLoops != nil && b.spmdLoopState != nil {
+			if loop, ok := b.spmdLoopState.loopBlocks[block.Index]; ok {
+				if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseMain {
+					blockElse = peeled.tailCheckBlock
+				}
+			}
+		}
 		// SPMD: check for switch chain If before other varying-if handling.
 		if chainIdx, ok := b.spmdSwitchIfBlocks[block.Index]; ok {
 			b.spmdCompileSwitchIf(block, cond, chainIdx)
@@ -2897,6 +2907,16 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					}
 					y = llvm.ConstInt(x.Type(), uint64(loop.laneCount), false)
 				}
+			}
+		}
+		// SPMD loop peeling: replace bound with alignedBound in the loop exit comparison.
+		// This makes the main loop iterate only over full vectors (incr < alignedBound),
+		// with the tail handling the remaining 0 to laneCount-1 elements.
+		// Note: x is already the scalar incr value from the +laneCount override above.
+		if expr.Op == token.LSS {
+			if alignedBound, ok := b.spmdIsLoopExitBound(expr); ok {
+				// Scalar comparison: incr < alignedBound → scalar i1 result.
+				return b.CreateICmp(llvm.IntSLT, x, alignedBound, ""), nil
 			}
 		}
 		result, err := b.createBinOp(expr.Op, expr.X.Type(), expr.Y.Type(), x, y, expr.Pos())
