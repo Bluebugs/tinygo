@@ -479,7 +479,8 @@ type spmdPeeledLoop struct {
 	tailExitBlock  llvm.BasicBlock  // convergence point (original loop exit)
 	tailIterPhi    llvm.Value       // phi in tailCheck for the iter value at main loop exit
 	bodyBlockSet   map[int]bool     // set of SSA block indices belonging to this loop body
-	phase          spmdLoopPhase    // current emission phase (Main or Tail)
+	phase           spmdLoopPhase              // current emission phase (Main or Tail)
+	accumulatorPhis map[*ssa.Phi]llvm.Value   // SSA accumulator phi → tail.check LLVM phi
 
 	// Advancing pointer phis for interleaved store groups (main phase only).
 	// Each group's destination pointer advances by stride*laneCount bytes per
