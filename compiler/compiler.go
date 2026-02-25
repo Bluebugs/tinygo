@@ -2410,7 +2410,12 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 					llvmAddr := b.getValue(instr.Addr, getPos(instr))
 					if b.spmdContiguousPtr != nil {
 						if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
-							b.spmdMaskedStore(selected, ci.scalarPtr, parentMask)
+							// Cap-based optimization: use load-blend-store when safe.
+							if !ci.sliceCap.IsNil() && !b.spmdIsConstAllOnesMask(parentMask) {
+								b.spmdFullStoreWithBlend(selected, ci, parentMask)
+							} else {
+								b.spmdMaskedStore(selected, ci.scalarPtr, parentMask)
+							}
 							return
 						}
 					}
@@ -2459,7 +2464,12 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 					vecType := llvm.VectorType(llvmVal.Type(), ci.loop.laneCount)
 					llvmVal = b.splatScalar(llvmVal, vecType)
 				}
-				b.spmdMaskedStore(llvmVal, ci.scalarPtr, mask)
+				// Cap-based optimization: use load-blend-store when safe.
+				if !ci.sliceCap.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
+					b.spmdFullStoreWithBlend(llvmVal, ci, mask)
+				} else {
+					b.spmdMaskedStore(llvmVal, ci.scalarPtr, mask)
+				}
 				return
 			}
 		}

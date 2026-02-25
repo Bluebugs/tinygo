@@ -5680,3 +5680,171 @@ func TestSPMDFullLoadCapTypeMismatch(t *testing.T) {
 		})
 	}
 }
+
+// TestSPMDFullStoreWithBlend verifies that spmdFullStoreWithBlend emits the
+// correct branch structure: cap check → blend BB (load+select+store) | masked-store BB → merge.
+func TestSPMDFullStoreWithBlend(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	vecType := llvm.VectorType(i32Type, laneCount)
+
+	scalarIndex := llvm.ConstInt(b.uintptrType, 8, false)
+	sliceCap := llvm.ConstInt(b.uintptrType, 16, false)
+
+	arrType := llvm.ArrayType(i32Type, 16)
+	alloca := b.CreateAlloca(arrType, "test.buf")
+	zero := llvm.ConstInt(i32Type, 0, false)
+	scalarPtr := b.CreateInBoundsGEP(arrType, alloca, []llvm.Value{zero, zero}, "test.ptr")
+
+	maskElemType := i32Type
+	mask := llvm.ConstVector([]llvm.Value{
+		llvm.ConstAllOnes(maskElemType),
+		llvm.ConstAllOnes(maskElemType),
+		llvm.ConstNull(maskElemType),
+		llvm.ConstNull(maskElemType),
+	}, false)
+
+	storeVal := llvm.ConstNull(vecType)
+
+	ci := &spmdContiguousInfo{
+		scalarPtr:   scalarPtr,
+		loop:        &spmdActiveLoop{laneCount: laneCount},
+		sliceCap:    sliceCap,
+		scalarIndex: scalarIndex,
+	}
+
+	b.spmdFullStoreWithBlend(storeVal, ci, mask)
+	b.CreateRetVoid()
+
+	ir := c.mod.String()
+
+	if !strings.Contains(ir, "llvm.masked.store") {
+		t.Error("IR should contain llvm.masked.store for the fallback path")
+	}
+	if !strings.Contains(ir, "spmd.blend") {
+		t.Error("IR should contain spmd.blend basic block")
+	}
+	if !strings.Contains(ir, "spmd.maskedstore") {
+		t.Error("IR should contain spmd.maskedstore basic block")
+	}
+	if !strings.Contains(ir, "spmd.store.merge") {
+		t.Error("IR should contain spmd.store.merge basic block")
+	}
+	if !strings.Contains(ir, "spmd.blend.old") {
+		t.Error("IR should contain spmd.blend.old load in the blend path")
+	}
+}
+
+// TestSPMDFullStoreCapTypeMismatch verifies that spmdFullStoreWithBlend handles
+// integer type mismatches between the scalar index and slice cap without
+// panicking, and produces valid IR with the appropriate extend/truncate
+// instruction.
+//
+// LLVM constant-folds trunc/zext on ConstInt values, so the index and cap
+// must be non-constant (function parameters) to keep the cast instructions
+// visible in the IR.
+func TestSPMDFullStoreCapTypeMismatch(t *testing.T) {
+	laneCount := 4
+
+	tests := []struct {
+		name         string
+		indexType    func(c *compilerContext) llvm.Type
+		capType      func(c *compilerContext) llvm.Type
+		wantIRString string
+	}{
+		{
+			// scalarIndex is i32 (uintptr on wasm32), sliceCap is i64.
+			// cap (64 bits) > iter (32 bits) -> Trunc path.
+			name:         "i32 index, i64 cap",
+			indexType:    func(c *compilerContext) llvm.Type { return c.ctx.Int32Type() },
+			capType:      func(c *compilerContext) llvm.Type { return c.ctx.Int64Type() },
+			wantIRString: "spmd.cap.trunc",
+		},
+		{
+			// scalarIndex is i64, sliceCap is i32 (uintptr on wasm32).
+			// cap (32 bits) < iter (64 bits) -> ZExt path.
+			name:         "i64 index, i32 cap",
+			indexType:    func(c *compilerContext) llvm.Type { return c.ctx.Int64Type() },
+			capType:      func(c *compilerContext) llvm.Type { return c.ctx.Int32Type() },
+			wantIRString: "spmd.cap.ext",
+		},
+		{
+			// Both i32 — the common case on wasm32. No cast needed.
+			name:         "i32 index, i32 cap",
+			indexType:    func(c *compilerContext) llvm.Type { return c.ctx.Int32Type() },
+			capType:      func(c *compilerContext) llvm.Type { return c.ctx.Int32Type() },
+			wantIRString: "spmd.can.fullstore",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestCompilerContext(t)
+			defer c.dispose()
+
+			i32Type := c.ctx.Int32Type()
+			vecType := llvm.VectorType(i32Type, laneCount)
+
+			idxType := tc.indexType(c)
+			capType := tc.capType(c)
+
+			ptrType := llvm.PointerType(i32Type, 0)
+			paramTypes := []llvm.Type{idxType, capType, ptrType}
+			fnType := llvm.FunctionType(c.ctx.VoidType(), paramTypes, false)
+			fn := llvm.AddFunction(c.mod, "test_func_store_mismatch", fnType)
+			bb := llvm.AddBasicBlock(fn, "entry")
+
+			b := &builder{compilerContext: c}
+			b.Builder = c.ctx.NewBuilder()
+			defer b.Dispose()
+			b.llvmFn = fn
+			b.SetInsertPointAtEnd(bb)
+
+			scalarIndex := fn.Param(0)
+			sliceCap := fn.Param(1)
+			scalarPtr := fn.Param(2)
+
+			maskElemType := i32Type
+			mask := llvm.ConstVector([]llvm.Value{
+				llvm.ConstAllOnes(maskElemType),
+				llvm.ConstAllOnes(maskElemType),
+				llvm.ConstNull(maskElemType),
+				llvm.ConstNull(maskElemType),
+			}, false)
+
+			storeVal := llvm.ConstNull(vecType)
+
+			ci := &spmdContiguousInfo{
+				scalarPtr:   scalarPtr,
+				loop:        &spmdActiveLoop{laneCount: laneCount},
+				sliceCap:    sliceCap,
+				scalarIndex: scalarIndex,
+			}
+
+			b.spmdFullStoreWithBlend(storeVal, ci, mask)
+			b.CreateRetVoid()
+
+			ir := c.mod.String()
+			if !strings.Contains(ir, tc.wantIRString) {
+				t.Errorf("IR should contain %q", tc.wantIRString)
+			}
+			if !strings.Contains(ir, "spmd.blend") {
+				t.Error("IR should contain spmd.blend basic block")
+			}
+			if !strings.Contains(ir, "spmd.maskedstore") {
+				t.Error("IR should contain spmd.maskedstore basic block")
+			}
+			// Same-width case must NOT have cast instructions.
+			if tc.name == "i32 index, i32 cap" {
+				if strings.Contains(ir, "spmd.cap.ext") || strings.Contains(ir, "spmd.cap.trunc") {
+					t.Error("same-width case should not have ext/trunc instructions")
+				}
+			}
+		})
+	}
+}

@@ -3649,6 +3649,70 @@ func (b *builder) spmdMaskedStore(val, ptr, mask llvm.Value) {
 	b.createCall(fnType, fn, []llvm.Value{val, ptr, align, i1Mask}, "")
 }
 
+// spmdFullStoreWithBlend emits a runtime cap check and, when safe, replaces a
+// scalarized llvm.masked.store with a load-blend-store pattern:
+//
+//	v128.load(ptr) → v128.bitselect(mask, newVal, oldVal) → v128.store(ptr)
+//
+// On WASM, llvm.masked.store scalarizes to 4-16 conditional scalar stores. The
+// load-blend-store pattern is only 3 instructions when the slice backing array
+// has enough capacity (scalarIndex + laneCount <= sliceCap).
+//
+// Emits:
+//
+//	iterPlusLanes = scalarIndex + laneCount
+//	canFullStore = iterPlusLanes ule sliceCap
+//	br canFullStore, blendBB, maskedBB
+//	blendBB: old = load ptr; blended = select(mask, val, old); store blended, ptr; br mergeBB
+//	maskedBB: masked.store(val, ptr, mask); br mergeBB
+//	mergeBB: (void, no phi)
+func (b *builder) spmdFullStoreWithBlend(val llvm.Value, ci *spmdContiguousInfo, mask llvm.Value) {
+	vecType := val.Type()
+	laneCount := ci.loop.laneCount
+
+	// Compute scalarIndex + laneCount using the actual GEP index.
+	iterType := ci.scalarIndex.Type()
+	laneCountVal := llvm.ConstInt(iterType, uint64(laneCount), false)
+	iterPlusLanes := b.CreateAdd(ci.scalarIndex, laneCountVal, "spmd.iter.plus.lanes")
+
+	// Normalize cap to same width as index for comparison.
+	capVal := ci.sliceCap
+	if capVal.Type() != iterType {
+		capWidth := capVal.Type().IntTypeWidth()
+		iterWidth := iterType.IntTypeWidth()
+		if capWidth < iterWidth {
+			capVal = b.CreateZExt(capVal, iterType, "spmd.cap.ext")
+		} else {
+			capVal = b.CreateTrunc(capVal, iterType, "spmd.cap.trunc")
+		}
+	}
+
+	// Runtime check: scalarIndex + laneCount <= sliceCap (unsigned).
+	canFullStore := b.CreateICmp(llvm.IntULE, iterPlusLanes, capVal, "spmd.can.fullstore")
+
+	// Create basic blocks.
+	blendBB := b.insertBasicBlock("spmd.blend")
+	maskedBB := b.insertBasicBlock("spmd.maskedstore")
+	mergeBB := b.insertBasicBlock("spmd.store.merge")
+
+	b.CreateCondBr(canFullStore, blendBB, maskedBB)
+
+	// Blend path: load existing → select → store.
+	b.SetInsertPointAtEnd(blendBB)
+	oldVal := b.CreateLoad(vecType, ci.scalarPtr, "spmd.blend.old")
+	blended := b.spmdMaskSelect(mask, val, oldVal)
+	b.CreateStore(blended, ci.scalarPtr)
+	b.CreateBr(mergeBB)
+
+	// Masked store path: existing scalarized fallback.
+	b.SetInsertPointAtEnd(maskedBB)
+	b.spmdMaskedStore(val, ci.scalarPtr, mask)
+	b.CreateBr(mergeBB)
+
+	// Merge (void return, no phi).
+	b.SetInsertPointAtEnd(mergeBB)
+}
+
 // spmdMaskedGather calls llvm.masked.gather.<suffix>.v<N>p0 for non-contiguous loads from a vector of pointers.
 // The mask parameter may be <N x i32> (WASM format) or <N x i1>; it is truncated to <N x i1> as required
 // by the LLVM masked intrinsic interface.
