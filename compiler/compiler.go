@@ -4721,6 +4721,10 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 				if mask.IsNil() {
 					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(ci.loop.laneCount), ci.loop.laneCount))
 				}
+				// Cap-based optimization: use full v128.load + select when safe.
+				if !ci.sliceCap.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
+					return b.spmdFullLoadWithSelect(vecType, ci, mask), nil
+				}
 				return b.spmdMaskedLoad(vecType, ci.scalarPtr, mask), nil
 			}
 		}

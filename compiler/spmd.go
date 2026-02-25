@@ -1273,8 +1273,10 @@ type spmdMaskTransition struct {
 
 // spmdContiguousInfo tracks an IndexAddr result that was detected as contiguous SPMD access.
 type spmdContiguousInfo struct {
-	scalarPtr llvm.Value      // scalar GEP result (base of contiguous access)
-	loop      *spmdActiveLoop // owning loop (for lane count)
+	scalarPtr   llvm.Value      // scalar GEP result (base of contiguous access)
+	loop        *spmdActiveLoop // owning loop (for lane count)
+	sliceCap    llvm.Value      // cap of source slice (zero value for arrays/strings)
+	scalarIndex llvm.Value      // actual scalar GEP index used (may be iter+offset)
 }
 
 // spmdShiftedLoadInfo describes a gather that can be optimized to a smaller
@@ -2807,6 +2809,17 @@ func (c *compilerContext) spmdIsWASM() bool {
 	return strings.HasPrefix(c.Triple, "wasm")
 }
 
+// spmdIsConstAllOnesMask returns true if the mask is a compile-time constant
+// with all bits set (ConstAllOnes). When true, LLVM already optimizes
+// llvm.masked.load to a plain load, so cap-based optimization is unnecessary.
+func (b *builder) spmdIsConstAllOnesMask(mask llvm.Value) bool {
+	if !mask.IsConstant() {
+		return false
+	}
+	allOnes := llvm.ConstAllOnes(mask.Type())
+	return mask.C == allOnes.C
+}
+
 // spmdMaskElemType returns the LLVM element type for SPMD mask vectors.
 // On WASM targets, the mask element type is sized to keep the mask in a single
 // 128-bit v128 register: i32 for 4 lanes, i16 for 8, i8 for 16.
@@ -3543,6 +3556,73 @@ func (b *builder) spmdMaskedLoad(vecType llvm.Type, ptr, mask llvm.Value) llvm.V
 	return b.createCall(fnType, fn, []llvm.Value{ptr, align, i1Mask, passthru}, "spmd.load")
 }
 
+// spmdFullLoadWithSelect emits a runtime cap check and, when safe, replaces a
+// scalarized llvm.masked.load with a plain v128.load + select(mask, loaded, zero).
+// On WASM, llvm.masked.load scalarizes to 4-16 conditional scalar loads. A full
+// v128.load + select is only 2 instructions when the slice backing array has
+// enough capacity (scalarIter + laneCount <= sliceCap).
+//
+// Emits:
+//
+//	iterPlusLanes = scalarIter + laneCount
+//	canFullLoad = iterPlusLanes ule sliceCap
+//	br canFullLoad, fullBB, maskedBB
+//	fullBB: raw = load <N x T>, ptr; result = select(mask, raw, zero); br mergeBB
+//	maskedBB: result = masked.load(ptr, mask); br mergeBB
+//	mergeBB: phi [fullBB, maskedBB]
+func (b *builder) spmdFullLoadWithSelect(vecType llvm.Type, ci *spmdContiguousInfo, mask llvm.Value) llvm.Value {
+	laneCount := ci.loop.laneCount
+
+	// Compute scalarIndex + laneCount using the actual GEP index (not raw iter,
+	// which may differ when an offset is applied, e.g. output[j*width + i]).
+	iterType := ci.scalarIndex.Type()
+	laneCountVal := llvm.ConstInt(iterType, uint64(laneCount), false)
+	iterPlusLanes := b.CreateAdd(ci.scalarIndex, laneCountVal, "spmd.iter.plus.lanes")
+
+	// Normalize cap to same width as index for comparison.
+	capVal := ci.sliceCap
+	if capVal.Type() != iterType {
+		capWidth := capVal.Type().IntTypeWidth()
+		iterWidth := iterType.IntTypeWidth()
+		if capWidth < iterWidth {
+			capVal = b.CreateZExt(capVal, iterType, "spmd.cap.ext")
+		} else {
+			capVal = b.CreateTrunc(capVal, iterType, "spmd.cap.trunc")
+		}
+	}
+
+	// Runtime check: scalarIter + laneCount <= sliceCap (unsigned).
+	canFullLoad := b.CreateICmp(llvm.IntULE, iterPlusLanes, capVal, "spmd.can.fullload")
+
+	// Create basic blocks.
+	fullBB := b.insertBasicBlock("spmd.fullload")
+	maskedBB := b.insertBasicBlock("spmd.maskedload")
+	mergeBB := b.insertBasicBlock("spmd.load.merge")
+
+	b.CreateCondBr(canFullLoad, fullBB, maskedBB)
+
+	// Full load path: plain v128.load + select.
+	b.SetInsertPointAtEnd(fullBB)
+	rawLoad := b.CreateLoad(vecType, ci.scalarPtr, "spmd.fullload.raw")
+	zeroinit := llvm.ConstNull(vecType)
+	fullResult := b.spmdMaskSelect(mask, rawLoad, zeroinit)
+	b.CreateBr(mergeBB)
+	fullExitBB := b.GetInsertBlock()
+
+	// Masked load path: existing scalarized fallback.
+	b.SetInsertPointAtEnd(maskedBB)
+	maskedResult := b.spmdMaskedLoad(vecType, ci.scalarPtr, mask)
+	b.CreateBr(mergeBB)
+	maskedExitBB := b.GetInsertBlock()
+
+	// Merge with phi.
+	b.SetInsertPointAtEnd(mergeBB)
+	phi := b.CreatePHI(vecType, "spmd.load.result")
+	phi.AddIncoming([]llvm.Value{fullResult, maskedResult}, []llvm.BasicBlock{fullExitBB, maskedExitBB})
+
+	return phi
+}
+
 // spmdMaskedStore calls llvm.masked.store.<suffix>.p0 to store a vector to a scalar pointer with a per-lane mask.
 // The mask parameter may be <N x i32> (WASM format) or <N x i1>; it is truncated to <N x i1> as required
 // by the LLVM masked intrinsic interface.
@@ -3750,14 +3830,19 @@ func (b *builder) spmdContiguousIndexAddrCore(expr *ssa.IndexAddr, loop *spmdAct
 		}
 	case *types.Slice:
 		bufptr := b.CreateExtractValue(val, 0, "indexaddr.ptr")
+		sliceCap := b.CreateExtractValue(val, 2, "indexaddr.cap")
 		bufType := b.getLLVMType(ptrTyp.Elem())
 		ptr = b.CreateInBoundsGEP(bufType, bufptr, []llvm.Value{scalarIndex}, "spmd.contiguous.ptr")
+		if b.spmdContiguousPtr != nil {
+			b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop, sliceCap: sliceCap, scalarIndex: scalarIndex}
+		}
+		return ptr, nil
 	default:
 		return llvm.Value{}, b.makeError(expr.Pos(), "unsupported contiguous SPMD indexaddr type: "+ptrTyp.String())
 	}
 
 	if b.spmdContiguousPtr != nil {
-		b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop}
+		b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop, scalarIndex: scalarIndex}
 	}
 	return ptr, nil
 }

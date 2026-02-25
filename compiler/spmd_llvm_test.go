@@ -10,6 +10,7 @@ import (
 	"go/types"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/ssa"
@@ -39,6 +40,7 @@ func newTestBuilder(t *testing.T, c *compilerContext) *builder {
 	bb := llvm.AddBasicBlock(fn, "entry")
 	b := &builder{compilerContext: c}
 	b.Builder = c.ctx.NewBuilder()
+	b.llvmFn = fn
 	b.SetInsertPointAtEnd(bb)
 	return b
 }
@@ -5451,5 +5453,106 @@ func TestSPMDInterleaveStride3(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("out[%d] =\n  got  %v\n  want %v", k, got, want)
 		}
+	}
+}
+
+// TestSPMDFullLoadWithSelect verifies that spmdFullLoadWithSelect emits the
+// correct branch structure: cap check -> full load + select | masked load -> merge phi.
+func TestSPMDFullLoadWithSelect(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	vecType := llvm.VectorType(i32Type, laneCount)
+
+	scalarIndex := llvm.ConstInt(b.uintptrType, 8, false)
+	sliceCap := llvm.ConstInt(b.uintptrType, 16, false)
+
+	arrType := llvm.ArrayType(i32Type, 16)
+	alloca := b.CreateAlloca(arrType, "test.buf")
+	zero := llvm.ConstInt(i32Type, 0, false)
+	scalarPtr := b.CreateInBoundsGEP(arrType, alloca, []llvm.Value{zero, zero}, "test.ptr")
+
+	maskElemType := i32Type
+	mask := llvm.ConstVector([]llvm.Value{
+		llvm.ConstAllOnes(maskElemType),
+		llvm.ConstAllOnes(maskElemType),
+		llvm.ConstNull(maskElemType),
+		llvm.ConstNull(maskElemType),
+	}, false)
+
+	ci := &spmdContiguousInfo{
+		scalarPtr:   scalarPtr,
+		loop:        &spmdActiveLoop{laneCount: laneCount},
+		sliceCap:    sliceCap,
+		scalarIndex: scalarIndex,
+	}
+
+	mergeBB := b.insertBasicBlock("test.after")
+	result := b.spmdFullLoadWithSelect(vecType, ci, mask)
+	b.CreateBr(mergeBB)
+	b.SetInsertPointAtEnd(mergeBB)
+	b.CreateRetVoid()
+
+	if result.IsNil() {
+		t.Fatal("spmdFullLoadWithSelect returned nil")
+	}
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
+	}
+	if result.Type().VectorSize() != laneCount {
+		t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), laneCount)
+	}
+
+	ir := c.mod.String()
+	if !strings.Contains(ir, "llvm.masked.load") {
+		t.Error("IR should contain llvm.masked.load for the fallback path")
+	}
+	if !strings.Contains(ir, "spmd.fullload") {
+		t.Error("IR should contain spmd.fullload basic block")
+	}
+	if !strings.Contains(ir, "spmd.maskedload") {
+		t.Error("IR should contain spmd.maskedload basic block")
+	}
+	if !strings.Contains(ir, "spmd.load.merge") {
+		t.Error("IR should contain spmd.load.merge basic block")
+	}
+}
+
+// TestSPMDIsConstAllOnesMask verifies that spmdIsConstAllOnesMask correctly
+// identifies all-ones masks and rejects partial or non-constant masks.
+func TestSPMDIsConstAllOnesMask(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i32Type := c.ctx.Int32Type()
+	maskType := llvm.VectorType(i32Type, 4)
+
+	// All-ones mask should be detected.
+	allOnesMask := llvm.ConstAllOnes(maskType)
+	if !b.spmdIsConstAllOnesMask(allOnesMask) {
+		t.Error("should return true for ConstAllOnes mask")
+	}
+
+	// Partial mask should NOT be detected.
+	partialMask := llvm.ConstVector([]llvm.Value{
+		llvm.ConstAllOnes(i32Type),
+		llvm.ConstNull(i32Type),
+		llvm.ConstNull(i32Type),
+		llvm.ConstNull(i32Type),
+	}, false)
+	if b.spmdIsConstAllOnesMask(partialMask) {
+		t.Error("should return false for partial mask")
+	}
+
+	// Null mask should NOT be detected.
+	nullMask := llvm.ConstNull(maskType)
+	if b.spmdIsConstAllOnesMask(nullMask) {
+		t.Error("should return false for null mask")
 	}
 }
