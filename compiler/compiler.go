@@ -1529,6 +1529,14 @@ func (b *builder) createFunction() {
 				if b.spmdShouldPeelLoop(loop) {
 					peeled := b.spmdCreateTailBlocks(loop)
 					peeled.phase = spmdLoopPhaseMain
+					// Collect interleaved store groups for this loop.
+					groupSeen := make(map[*spmdInterleavedStoreGroup]bool)
+					for _, info := range b.spmdInterleavedStores {
+						if info.group.loop == loop && !groupSeen[info.group] {
+							peeled.interleavedGroups = append(peeled.interleavedGroups, info.group)
+							groupSeen[info.group] = true
+						}
+					}
 					b.spmdPeeledLoops[loop] = peeled
 				}
 			}

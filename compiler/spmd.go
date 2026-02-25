@@ -480,6 +480,14 @@ type spmdPeeledLoop struct {
 	tailIterPhi    llvm.Value       // phi in tailCheck for the iter value at main loop exit
 	bodyBlockSet   map[int]bool     // set of SSA block indices belonging to this loop body
 	phase          spmdLoopPhase    // current emission phase (Main or Tail)
+
+	// Advancing pointer phis for interleaved store groups (main phase only).
+	// Each group's destination pointer advances by stride*laneCount bytes per
+	// iteration, allowing stores to use phi + const_offset which the WASM
+	// backend folds into v128.store offset=K.
+	interleavedGroups []*spmdInterleavedStoreGroup                  // detected groups for this loop
+	dstPtrPhis        map[*spmdInterleavedStoreGroup]llvm.Value     // phi for each group's dst pointer
+	dstElemTypes      map[*spmdInterleavedStoreGroup]llvm.Type      // element type for GEP arithmetic
 }
 
 // spmdShouldPeelLoop returns true if the given SPMD loop is eligible for peeling.
@@ -548,6 +556,64 @@ func (b *builder) spmdComputeAlignedBound(bound llvm.Value, laneCount int) llvm.
 func (b *builder) spmdPeeledMainMask(laneCount int) llvm.Value {
 	maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
 	return llvm.ConstAllOnes(maskType)
+}
+
+// spmdCreateInterleavedPtrPhis creates advancing pointer phis for interleaved
+// store groups in a peeled main-phase loop. Each phi starts at the destination
+// buffer pointer and advances by stride*laneCount bytes per iteration. Stores
+// use phi (k=0) and GEP(phi, k*N) (k>0), preserving the base+const_offset
+// pattern that the WASM backend folds into v128.store offset=K.
+func (b *builder) spmdCreateInterleavedPtrPhis(loop *spmdActiveLoop, peeled *spmdPeeledLoop) {
+	if len(peeled.interleavedGroups) == 0 {
+		return
+	}
+	peeled.dstPtrPhis = make(map[*spmdInterleavedStoreGroup]llvm.Value)
+	peeled.dstElemTypes = make(map[*spmdInterleavedStoreGroup]llvm.Type)
+
+	savedInsert := b.GetInsertBlock()
+
+	// Get the loop header LLVM block and its entry predecessor.
+	loopSSABlock := loop.incrBinOp.Block()
+	loopHeaderBlock := b.blockInfo[loopSSABlock.Index].entry
+	entryPredSSA := loopSSABlock.Preds[loop.initEdgeIndex]
+	entryPredBlock := b.blockInfo[entryPredSSA.Index].exit
+
+	for _, group := range peeled.interleavedGroups {
+		// Extract bufptr in the entry predecessor block (before its terminator)
+		// so it dominates the loop header.
+		b.SetInsertPointBefore(entryPredBlock.LastInstruction())
+
+		sliceVal := b.getValue(group.baseSlice, token.NoPos)
+		var bufptr llvm.Value
+		var elemType llvm.Type
+
+		switch ptrTyp := group.addrs[0].X.Type().Underlying().(type) {
+		case *types.Slice:
+			bufptr = b.CreateExtractValue(sliceVal, 0, "interleaved.phi.ptr")
+			elemType = b.getLLVMType(ptrTyp.Elem())
+		case *types.Pointer:
+			typ := ptrTyp.Elem().Underlying()
+			if arr, ok := typ.(*types.Array); ok {
+				bufptr = sliceVal
+				elemType = b.getLLVMType(arr.Elem())
+			} else {
+				continue
+			}
+		default:
+			continue
+		}
+
+		// Create phi in loop header block (before first instruction, alongside
+		// existing phis like the iteration variable phi).
+		b.SetInsertPointBefore(loopHeaderBlock.FirstInstruction())
+		phi := b.CreatePHI(bufptr.Type(), "interleaved.dst.phi")
+		phi.AddIncoming([]llvm.Value{bufptr}, []llvm.BasicBlock{entryPredBlock})
+
+		peeled.dstPtrPhis[group] = phi
+		peeled.dstElemTypes[group] = elemType
+	}
+
+	b.SetInsertPointAtEnd(savedInsert)
 }
 
 // spmdIsLoopExitBound checks if a BinOp is the loop exit comparison (incr < bound)
@@ -997,6 +1063,7 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 					peeled.alignedBound = b.spmdComputeAlignedBound(boundScalar, loop.laneCount)
 				}
 				loop.tailMask = b.spmdPeeledMainMask(loop.laneCount)
+				b.spmdCreateInterleavedPtrPhis(loop, peeled)
 				return
 			}
 		}
@@ -1057,6 +1124,7 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 			}
 			loop.laneIndices = laneIndices
 			loop.tailMask = b.spmdPeeledMainMask(loop.laneCount)
+			b.spmdCreateInterleavedPtrPhis(loop, peeled)
 			return
 		}
 	}
@@ -5468,6 +5536,56 @@ func (b *builder) spmdEmitInterleavedStore(lastStore *ssa.Store, info *spmdInter
 		outVecs = ov[:]
 	default:
 		return // unsupported stride
+	}
+
+	// Main phase with phi-ptr: use advancing pointer instead of index-based GEP.
+	// The phi starts at the buffer base and advances by stride*N each iteration,
+	// so stores use phi (k=0) and GEP(phi, k*N) (k>0). The WASM backend folds
+	// the constant GEP offset into v128.store offset=K.
+	//
+	// Bounds safety: the main peeled loop runs while iter < alignedBound, where
+	// alignedBound = len(src) & ~(N-1). The phi starts at dst[0] and advances by
+	// stride*N bytes per iteration, so the maximum store address is
+	// alignedBound*stride bytes into dst. For well-formed code where
+	// len(dst) >= len(src)*stride, this is in-bounds. The normal IndexAddr bounds
+	// checks are suppressed for interleaved groups (IndexAddr returns undef), so
+	// the caller is responsible for ensuring dst is large enough.
+	//
+	// Back-edge safety: spmdAnalyzeInterleavedStores only detects stores in the
+	// direct body block (not interior if.then/else blocks), so bodyBlock here is
+	// always the block that branches back to the loop header.
+	if b.spmdPeeledLoops != nil {
+		if peeled, ok := b.spmdPeeledLoops[group.loop]; ok && peeled.phase == spmdLoopPhaseMain {
+			if phi, ok := peeled.dstPtrPhis[group]; ok {
+				elemType := peeled.dstElemTypes[group]
+				mask := b.spmdCurrentMask()
+				if mask.IsNil() {
+					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(N), N))
+				}
+				expandedMasks := b.spmdExpandMaskForStride(mask, stride, N)
+
+				// Capture the body block before emitting stores, in case a future
+				// change to spmdMaskedStore introduces block splits.
+				bodyBlock := b.GetInsertBlock()
+
+				// k=0: store directly to phi ptr.
+				b.spmdMaskedStore(outVecs[0], phi, expandedMasks[0])
+				// k>0: GEP(phi, k*N) — constant offset folds into v128.store offset=k*N.
+				for k := 1; k < stride; k++ {
+					offset := llvm.ConstInt(b.uintptrType, uint64(k*N), false)
+					ptr := b.CreateInBoundsGEP(elemType, phi,
+						[]llvm.Value{offset}, fmt.Sprintf("interleaved.store.ptr.%d", k))
+					b.spmdMaskedStore(outVecs[k], ptr, expandedMasks[k])
+				}
+
+				// Advance phi for next iteration: GEP(phi, stride*N).
+				advance := llvm.ConstInt(b.uintptrType, uint64(stride*N), false)
+				nextPtr := b.CreateInBoundsGEP(elemType, phi,
+					[]llvm.Value{advance}, "interleaved.dst.next")
+				phi.AddIncoming([]llvm.Value{nextPtr}, []llvm.BasicBlock{bodyBlock})
+				return
+			}
+		}
 	}
 
 	// Compute the base pointer for the output slice.
