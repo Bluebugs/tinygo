@@ -188,7 +188,10 @@ type builder struct {
 	spmdMaskTransitions     map[int]*spmdMaskTransition        // block index -> mask transition to apply
 	spmdContiguousPtr       map[ssa.Value]*spmdContiguousInfo  // IndexAddr SSA value -> contiguous access info
 	spmdShiftedPtr          map[ssa.Value]*spmdShiftedLoadInfo // IndexAddr SSA value -> shifted load info (load+shuffle)
-	spmdCoalescedStores     map[*ssa.Store]*spmdCoalescedStore // store → coalescing info (then/else pairs)
+	spmdCoalescedStores     map[*ssa.Store]*spmdCoalescedStore             // store → coalescing info (then/else pairs)
+	spmdInterleavedStores map[*ssa.Store]*spmdInterleavedStoreInfo         // store → interleaved group info
+	spmdInterleavedAddrs  map[*ssa.IndexAddr]*spmdInterleavedStoreInfo     // IndexAddr → interleaved group info
+	spmdInterleavedValues map[*spmdInterleavedStoreGroup][]llvm.Value      // group → collected values (filled during codegen)
 	spmdFuncIsBody          bool                               // true if entire function body is an SPMD region (varying params, no go-for loops)
 	spmdForLoops            map[int]*spmdForLoopInfo           // body block index -> for-loop info (SPMD func body only)
 	spmdBreakRedirects      map[int]spmdBreakRedirect          // then-block index -> break redirect info
@@ -1491,6 +1494,9 @@ func (b *builder) createFunction() {
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
 		b.spmdShiftedPtr = make(map[ssa.Value]*spmdShiftedLoadInfo)
 		b.spmdCoalescedStores = make(map[*ssa.Store]*spmdCoalescedStore)
+		b.spmdInterleavedStores = make(map[*ssa.Store]*spmdInterleavedStoreInfo)
+		b.spmdInterleavedAddrs = make(map[*ssa.IndexAddr]*spmdInterleavedStoreInfo)
+		b.spmdInterleavedValues = make(map[*spmdInterleavedStoreGroup][]llvm.Value)
 		b.spmdBreakRedirects = make(map[int]spmdBreakRedirect)
 		b.spmdBreakPhiOverrides = make(map[*ssa.Phi]llvm.Value)
 		b.spmdMergePhiOverrides = make(map[*ssa.Phi]spmdMergePhiOverride)
@@ -1503,6 +1509,11 @@ func (b *builder) createFunction() {
 		// selects when they're compiled. Without this, phis would be compiled
 		// before spmdMergeSelects is populated.
 		b.preDetectVaryingIfs()
+
+		// SPMD: pre-detect interleaved stride-S stores for shufflevector emission.
+		if b.spmdLoopState != nil {
+			b.spmdAnalyzeInterleavedStores()
+		}
 
 		// SPMD: set up loop peeling for eligible loops.
 		// Tail LLVM blocks are created here (before the DomPreorder pass)
@@ -2406,6 +2417,24 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			}
 		}
 
+		// SPMD: interleaved stride-S store handling.
+		// First S-1 remainders save their values; last remainder emits interleaved stores.
+		if b.spmdInterleavedStores != nil {
+			if info, ok := b.spmdInterleavedStores[instr]; ok {
+				if info.remainder < info.group.stride-1 {
+					vals := b.spmdInterleavedValues[info.group]
+					if vals == nil {
+						vals = make([]llvm.Value, info.group.stride)
+						b.spmdInterleavedValues[info.group] = vals
+					}
+					vals[info.remainder] = b.getValue(instr.Val, getPos(instr))
+					return
+				}
+				b.spmdEmitInterleavedStore(instr, info)
+				return
+			}
+		}
+
 		llvmAddr := b.getValue(instr.Addr, getPos(instr))
 		llvmVal := b.getValue(instr.Val, getPos(instr))
 
@@ -3263,6 +3292,15 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			panic("unknown *ssa.Index type")
 		}
 	case *ssa.IndexAddr:
+		// SPMD: interleaved-store group members bypass normal IndexAddr handling.
+		// The interleaved store emitter computes its own base pointer and bounds check;
+		// the IndexAddr itself only needs to produce a placeholder so getValue doesn't fail.
+		if b.spmdInterleavedAddrs != nil {
+			if _, ok := b.spmdInterleavedAddrs[expr]; ok {
+				return llvm.Undef(b.dataPtrType), nil
+			}
+		}
+
 		// SPMD: shifted-contiguous path FIRST — before decomposed or contiguous checks.
 		// Detects index patterns like (iter_expr) >> const_k (e.g., i>>1) where adjacent
 		// lanes access overlapping elements. Generates narrow load + shuffle instead of

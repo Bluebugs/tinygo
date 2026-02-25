@@ -5,6 +5,7 @@ package compiler
 // so we build a side-table from go/ast and go/types (which our Go fork extends).
 
 import (
+	"fmt"
 	"go/ast"
 	"go/constant"
 	"go/token"
@@ -1228,6 +1229,279 @@ type spmdCoalescedStore struct {
 	thenStore *ssa.Store     // store in then-branch (skipped during codegen)
 	elseStore *ssa.Store     // store in else-branch (emits the coalesced store)
 	ifInfo    *spmdVaryingIf // the varying if that contains them
+}
+
+// spmdStridePattern represents the stride decomposition of an SSA index expression.
+// For example, i*2+1 has stride=2, remainder=1, where i is the SPMD loop iterator.
+type spmdStridePattern struct {
+	stride    int64
+	remainder int64
+	iterValue ssa.Value       // the body iter value matched
+	loop      *spmdActiveLoop // owning SPMD loop
+}
+
+// spmdInterleavedStoreGroup represents a complete set of stride-S stores
+// that write to complementary positions (remainders 0..S-1) of the same
+// base slice. These can be replaced with S shufflevector interleaves +
+// S contiguous masked stores.
+type spmdInterleavedStoreGroup struct {
+	stores    []*ssa.Store     // one store per remainder, ordered 0..S-1
+	addrs     []*ssa.IndexAddr // corresponding IndexAddr per remainder
+	stride    int              // stride value (2, 3, or 4)
+	baseSlice ssa.Value        // the common base slice (IndexAddr.X)
+	loop      *spmdActiveLoop  // owning SPMD loop
+	laneCount int              // SIMD lane count
+}
+
+// spmdInterleavedStoreInfo links a single store or IndexAddr to its
+// interleaved group and its position within that group.
+type spmdInterleavedStoreInfo struct {
+	group     *spmdInterleavedStoreGroup
+	remainder int
+}
+
+// spmdAnalyzeStrideIndex pattern-matches an SSA index expression to detect
+// stride-S interleaved access patterns of the form iter*S+R, where iter is
+// the SPMD loop body iterator, S is the stride (2, 3, or 4), and R is the
+// remainder (0 to S-1).
+//
+// Recognized patterns (commutative MUL and ADD):
+//   - iter*S           → stride=S, remainder=0
+//   - iter*S + R       → stride=S, remainder=R
+//
+// ChangeType wrappers on the index and on iter candidates are peeled before
+// matching. Only strides in [2,4] and remainders in [0, stride-1] are accepted.
+// Returns nil if the pattern does not match.
+func (b *builder) spmdAnalyzeStrideIndex(index ssa.Value) *spmdStridePattern {
+	if b.spmdLoopState == nil {
+		return nil
+	}
+
+	// Unwrap ChangeType chains on the top-level index value.
+	unwrapCT := func(v ssa.Value) ssa.Value {
+		for {
+			if ct, ok := v.(*ssa.ChangeType); ok {
+				v = ct.X
+			} else {
+				break
+			}
+		}
+		return v
+	}
+
+	// checkIsIter returns the active loop if v (after ChangeType unwrap) is the
+	// body iterator for some SPMD loop.
+	checkIsIter := func(v ssa.Value) *spmdActiveLoop {
+		core := unwrapCT(v)
+		if loop, ok := b.spmdLoopState.activeLoops[core]; ok {
+			return loop
+		}
+		return nil
+	}
+
+	// tryMul checks whether a BinOp is iter*S (commutative) and returns
+	// (stride, iterValue, loop) on success.
+	tryMul := func(op *ssa.BinOp) (int64, ssa.Value, *spmdActiveLoop, bool) {
+		if op.Op != token.MUL {
+			return 0, nil, nil, false
+		}
+		// Try X=iter, Y=const.
+		if loop := checkIsIter(op.X); loop != nil {
+			if c, ok := ssaConstInt64(op.Y); ok && c >= 2 && c <= 4 {
+				return c, unwrapCT(op.X), loop, true
+			}
+		}
+		// Try X=const, Y=iter.
+		if loop := checkIsIter(op.Y); loop != nil {
+			if c, ok := ssaConstInt64(op.X); ok && c >= 2 && c <= 4 {
+				return c, unwrapCT(op.Y), loop, true
+			}
+		}
+		return 0, nil, nil, false
+	}
+
+	idx := unwrapCT(index)
+
+	// Pattern: iter*S (no remainder).
+	if mul, ok := idx.(*ssa.BinOp); ok {
+		if stride, iterVal, loop, ok := tryMul(mul); ok {
+			return &spmdStridePattern{
+				stride:    stride,
+				remainder: 0,
+				iterValue: iterVal,
+				loop:      loop,
+			}
+		}
+	}
+
+	// Pattern: iter*S + R  (ADD is commutative).
+	if add, ok := idx.(*ssa.BinOp); ok && add.Op == token.ADD {
+		// Try add.X = mul, add.Y = const.
+		if mulOp, ok := unwrapCT(add.X).(*ssa.BinOp); ok {
+			if stride, iterVal, loop, ok := tryMul(mulOp); ok {
+				if r, ok := ssaConstInt64(add.Y); ok && r >= 0 && r < stride {
+					return &spmdStridePattern{
+						stride:    stride,
+						remainder: r,
+						iterValue: iterVal,
+						loop:      loop,
+					}
+				}
+			}
+		}
+		// Try add.Y = mul, add.X = const.
+		if mulOp, ok := unwrapCT(add.Y).(*ssa.BinOp); ok {
+			if stride, iterVal, loop, ok := tryMul(mulOp); ok {
+				if r, ok := ssaConstInt64(add.X); ok && r >= 0 && r < stride {
+					return &spmdStridePattern{
+						stride:    stride,
+						remainder: r,
+						iterValue: iterVal,
+						loop:      loop,
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// ssaConstInt64 extracts an int64 value from an *ssa.Const if it holds an
+// integer constant representable as int64. Returns (0, false) otherwise.
+func ssaConstInt64(v ssa.Value) (int64, bool) {
+	c, ok := v.(*ssa.Const)
+	if !ok || c.Value == nil || c.Value.Kind() != constant.Int {
+		return 0, false
+	}
+	val, ok := constant.Int64Val(c.Value)
+	return val, ok
+}
+
+// spmdAnalyzeInterleavedStores scans all SPMD body blocks and groups stores whose
+// target index follows an iter*S+R pattern (stride S in [2,4], remainder R in
+// [0..S-1]) into spmdInterleavedStoreGroup records. Complete groups (all S
+// remainders present) are registered in b.spmdInterleavedStores and
+// b.spmdInterleavedAddrs so that the store emitter can replace the S scatter
+// operations with S shufflevector+masked-store pairs.
+//
+// Must be called after b.spmdLoopState is populated (i.e., after analyzeSPMDLoops)
+// and after b.spmdCoalescedStores is populated (coalesced stores are excluded).
+func (b *builder) spmdAnalyzeInterleavedStores() {
+	if b.spmdLoopState == nil {
+		return
+	}
+
+	// Key for grouping: (base-slice SSA value, stride, owning loop).
+	// The loop pointer prevents cross-loop false grouping when two SPMD loops
+	// write stride-S patterns to the same base slice.
+	type groupKey struct {
+		base   ssa.Value
+		stride int64
+		loop   *spmdActiveLoop
+	}
+
+	// Partial group accumulator: maps groupKey → per-remainder slot.
+	type partialGroup struct {
+		stores []*ssa.Store     // indexed by remainder; nil means not yet seen
+		addrs  []*ssa.IndexAddr // parallel to stores
+		loop   *spmdActiveLoop
+	}
+
+	partials := make(map[groupKey]*partialGroup)
+
+	for _, block := range b.fn.Blocks {
+		loop, ok := b.spmdLoopState.bodyBlocks[block.Index]
+		if !ok {
+			continue // not an SPMD body block
+		}
+
+		for _, instr := range block.Instrs {
+			store, ok := instr.(*ssa.Store)
+			if !ok {
+				continue
+			}
+			// Skip stores already claimed by coalesced-store optimization.
+			if _, coalesced := b.spmdCoalescedStores[store]; coalesced {
+				continue
+			}
+			indexAddr, ok := store.Addr.(*ssa.IndexAddr)
+			if !ok {
+				continue
+			}
+			// Skip IndexAddr nodes that have other referrers besides this store.
+			// Returning undef for the IndexAddr during codegen would break any
+			// other use (e.g., a load in a read-modify-write pattern).
+			if refs := indexAddr.Referrers(); refs == nil || len(*refs) != 1 {
+				continue
+			}
+			pat := b.spmdAnalyzeStrideIndex(indexAddr.Index)
+			if pat == nil {
+				continue
+			}
+			if pat.loop != loop {
+				continue // pattern iter belongs to a different loop
+			}
+
+			key := groupKey{base: indexAddr.X, stride: pat.stride, loop: loop}
+			pg := partials[key]
+			if pg == nil {
+				pg = &partialGroup{
+					stores: make([]*ssa.Store, pat.stride),
+					addrs:  make([]*ssa.IndexAddr, pat.stride),
+					loop:   loop,
+				}
+				partials[key] = pg
+			}
+			rem := int(pat.remainder)
+			if pg.stores[rem] != nil {
+				continue // duplicate remainder in the same block — skip
+			}
+			pg.stores[rem] = store
+			pg.addrs[rem] = indexAddr
+		}
+	}
+
+	// Promote complete groups (all remainders filled) to the registered maps.
+	for key, pg := range partials {
+		stride := int(key.stride)
+		complete := true
+		for r := 0; r < stride; r++ {
+			if pg.stores[r] == nil {
+				complete = false
+				break
+			}
+		}
+		if !complete {
+			continue
+		}
+
+		// Verify all stored values have the same type.
+		baseType := pg.stores[0].Val.Type()
+		for r := 1; r < stride; r++ {
+			if !types.Identical(pg.stores[r].Val.Type(), baseType) {
+				complete = false
+				break
+			}
+		}
+		if !complete {
+			continue
+		}
+
+		group := &spmdInterleavedStoreGroup{
+			stores:    pg.stores,
+			addrs:     pg.addrs,
+			stride:    stride,
+			baseSlice: key.base,
+			loop:      pg.loop,
+			laneCount: pg.loop.laneCount,
+		}
+		for r := 0; r < stride; r++ {
+			info := &spmdInterleavedStoreInfo{group: group, remainder: r}
+			b.spmdInterleavedStores[pg.stores[r]] = info
+			b.spmdInterleavedAddrs[pg.addrs[r]] = info
+		}
+	}
 }
 
 // spmdSameStoreAddr checks whether two SSA values represent the same store destination.
@@ -5156,4 +5430,244 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 
 	// Restore to main phase.
 	peeled.phase = spmdLoopPhaseMain
+}
+
+// spmdEmitInterleavedStore handles the last store (remainder == stride-1) in a
+// stride-S interleaved store group. It collects values already saved for
+// remainders 0..S-2 from spmdInterleavedValues, shuffles them into S output
+// vectors in interleaved order, computes the base pointer into the destination
+// slice, and emits S masked stores.
+func (b *builder) spmdEmitInterleavedStore(lastStore *ssa.Store, info *spmdInterleavedStoreInfo) {
+	group := info.group
+	stride := group.stride
+	N := group.laneCount
+
+	// Collect all S values: 0..S-2 were saved earlier; S-1 comes from lastStore.
+	vals := make([]llvm.Value, stride)
+	saved := b.spmdInterleavedValues[group]
+	for r := 0; r < stride-1; r++ {
+		if saved == nil || saved[r].IsNil() {
+			// Earlier remainder was never saved — fall back gracefully.
+			return
+		}
+		vals[r] = saved[r]
+	}
+	vals[stride-1] = b.getValue(lastStore.Val, getPos(lastStore))
+
+	// Shuffle values into S interleaved output vectors.
+	var outVecs []llvm.Value
+	switch stride {
+	case 2:
+		ov := b.spmdInterleaveStride2(vals[0], vals[1], N)
+		outVecs = ov[:]
+	case 3:
+		ov := b.spmdInterleaveStride3(vals[0], vals[1], vals[2], N)
+		outVecs = ov[:]
+	case 4:
+		ov := b.spmdInterleaveStride4(vals[0], vals[1], vals[2], vals[3], N)
+		outVecs = ov[:]
+	default:
+		return // unsupported stride
+	}
+
+	// Compute the base pointer for the output slice.
+	// decomp.scalarBase for remainder-0 addr is already iter*stride (the scalar
+	// part of the decomposed index). GEP from the slice data pointer at that offset.
+	addr0 := group.addrs[0]
+	baseSliceVal := b.getValue(addr0.X, getPos(addr0))
+
+	var bufptr llvm.Value
+	var elemType llvm.Type
+	var buflen llvm.Value
+
+	switch ptrTyp := addr0.X.Type().Underlying().(type) {
+	case *types.Slice:
+		bufptr = b.CreateExtractValue(baseSliceVal, 0, "interleaved.ptr")
+		buflen = b.CreateExtractValue(baseSliceVal, 1, "interleaved.len")
+		elemType = b.getLLVMType(ptrTyp.Elem())
+	case *types.Pointer:
+		typ := ptrTyp.Elem().Underlying()
+		switch arr := typ.(type) {
+		case *types.Array:
+			bufptr = baseSliceVal
+			buflen = llvm.ConstInt(b.uintptrType, uint64(arr.Len()), false)
+			elemType = b.getLLVMType(arr.Elem())
+		default:
+			return
+		}
+	default:
+		return
+	}
+
+	// Retrieve the scalar base index (iter*stride) from the decomposed index map.
+	// This is the scalar component of the decomposed index for addr0.Index.
+	// Fall back to zero if not found (shouldn't happen for well-formed groups).
+	scalarBase := llvm.Value{}
+	if b.spmdDecomposed != nil {
+		if decomp, ok := b.spmdDecomposed[addr0.Index]; ok {
+			scalarBase = decomp.scalarBase
+		}
+	}
+	if scalarBase.IsNil() {
+		scalarBase = llvm.ConstInt(b.uintptrType, 0, false)
+	}
+	scalarBase = b.extendInteger(scalarBase, addr0.Index.Type(), b.uintptrType)
+
+	// Bounds check: ensure scalarBase + stride*laneCount <= len(slice).
+	if !b.info.nobounds && !buflen.IsNil() {
+		endIdx := b.CreateAdd(scalarBase,
+			llvm.ConstInt(b.uintptrType, uint64(stride*N), false),
+			"interleaved.end")
+		oob := b.CreateICmp(llvm.IntUGT, endIdx, buflen, "interleaved.oob")
+		b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+	}
+
+	// Get the execution mask and expand it for each of the S output stores.
+	mask := b.spmdCurrentMask()
+	if mask.IsNil() {
+		mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(N), N))
+	}
+	expandedMasks := b.spmdExpandMaskForStride(mask, stride, N)
+
+	// Emit S masked stores: outVecs[k] → bufptr[scalarBase + k*N].
+	for k := 0; k < stride; k++ {
+		offset := llvm.ConstInt(b.uintptrType, uint64(k*N), false)
+		ptr := b.CreateInBoundsGEP(elemType, bufptr,
+			[]llvm.Value{b.CreateAdd(scalarBase, offset, "interleaved.off")},
+			"interleaved.store.ptr")
+		b.spmdMaskedStore(outVecs[k], ptr, expandedMasks[k])
+	}
+}
+
+// spmdInterleaveStride2 builds two <N x T> output vectors by interleaving
+// val0 (even positions) and val1 (odd positions).
+//
+// The N source lanes produce 2*N output bytes laid out as:
+//
+//	[v0[0], v1[0], v0[1], v1[1], ..., v0[N-1], v1[N-1]]
+//
+// Split into two output vectors of N elements each:
+//
+//	out[0] = [v0[0], v1[0], v0[1], v1[1], ..., v0[N/2-1], v1[N/2-1]]
+//	out[1] = [v0[N/2], v1[N/2], v0[N/2+1], v1[N/2+1], ..., v0[N-1], v1[N-1]]
+//
+// Each output vector is produced by a single CreateShuffleVector where indices
+// >= N refer to elements of the second input operand.
+func (b *builder) spmdInterleaveStride2(val0, val1 llvm.Value, N int) [2]llvm.Value {
+	// N must be even; all WASM SIMD lane counts (4, 8, 16) satisfy this.
+	if N%2 != 0 {
+		panic(fmt.Sprintf("spmdInterleaveStride2: N must be even, got %d", N))
+	}
+	// lo output: interleave first halves.
+	// lo[j] = v0[j/2]  if j is even, v1[j/2]  if j is odd  (j in [0, N/2*2))
+	// Out index j: even → val0[j/2], odd → val1[(j-1)/2]
+	// In shufflevector terms: val0 occupies indices [0, N) and val1 occupies [N, 2N).
+	loMask := make([]uint64, N)
+	hiMask := make([]uint64, N)
+	for j := 0; j < N/2; j++ {
+		loMask[2*j] = uint64(j)         // val0[j]
+		loMask[2*j+1] = uint64(N + j)   // val1[j]
+	}
+	for j := 0; j < N/2; j++ {
+		hiMask[2*j] = uint64(N/2 + j)       // val0[N/2+j]
+		hiMask[2*j+1] = uint64(N + N/2 + j) // val1[N/2+j]
+	}
+	lo := b.CreateShuffleVector(val0, val1, b.spmdShuffleConst(loMask), "interleave2.lo")
+	hi := b.CreateShuffleVector(val0, val1, b.spmdShuffleConst(hiMask), "interleave2.hi")
+	return [2]llvm.Value{lo, hi}
+}
+
+// spmdInterleaveStride3 builds three <N x T> output vectors by interleaving
+// val0, val1, val2 (positions 0, 1, 2 within each triplet respectively).
+//
+// The N source lanes produce 3*N output bytes:
+//
+//	[v0[0],v1[0],v2[0], v0[1],v1[1],v2[1], ..., v0[N-1],v1[N-1],v2[N-1]]
+//
+// This is split into three N-element output vectors. For each output k (0..2)
+// and position j (0..N-1): global position = k*N+j, triplet = (k*N+j)/3,
+// slot = (k*N+j)%3 selects from val0/val1/val2.
+//
+// Each output is produced in two shuffle steps: first merge val0 and val1 for
+// the positions they occupy, leaving val2 positions as undef; then overlay val2.
+func (b *builder) spmdInterleaveStride3(val0, val1, val2 llvm.Value, N int) [3]llvm.Value {
+	var out [3]llvm.Value
+
+	for k := 0; k < 3; k++ {
+		// Step 1: shuffle val0 and val1 into an N-element intermediate; val2 positions
+		// use index 0 as placeholder (they will be overwritten in step 2).
+		mask01 := make([]uint64, N)
+		// Step 2: mask to overlay val2 values onto the result of step 1.
+		mask2 := make([]uint64, N)
+
+		for j := 0; j < N; j++ {
+			globalPos := k*N + j
+			triplet := globalPos / 3
+			slot := globalPos % 3
+			switch slot {
+			case 0:
+				// val0[triplet]: shufflevector index triplet (first input = val0 → indices 0..N-1)
+				mask01[j] = uint64(triplet)
+				mask2[j] = uint64(j) // keep from step1 (first input in step2 = step1 result)
+			case 1:
+				// val1[triplet]: shufflevector index N+triplet (second input = val1 → indices N..2N-1)
+				mask01[j] = uint64(N + triplet)
+				mask2[j] = uint64(j) // keep from step1
+			case 2:
+				// val2[triplet]: not present in step1; use placeholder, then override in step2.
+				mask01[j] = 0 // placeholder (will be replaced)
+				mask2[j] = uint64(N + triplet) // second input in step2 = val2 → indices N..2N-1
+			}
+		}
+
+		step1 := b.CreateShuffleVector(val0, val1, b.spmdShuffleConst(mask01),
+			fmt.Sprintf("interleave3.k%d.step1", k))
+		out[k] = b.CreateShuffleVector(step1, val2, b.spmdShuffleConst(mask2),
+			fmt.Sprintf("interleave3.k%d", k))
+	}
+	return out
+}
+
+// spmdInterleaveStride4 builds four <N x T> output vectors by interleaving
+// val0, val1, val2, val3 (positions 0, 1, 2, 3 within each group of four).
+//
+// Uses a butterfly (two-level stride-2) approach:
+//
+//	Level 1:
+//	  pair02[lo,hi] = stride2(val0, val2)   — interleaves 0-indexed and 2-indexed
+//	  pair13[lo,hi] = stride2(val1, val3)   — interleaves 1-indexed and 3-indexed
+//	Level 2:
+//	  out[0,1] = stride2(pair02.lo, pair13.lo)
+//	  out[2,3] = stride2(pair02.hi, pair13.hi)
+func (b *builder) spmdInterleaveStride4(val0, val1, val2, val3 llvm.Value, N int) [4]llvm.Value {
+	pair02 := b.spmdInterleaveStride2(val0, val2, N)
+	pair13 := b.spmdInterleaveStride2(val1, val3, N)
+	out01 := b.spmdInterleaveStride2(pair02[0], pair13[0], N)
+	out23 := b.spmdInterleaveStride2(pair02[1], pair13[1], N)
+	return [4]llvm.Value{out01[0], out01[1], out23[0], out23[1]}
+}
+
+// spmdExpandMaskForStride expands a source execution mask of N lanes into
+// S output masks, each N lanes wide, for stride-S interleaved stores.
+//
+// For stride S, output k, position j: the corresponding source lane is
+// (k*N + j) / S. The expanded mask for output k has its j-th element equal to
+// the source mask at lane (k*N+j)/S.
+//
+// The source mask is <N x maskElemType> (i32 on WASM). Each output mask has the
+// same element type and N elements.
+func (b *builder) spmdExpandMaskForStride(mask llvm.Value, stride, N int) []llvm.Value {
+	out := make([]llvm.Value, stride)
+	undef := llvm.Undef(mask.Type())
+
+	for k := 0; k < stride; k++ {
+		expandIdx := make([]uint64, N)
+		for j := 0; j < N; j++ {
+			srcLane := (k*N + j) / stride
+			expandIdx[j] = uint64(srcLane)
+		}
+		out[k] = b.CreateShuffleVector(mask, undef, b.spmdShuffleConst(expandIdx),
+			fmt.Sprintf("interleaved.mask.k%d", k))
+	}
+	return out
 }

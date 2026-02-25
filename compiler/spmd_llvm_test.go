@@ -8,6 +8,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"reflect"
 	"strconv"
 	"testing"
 
@@ -5057,5 +5058,398 @@ func TestSPMDPeeledMainMask(t *testing.T) {
 				t.Errorf("mask type mismatch: got %v, want %v", mask.Type(), expected.Type())
 			}
 		})
+	}
+}
+
+// extractConstVec extracts all integer elements from a constant LLVM vector as
+// a []uint64 slice, using ConstExtractElement with an i32 index. The inputs
+// must be constant-foldable (e.g., shufflevector of constant inputs).
+func extractConstVec(t *testing.T, v llvm.Value, ctx llvm.Context) []uint64 {
+	t.Helper()
+	n := v.Type().VectorSize()
+	result := make([]uint64, n)
+	for i := 0; i < n; i++ {
+		idx := llvm.ConstInt(ctx.Int32Type(), uint64(i), false)
+		elem := llvm.ConstExtractElement(v, idx)
+		result[i] = elem.ZExtValue()
+	}
+	return result
+}
+
+// buildConstVec creates a <N x elemType> constant vector from a []uint64 value
+// slice. Each value must fit in the element type.
+func buildConstVec(ctx llvm.Context, elemType llvm.Type, vals []uint64) llvm.Value {
+	elts := make([]llvm.Value, len(vals))
+	for i, v := range vals {
+		elts[i] = llvm.ConstInt(elemType, v, false)
+	}
+	return llvm.ConstVector(elts, false)
+}
+
+// TestSPMDInterleaveStride2Masks verifies that spmdInterleaveStride2 produces
+// the correct interleaving for N=16 (byte lanes on WASM SIMD128).
+//
+// val0 = <0,1,...,15>  and  val1 = <16,17,...,31>
+// Expected outputs:
+//
+//	out[0] = <0,16,1,17,2,18,3,19,4,20,5,21,6,22,7,23>   (lo: first halves interleaved)
+//	out[1] = <8,24,9,25,10,26,11,27,12,28,13,29,14,30,15,31>  (hi: second halves interleaved)
+func TestSPMDInterleaveStride2Masks(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	const N = 16
+	i8Type := c.ctx.Int8Type()
+
+	// Build val0 = <0,1,...,15> and val1 = <16,17,...,31>.
+	v0vals := make([]uint64, N)
+	v1vals := make([]uint64, N)
+	for i := 0; i < N; i++ {
+		v0vals[i] = uint64(i)
+		v1vals[i] = uint64(N + i)
+	}
+	val0 := buildConstVec(c.ctx, i8Type, v0vals)
+	val1 := buildConstVec(c.ctx, i8Type, v1vals)
+
+	out := b.spmdInterleaveStride2(val0, val1, N)
+
+	want0 := []uint64{0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23}
+	want1 := []uint64{8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31}
+
+	got0 := extractConstVec(t, out[0], c.ctx)
+	got1 := extractConstVec(t, out[1], c.ctx)
+
+	if !reflect.DeepEqual(got0, want0) {
+		t.Errorf("out[0] = %v\n          want %v", got0, want0)
+	}
+	if !reflect.DeepEqual(got1, want1) {
+		t.Errorf("out[1] = %v\n          want %v", got1, want1)
+	}
+}
+
+// TestSPMDInterleaveStride2N4 verifies spmdInterleaveStride2 for N=4 (i32 lanes).
+//
+// val0 = <0,1,2,3>  and  val1 = <4,5,6,7>
+// Expected:
+//
+//	out[0] = <0,4,1,5>
+//	out[1] = <2,6,3,7>
+func TestSPMDInterleaveStride2N4(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	const N = 4
+	i32Type := c.ctx.Int32Type()
+
+	val0 := buildConstVec(c.ctx, i32Type, []uint64{0, 1, 2, 3})
+	val1 := buildConstVec(c.ctx, i32Type, []uint64{4, 5, 6, 7})
+
+	out := b.spmdInterleaveStride2(val0, val1, N)
+
+	want0 := []uint64{0, 4, 1, 5}
+	want1 := []uint64{2, 6, 3, 7}
+
+	got0 := extractConstVec(t, out[0], c.ctx)
+	got1 := extractConstVec(t, out[1], c.ctx)
+
+	if !reflect.DeepEqual(got0, want0) {
+		t.Errorf("out[0] = %v, want %v", got0, want0)
+	}
+	if !reflect.DeepEqual(got1, want1) {
+		t.Errorf("out[1] = %v, want %v", got1, want1)
+	}
+}
+
+// TestSPMDInterleaveStride4Butterfly verifies that spmdInterleaveStride4
+// produces the correct 4-way interleaving for N=16 (byte lanes on WASM).
+//
+// val0 = <0..15>, val1 = <16..31>, val2 = <32..47>, val3 = <48..63>
+// For each global output position p = k*16+j:
+//
+//	element = vals[p%4][p/4]
+//
+// So:
+//
+//	out[0] = [0,16,32,48, 1,17,33,49, 2,18,34,50, 3,19,35,51]
+//	out[1] = [4,20,36,52, 5,21,37,53, 6,22,38,54, 7,23,39,55]
+//	out[2] = [8,24,40,56, 9,25,41,57, 10,26,42,58, 11,27,43,59]
+//	out[3] = [12,28,44,60, 13,29,45,61, 14,30,46,62, 15,31,47,63]
+func TestSPMDInterleaveStride4Butterfly(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	const N = 16
+	i8Type := c.ctx.Int8Type()
+
+	vals := [4]llvm.Value{}
+	for s := 0; s < 4; s++ {
+		v := make([]uint64, N)
+		for i := 0; i < N; i++ {
+			v[i] = uint64(s*N + i)
+		}
+		vals[s] = buildConstVec(c.ctx, i8Type, v)
+	}
+
+	out := b.spmdInterleaveStride4(vals[0], vals[1], vals[2], vals[3], N)
+
+	// Build expected: for output k, position j: globalPos = k*N+j; value = vals[globalPos%4][globalPos/4].
+	wants := [4][]uint64{}
+	for k := 0; k < 4; k++ {
+		wants[k] = make([]uint64, N)
+		for j := 0; j < N; j++ {
+			globalPos := k*N + j
+			srcVec := globalPos % 4
+			srcLane := globalPos / 4
+			wants[k][j] = uint64(srcVec*N + srcLane)
+		}
+	}
+
+	for k := 0; k < 4; k++ {
+		got := extractConstVec(t, out[k], c.ctx)
+		if !reflect.DeepEqual(got, wants[k]) {
+			t.Errorf("out[%d] = %v\n             want %v", k, got, wants[k])
+		}
+	}
+}
+
+// TestSPMDMaskExpansionStride2 verifies spmdExpandMaskForStride for stride=2, N=16.
+//
+// Source mask = <0,1,2,...,15>. For stride-2, the expanded mask for output k at
+// position j selects source lane (k*N+j)/2:
+//
+//	expanded[0]: srcLane = j/2       → [0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7]
+//	expanded[1]: srcLane = (16+j)/2  → [8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15]
+func TestSPMDMaskExpansionStride2(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	const N = 16
+	const stride = 2
+	maskElemType := c.spmdMaskElemType(N)
+
+	// Build source mask <0,1,...,15> where each element is treated as a lane identifier.
+	srcVals := make([]uint64, N)
+	for i := 0; i < N; i++ {
+		srcVals[i] = uint64(i)
+	}
+	srcMask := buildConstVec(c.ctx, maskElemType, srcVals)
+
+	expanded := b.spmdExpandMaskForStride(srcMask, stride, N)
+
+	if len(expanded) != stride {
+		t.Fatalf("len(expanded) = %d, want %d", len(expanded), stride)
+	}
+
+	// Build expected: expanded[k][j] = (k*N+j)/stride sourced from srcVals.
+	for k := 0; k < stride; k++ {
+		want := make([]uint64, N)
+		for j := 0; j < N; j++ {
+			srcLane := (k*N + j) / stride
+			want[j] = srcVals[srcLane]
+		}
+		got := extractConstVec(t, expanded[k], c.ctx)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("expanded[%d] = %v\n                  want %v", k, got, want)
+		}
+	}
+}
+
+// TestSPMDAnalyzeStrideIndex tests the SSA pattern matching in spmdAnalyzeStrideIndex
+// for stride-S interleaved index expressions of the form iter*S+R.
+func TestSPMDAnalyzeStrideIndex(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Create a fake SPMD loop iterator phi (laneCount=16, i8 lanes on WASM).
+	iterPhi := &ssa.Phi{}
+	loop := &spmdActiveLoop{
+		bodyIterValue: iterPhi,
+		laneCount:     16,
+		scalarIterVal: llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+	}
+	b.spmdLoopState = &spmdLoopState{
+		activeLoops: map[ssa.Value]*spmdActiveLoop{
+			iterPhi: loop,
+		},
+		bodyBlocks: map[int]*spmdActiveLoop{},
+		loopBlocks: map[int]*spmdActiveLoop{},
+	}
+
+	// mkConst creates a typed integer SSA constant.
+	mkConst := func(val int64) *ssa.Const {
+		return ssa.NewConst(constant.MakeInt64(val), types.Typ[types.Int])
+	}
+	// mkMul creates iter*factor as a BinOp.
+	mkMul := func(iter ssa.Value, factor int64) *ssa.BinOp {
+		op := &ssa.BinOp{}
+		op.Op = token.MUL
+		op.X = iter
+		op.Y = mkConst(factor)
+		return op
+	}
+	// mkAdd creates lhs+rhs as a BinOp.
+	mkAdd := func(lhs, rhs ssa.Value) *ssa.BinOp {
+		op := &ssa.BinOp{}
+		op.Op = token.ADD
+		op.X = lhs
+		op.Y = rhs
+		return op
+	}
+
+	tests := []struct {
+		name          string
+		index         ssa.Value
+		wantNil       bool
+		wantStride    int64
+		wantRemainder int64
+	}{
+		{
+			name:          "iter*2 → stride=2 remainder=0",
+			index:         mkMul(iterPhi, 2),
+			wantStride:    2,
+			wantRemainder: 0,
+		},
+		{
+			name:          "iter*2+1 → stride=2 remainder=1",
+			index:         mkAdd(mkMul(iterPhi, 2), mkConst(1)),
+			wantStride:    2,
+			wantRemainder: 1,
+		},
+		{
+			name:          "iter*3+2 → stride=3 remainder=2",
+			index:         mkAdd(mkMul(iterPhi, 3), mkConst(2)),
+			wantStride:    3,
+			wantRemainder: 2,
+		},
+		{
+			name:          "iter*4 → stride=4 remainder=0",
+			index:         mkMul(iterPhi, 4),
+			wantStride:    4,
+			wantRemainder: 0,
+		},
+		{
+			// Commutative MUL: 2*iter instead of iter*2.
+			name: "2*iter+1 → stride=2 remainder=1 (commutative MUL and ADD)",
+			index: func() ssa.Value {
+				mul := &ssa.BinOp{}
+				mul.Op = token.MUL
+				mul.X = mkConst(2) // constant on left
+				mul.Y = iterPhi
+				// 1 + mul (constant on left of ADD).
+				add := &ssa.BinOp{}
+				add.Op = token.ADD
+				add.X = mkConst(1)
+				add.Y = mul
+				return add
+			}(),
+			wantStride:    2,
+			wantRemainder: 1,
+		},
+		{
+			// Stride 5 exceeds [2,4]; should return nil.
+			name:    "iter*5 → nil (stride > 4)",
+			index:   mkMul(iterPhi, 5),
+			wantNil: true,
+		},
+		{
+			// ADD without MUL: iter+1 should return nil (no stride).
+			name: "iter+1 → nil (no MUL)",
+			index: func() ssa.Value {
+				op := &ssa.BinOp{}
+				op.Op = token.ADD
+				op.X = iterPhi
+				op.Y = mkConst(1)
+				return op
+			}(),
+			wantNil: true,
+		},
+		{
+			// Remainder >= stride: iter*2+3 is invalid (R=3 >= S=2).
+			name:    "iter*2+3 → nil (remainder >= stride)",
+			index:   mkAdd(mkMul(iterPhi, 2), mkConst(3)),
+			wantNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pat := b.spmdAnalyzeStrideIndex(tt.index)
+			if tt.wantNil {
+				if pat != nil {
+					t.Errorf("spmdAnalyzeStrideIndex = %+v, want nil", pat)
+				}
+				return
+			}
+			if pat == nil {
+				t.Fatal("spmdAnalyzeStrideIndex = nil, want non-nil")
+			}
+			if pat.stride != tt.wantStride {
+				t.Errorf("stride = %d, want %d", pat.stride, tt.wantStride)
+			}
+			if pat.remainder != tt.wantRemainder {
+				t.Errorf("remainder = %d, want %d", pat.remainder, tt.wantRemainder)
+			}
+			if pat.loop != loop {
+				t.Errorf("loop pointer mismatch")
+			}
+		})
+	}
+}
+
+// TestSPMDInterleaveStride3 verifies spmdInterleaveStride3 for N=16 (byte lanes).
+//
+// val0 = <0..15>, val1 = <16..31>, val2 = <32..47>
+// For each global output position p = k*16+j:
+//
+//	element = vals[p%3][p/3]
+//
+// So the expected output vectors are:
+//
+//	out[0] = [0,16,32, 1,17,33, 2,18,34, 3,19,35, 4,20,36, 5]       (positions 0-15)
+//	out[1] = [21,37, 6,22,38, 7,23,39, 8,24,40, 9,25,41, 10,26]     (positions 16-31)
+//	out[2] = [42, 11,27,43, 12,28,44, 13,29,45, 14,30,46, 15,31,47] (positions 32-47)
+func TestSPMDInterleaveStride3(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	const N = 16
+	i8Type := c.ctx.Int8Type()
+
+	vals := [3]llvm.Value{}
+	for s := 0; s < 3; s++ {
+		v := make([]uint64, N)
+		for i := 0; i < N; i++ {
+			v[i] = uint64(s*N + i)
+		}
+		vals[s] = buildConstVec(c.ctx, i8Type, v)
+	}
+
+	out := b.spmdInterleaveStride3(vals[0], vals[1], vals[2], N)
+
+	// Build expected: for output k, position j: globalPos = k*N+j; value = vals[globalPos%3][globalPos/3].
+	for k := 0; k < 3; k++ {
+		want := make([]uint64, N)
+		for j := 0; j < N; j++ {
+			globalPos := k*N + j
+			srcVec := globalPos % 3
+			srcLane := globalPos / 3
+			want[j] = uint64(srcVec*N + srcLane)
+		}
+		got := extractConstVec(t, out[k], c.ctx)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("out[%d] =\n  got  %v\n  want %v", k, got, want)
+		}
 	}
 }
