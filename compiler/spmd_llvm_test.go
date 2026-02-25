@@ -5556,3 +5556,127 @@ func TestSPMDIsConstAllOnesMask(t *testing.T) {
 		t.Error("should return false for null mask")
 	}
 }
+
+// TestSPMDFullLoadCapTypeMismatch verifies that spmdFullLoadWithSelect handles
+// integer type mismatches between the scalar index and slice cap without
+// panicking, and produces valid IR with the appropriate extend/truncate
+// instruction.
+//
+// LLVM constant-folds trunc/zext on ConstInt values, so the index and cap
+// must be non-constant (function parameters) to keep the cast instructions
+// visible in the IR.
+func TestSPMDFullLoadCapTypeMismatch(t *testing.T) {
+	laneCount := 4
+
+	tests := []struct {
+		name         string
+		indexType    func(c *compilerContext) llvm.Type
+		capType      func(c *compilerContext) llvm.Type
+		wantIRString string
+	}{
+		{
+			// scalarIndex is i32 (uintptr on wasm32), sliceCap is i64.
+			// cap (64 bits) > iter (32 bits) -> Trunc path.
+			name:         "i32 index, i64 cap",
+			indexType:    func(c *compilerContext) llvm.Type { return c.ctx.Int32Type() },
+			capType:      func(c *compilerContext) llvm.Type { return c.ctx.Int64Type() },
+			wantIRString: "spmd.cap.trunc",
+		},
+		{
+			// scalarIndex is i64, sliceCap is i32 (uintptr on wasm32).
+			// cap (32 bits) < iter (64 bits) -> ZExt path.
+			name:         "i64 index, i32 cap",
+			indexType:    func(c *compilerContext) llvm.Type { return c.ctx.Int64Type() },
+			capType:      func(c *compilerContext) llvm.Type { return c.ctx.Int32Type() },
+			wantIRString: "spmd.cap.ext",
+		},
+		{
+			// Both i32 — the common case on wasm32. No cast needed.
+			name:         "i32 index, i32 cap",
+			indexType:    func(c *compilerContext) llvm.Type { return c.ctx.Int32Type() },
+			capType:      func(c *compilerContext) llvm.Type { return c.ctx.Int32Type() },
+			wantIRString: "spmd.can.fullload",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Each sub-test gets its own context and builder because the
+			// builder state cannot be reused after branching IR is created.
+			c := newTestCompilerContext(t)
+			defer c.dispose()
+
+			i32Type := c.ctx.Int32Type()
+			vecType := llvm.VectorType(i32Type, laneCount)
+
+			idxType := tc.indexType(c)
+			capType := tc.capType(c)
+
+			// Use function parameters rather than ConstInt values so that
+			// LLVM cannot constant-fold the trunc/zext instructions away.
+			ptrType := llvm.PointerType(i32Type, 0)
+			paramTypes := []llvm.Type{idxType, capType, ptrType}
+			fnType := llvm.FunctionType(c.ctx.VoidType(), paramTypes, false)
+			fn := llvm.AddFunction(c.mod, "test_func_mismatch", fnType)
+			bb := llvm.AddBasicBlock(fn, "entry")
+
+			b := &builder{compilerContext: c}
+			b.Builder = c.ctx.NewBuilder()
+			defer b.Dispose()
+			b.llvmFn = fn
+			b.SetInsertPointAtEnd(bb)
+
+			scalarIndex := fn.Param(0)
+			sliceCap := fn.Param(1)
+			scalarPtr := fn.Param(2)
+
+			maskElemType := i32Type
+			mask := llvm.ConstVector([]llvm.Value{
+				llvm.ConstAllOnes(maskElemType),
+				llvm.ConstAllOnes(maskElemType),
+				llvm.ConstNull(maskElemType),
+				llvm.ConstNull(maskElemType),
+			}, false)
+
+			ci := &spmdContiguousInfo{
+				scalarPtr:   scalarPtr,
+				loop:        &spmdActiveLoop{laneCount: laneCount},
+				sliceCap:    sliceCap,
+				scalarIndex: scalarIndex,
+			}
+
+			mergeBB := b.insertBasicBlock("test.after")
+			result := b.spmdFullLoadWithSelect(vecType, ci, mask)
+			b.CreateBr(mergeBB)
+			b.SetInsertPointAtEnd(mergeBB)
+			b.CreateRetVoid()
+
+			if result.IsNil() {
+				t.Fatal("spmdFullLoadWithSelect returned nil")
+			}
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
+			}
+			if result.Type().VectorSize() != laneCount {
+				t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), laneCount)
+			}
+
+			ir := c.mod.String()
+			if !strings.Contains(ir, tc.wantIRString) {
+				t.Errorf("IR should contain %q", tc.wantIRString)
+			}
+			if !strings.Contains(ir, "spmd.fullload") {
+				t.Error("IR should contain spmd.fullload basic block")
+			}
+			if !strings.Contains(ir, "spmd.maskedload") {
+				t.Error("IR should contain spmd.maskedload basic block")
+			}
+			// Same-width case must NOT have cast instructions.
+			if tc.name == "i32 index, i32 cap" {
+				if strings.Contains(ir, "spmd.cap.ext") || strings.Contains(ir, "spmd.cap.trunc") {
+					t.Error("same-width case should not have ext/trunc instructions")
+				}
+			}
+		})
+	}
+}
