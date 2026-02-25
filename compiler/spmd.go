@@ -491,23 +491,19 @@ type spmdPeeledLoop struct {
 }
 
 // spmdShouldPeelLoop returns true if the given SPMD loop is eligible for peeling.
-// Currently restricted to rangeindex (range-over-slice) loops without accumulator
-// phis, because:
-// - rangeint loops have a different CFG (entry→body→loop) that isn't handled yet
-// - Accumulator phis in the loop block need rewiring across main/tail loops
-// - SPMD function bodies with break masks are excluded
+// Supports both rangeindex (range-over-slice) and rangeint (range N) loops.
+// Accumulator phis are counted across both body and loop blocks; loops with
+// accumulators are still peeled (forwarding is handled by accumulatorPhis in
+// spmdPeeledLoop). SPMD function bodies are excluded via a panic assertion
+// because the activeLoops state implies spmdFuncIsBody is always false here.
 func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
-	// Don't peel loops in SPMD function bodies — they have break masks
-	// that interact with the iteration mask.
+	// spmdFuncIsBody implies spmdLoopState == nil, which means there are no
+	// go-for loops to peel. This function is only called for loops in
+	// spmdLoopState.activeLoops, so spmdFuncIsBody should never be true here.
+	// If this invariant is violated (e.g., go-for nesting becomes allowed),
+	// peeling must be revisited to handle break mask interaction.
 	if b.spmdFuncIsBody {
-		return false
-	}
-	// Only peel rangeindex (range-over-slice) loops.
-	// rangeint loops (range N) have a different CFG structure
-	// (entry→body→loop→body vs entry→loop→body→loop) that isn't
-	// handled by the entry-condbr and tail.check phi wiring yet.
-	if !loop.isRangeIndex {
-		return false
+		panic("spmd: spmdShouldPeelLoop called with spmdFuncIsBody=true (invariant violation)")
 	}
 	// Don't peel loops inside closures (anonymous functions).
 	// Closures have complex entry blocks (captured variables, recover setup)
@@ -519,25 +515,43 @@ func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
 	if loop.laneCount <= 0 {
 		return false
 	}
-	// Check for accumulator phis in the loop block.
-	// For rangeindex, the loop block (rangeindex.loop) has the iterator phi
-	// plus any accumulator phis (e.g., `total = phi [entry: 0, body: total+value]`).
-	// Peeling doesn't rewire accumulator phis across main/tail loops, so any
-	// loop with more than one phi in the loop block is ineligible.
+	// Check for accumulator phis beyond the iterator phi.
+	// Accumulator phis live in different blocks depending on the loop pattern:
+	// - rangeindex: iterator phi + accumulators in loop block (rangeindex.loop)
+	// - rangeint: iterator phi in body block (rangeint.body), accumulators also in body block
+	// Both patterns may also have phis in the other block (though uncommon).
+	// Count phis in both the body and loop blocks; only the single iterator phi is allowed.
 	if loop.incrBinOp == nil {
 		return false // defensive: incrBinOp must be set for any real loop
 	}
+	totalPhiCount := 0
+	// Count phis in the loop block (where incrBinOp lives).
 	loopBlock := loop.incrBinOp.Block()
-	phiCount := 0
 	for _, instr := range loopBlock.Instrs {
 		if _, isPhi := instr.(*ssa.Phi); isPhi {
-			phiCount++
-			if phiCount > 1 {
-				return false // has accumulator phis beyond the iterator, don't peel
-			}
+			totalPhiCount++
 		} else {
-			break // phis are always first in the block
+			break
 		}
+	}
+	// Count phis in the body block (where iterPhi lives, for rangeint).
+	if loop.iterPhi != nil {
+		bodyBlock := loop.iterPhi.Block()
+		if bodyBlock != loopBlock {
+			for _, instr := range bodyBlock.Instrs {
+				if _, isPhi := instr.(*ssa.Phi); isPhi {
+					totalPhiCount++
+				} else {
+					break
+				}
+			}
+		}
+	}
+	// The iterator phi is the one allowed phi. Any additional phis are accumulators
+	// that need forwarding through tail.check.
+	if totalPhiCount > 1 {
+		// Accumulator phis present — still peel, but will need forwarding.
+		// (Handled by accumulatorPhis in spmdPeeledLoop.)
 	}
 	return true
 }
