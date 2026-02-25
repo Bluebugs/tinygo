@@ -5717,6 +5717,11 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 					b.spmdMaskStack = []llvm.Value{loop.tailMask}
 					continue // skip normal createInstruction for this phi
 				}
+				// Check for accumulator phi — override to tail.check accumulator phi.
+				if accPhi, ok := peeled.accumulatorPhis[phi]; ok {
+					b.locals[phi] = accPhi
+					continue // skip normal createInstruction for this phi
+				}
 			}
 
 			b.createInstruction(instr)
