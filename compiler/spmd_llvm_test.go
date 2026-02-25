@@ -1326,29 +1326,37 @@ func TestSPMDLoopPeelingEligibility(t *testing.T) {
 	defer c.dispose()
 
 	tests := []struct {
-		name     string
-		loop     spmdActiveLoop
-		funcBody bool // spmdFuncIsBody
-		want     bool
+		name      string
+		loop      spmdActiveLoop
+		funcBody  bool
+		want      bool
+		wantPanic bool
 	}{
-		// rangeint loops are not eligible for peeling (different CFG structure).
-		{"rangeint_no_break", spmdActiveLoop{laneCount: 16}, false, false},
-		// rangeindex loops are eligible in principle, but without a real SSA BinOp
-		// (incrBinOp == nil) the nil guard returns false. Full eligibility for
-		// rangeindex loops with proper SSA graphs is exercised by integration tests.
-		{"rangeindex_nil_incrBinOp", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, false, false},
-		// SPMD function bodies are always ineligible, regardless of loop kind.
-		{"spmd_func_body", spmdActiveLoop{laneCount: 4}, true, false},
-		// SPMD function body + rangeindex: funcBody check short-circuits before incrBinOp access.
-		{"spmd_func_body_rangeindex", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, true, false},
+		// rangeint loops are now eligible for peeling (gate removed).
+		// Without a real SSA BinOp (incrBinOp == nil) the nil guard returns false.
+		{"rangeint_nil_incrBinOp", spmdActiveLoop{laneCount: 16}, false, false, false},
+		// rangeindex loops: same nil guard behavior.
+		{"rangeindex_nil_incrBinOp", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, false, false, false},
 		// Zero lane count is ineligible.
-		{"zero_lane_count", spmdActiveLoop{laneCount: 0, isRangeIndex: true}, false, false},
+		{"zero_lane_count", spmdActiveLoop{laneCount: 0, isRangeIndex: true}, false, false, false},
+		// SPMD function body triggers panic (invariant violation).
+		{"spmd_func_body_panics", spmdActiveLoop{laneCount: 4}, true, false, true},
+		{"spmd_func_body_rangeindex_panics", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, true, false, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := newTestBuilder(t, c)
 			b.spmdFuncIsBody = tt.funcBody
+			if tt.wantPanic {
+				defer func() {
+					if r := recover(); r == nil {
+						t.Errorf("spmdShouldPeelLoop() did not panic, expected panic")
+					}
+				}()
+				b.spmdShouldPeelLoop(&tt.loop)
+				return
+			}
 			got := b.spmdShouldPeelLoop(&tt.loop)
 			if got != tt.want {
 				t.Errorf("spmdShouldPeelLoop() = %v, want %v", got, tt.want)
