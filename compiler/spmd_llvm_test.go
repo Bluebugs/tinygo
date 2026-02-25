@@ -5740,6 +5740,133 @@ func TestSPMDFullStoreWithBlend(t *testing.T) {
 	}
 }
 
+// TestSPMDAllocaFastPathLoad verifies that spmdFullLoadWithSelect emits a direct
+// load+select when the contiguous access originates from a stack-allocated array
+// (alloca fast-path), with no runtime cap-check branch or masked.load fallback.
+func TestSPMDAllocaFastPathLoad(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	vecType := llvm.VectorType(i32Type, laneCount)
+
+	scalarIndex := llvm.ConstInt(b.uintptrType, 0, false)
+
+	arrType := llvm.ArrayType(i32Type, 16)
+	alloca := b.CreateAlloca(arrType, "test.buf")
+	zero := llvm.ConstInt(i32Type, 0, false)
+	scalarPtr := b.CreateInBoundsGEP(arrType, alloca, []llvm.Value{zero, zero}, "test.ptr")
+
+	maskElemType := i32Type
+	mask := llvm.ConstVector([]llvm.Value{
+		llvm.ConstAllOnes(maskElemType),
+		llvm.ConstAllOnes(maskElemType),
+		llvm.ConstNull(maskElemType),
+		llvm.ConstNull(maskElemType),
+	}, false)
+
+	goI32 := types.Typ[types.Int32]
+	goArrType := types.NewArray(goI32, 16)
+	goPtrType := types.NewPointer(goArrType)
+	mockAlloc := ssaAllocWithType(goPtrType, false)
+
+	ci := &spmdContiguousInfo{
+		scalarPtr:   scalarPtr,
+		loop:        &spmdActiveLoop{laneCount: laneCount},
+		ssaSource:   mockAlloc,
+		scalarIndex: scalarIndex,
+	}
+
+	mergeBB := b.insertBasicBlock("test.after")
+	result := b.spmdFullLoadWithSelect(vecType, ci, mask)
+	b.CreateBr(mergeBB)
+	b.SetInsertPointAtEnd(mergeBB)
+	b.CreateRetVoid()
+
+	if result.IsNil() {
+		t.Fatal("returned nil for alloca fast-path")
+	}
+
+	ir := c.mod.String()
+	if strings.Contains(ir, "spmd.can.fullload") {
+		t.Error("alloca fast-path should NOT emit cap check")
+	}
+	if strings.Contains(ir, "spmd.maskedload") {
+		t.Error("alloca fast-path should NOT emit masked load fallback")
+	}
+	if !strings.Contains(ir, "spmd.alloca.load") {
+		t.Error("alloca fast-path should emit spmd.alloca.load")
+	}
+	// WASM uses bitwise mask select (AND/OR), not LLVM select.
+	if !strings.Contains(ir, " and ") && !strings.Contains(ir, " or ") {
+		t.Error("alloca fast-path load should emit mask select to zero inactive lanes")
+	}
+}
+
+// TestSPMDAllocaFastPathStore verifies that spmdFullStoreWithBlend emits a direct
+// load-blend-store when the contiguous access originates from a stack-allocated
+// array (alloca fast-path), with no runtime cap-check branch or masked.store fallback.
+func TestSPMDAllocaFastPathStore(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	vecType := llvm.VectorType(i32Type, laneCount)
+
+	scalarIndex := llvm.ConstInt(b.uintptrType, 0, false)
+
+	arrType := llvm.ArrayType(i32Type, 16)
+	alloca := b.CreateAlloca(arrType, "test.buf")
+	zero := llvm.ConstInt(i32Type, 0, false)
+	scalarPtr := b.CreateInBoundsGEP(arrType, alloca, []llvm.Value{zero, zero}, "test.ptr")
+
+	maskElemType := i32Type
+	mask := llvm.ConstVector([]llvm.Value{
+		llvm.ConstAllOnes(maskElemType),
+		llvm.ConstAllOnes(maskElemType),
+		llvm.ConstNull(maskElemType),
+		llvm.ConstNull(maskElemType),
+	}, false)
+
+	storeVal := llvm.ConstNull(vecType)
+
+	goI32 := types.Typ[types.Int32]
+	goArrType := types.NewArray(goI32, 16)
+	goPtrType := types.NewPointer(goArrType)
+	mockAlloc := ssaAllocWithType(goPtrType, false)
+
+	ci := &spmdContiguousInfo{
+		scalarPtr:   scalarPtr,
+		loop:        &spmdActiveLoop{laneCount: laneCount},
+		ssaSource:   mockAlloc,
+		scalarIndex: scalarIndex,
+	}
+
+	b.spmdFullStoreWithBlend(storeVal, ci, mask)
+	b.CreateRetVoid()
+
+	ir := c.mod.String()
+	if strings.Contains(ir, "spmd.can.fullstore") {
+		t.Error("alloca fast-path should NOT emit cap check")
+	}
+	if strings.Contains(ir, "spmd.maskedstore") {
+		t.Error("alloca fast-path should NOT emit masked store fallback")
+	}
+	if !strings.Contains(ir, "spmd.alloca.old") {
+		t.Error("alloca fast-path should emit spmd.alloca.old load")
+	}
+	// WASM uses bitwise mask select (AND/OR), not LLVM select.
+	if !strings.Contains(ir, " and ") && !strings.Contains(ir, " or ") {
+		t.Error("alloca fast-path store should emit mask select to blend active lanes")
+	}
+}
+
 // TestSPMDFullStoreCapTypeMismatch verifies that spmdFullStoreWithBlend handles
 // integer type mismatches between the scalar index and slice cap without
 // panicking, and produces valid IR with the appropriate extend/truncate

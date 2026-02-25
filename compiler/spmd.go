@@ -1277,6 +1277,7 @@ type spmdContiguousInfo struct {
 	loop        *spmdActiveLoop // owning loop (for lane count)
 	sliceCap    llvm.Value      // cap of source slice (zero value for arrays/strings)
 	scalarIndex llvm.Value      // actual scalar GEP index used (may be iter+offset)
+	ssaSource   ssa.Value       // original IndexAddr.X for alloca origin tracing
 }
 
 // spmdShiftedLoadInfo describes a gather that can be optimized to a smaller
@@ -3556,6 +3557,37 @@ func (b *builder) spmdMaskedLoad(vecType llvm.Type, ptr, mask llvm.Value) llvm.V
 	return b.createCall(fnType, fn, []llvm.Value{ptr, align, i1Mask, passthru}, "spmd.load")
 }
 
+// spmdIsAllocaOriginStatic checks if an SSA value is a stack-allocated array
+// (*ssa.Alloc with Heap=false) large enough for a full vector operation.
+// Conservative: returns false for anything uncertain.
+func spmdIsAllocaOriginStatic(ssaVal ssa.Value, laneCount int) bool {
+	if ssaVal == nil {
+		return false
+	}
+	alloc, ok := ssaVal.(*ssa.Alloc)
+	if !ok || alloc.Heap {
+		return false
+	}
+	ptrType, ok := alloc.Type().Underlying().(*types.Pointer)
+	if !ok {
+		return false
+	}
+	arrType, ok := ptrType.Elem().Underlying().(*types.Array)
+	if !ok {
+		return false
+	}
+	return arrType.Len() >= int64(laneCount)
+}
+
+// spmdIsAllocaOrigin checks if the source of a contiguous SPMD access is a
+// stack-allocated array large enough for a full vector load/store.
+func (b *builder) spmdIsAllocaOrigin(ci *spmdContiguousInfo) bool {
+	if ci.ssaSource == nil {
+		return false
+	}
+	return spmdIsAllocaOriginStatic(ci.ssaSource, ci.loop.laneCount)
+}
+
 // spmdFullLoadWithSelect emits a runtime cap check and, when safe, replaces a
 // scalarized llvm.masked.load with a plain v128.load + select(mask, loaded, zero).
 // On WASM, llvm.masked.load scalarizes to 4-16 conditional scalar loads. A full
@@ -3571,7 +3603,18 @@ func (b *builder) spmdMaskedLoad(vecType llvm.Type, ptr, mask llvm.Value) llvm.V
 //	maskedBB: result = masked.load(ptr, mask); br mergeBB
 //	mergeBB: phi [fullBB, maskedBB]
 func (b *builder) spmdFullLoadWithSelect(vecType llvm.Type, ci *spmdContiguousInfo, mask llvm.Value) llvm.Value {
+	// Fast path: alloca origin — stack memory is always fully accessible.
+	if b.spmdIsAllocaOrigin(ci) {
+		raw := b.CreateLoad(vecType, ci.scalarPtr, "spmd.alloca.load")
+		return b.spmdMaskSelect(mask, raw, llvm.ConstNull(vecType))
+	}
+
 	laneCount := ci.loop.laneCount
+
+	// Defensive: sliceCap must be valid when the alloca fast-path was not taken.
+	if ci.sliceCap.IsNil() {
+		panic("spmdFullLoadWithSelect: sliceCap is nil and source is not alloca")
+	}
 
 	// Compute scalarIndex + laneCount using the actual GEP index (not raw iter,
 	// which may differ when an offset is applied, e.g. output[j*width + i]).
@@ -3668,7 +3711,21 @@ func (b *builder) spmdMaskedStore(val, ptr, mask llvm.Value) {
 //	mergeBB: (void, no phi)
 func (b *builder) spmdFullStoreWithBlend(val llvm.Value, ci *spmdContiguousInfo, mask llvm.Value) {
 	vecType := val.Type()
+
+	// Fast path: alloca origin — stack memory is always fully accessible.
+	if b.spmdIsAllocaOrigin(ci) {
+		old := b.CreateLoad(vecType, ci.scalarPtr, "spmd.alloca.old")
+		blended := b.spmdMaskSelect(mask, val, old)
+		b.CreateStore(blended, ci.scalarPtr)
+		return
+	}
+
 	laneCount := ci.loop.laneCount
+
+	// Defensive: sliceCap must be valid when the alloca fast-path was not taken.
+	if ci.sliceCap.IsNil() {
+		panic("spmdFullStoreWithBlend: sliceCap is nil and source is not alloca")
+	}
 
 	// Compute scalarIndex + laneCount using the actual GEP index.
 	iterType := ci.scalarIndex.Type()
@@ -3898,7 +3955,7 @@ func (b *builder) spmdContiguousIndexAddrCore(expr *ssa.IndexAddr, loop *spmdAct
 		bufType := b.getLLVMType(ptrTyp.Elem())
 		ptr = b.CreateInBoundsGEP(bufType, bufptr, []llvm.Value{scalarIndex}, "spmd.contiguous.ptr")
 		if b.spmdContiguousPtr != nil {
-			b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop, sliceCap: sliceCap, scalarIndex: scalarIndex}
+			b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop, sliceCap: sliceCap, scalarIndex: scalarIndex, ssaSource: expr.X}
 		}
 		return ptr, nil
 	default:
@@ -3906,7 +3963,7 @@ func (b *builder) spmdContiguousIndexAddrCore(expr *ssa.IndexAddr, loop *spmdAct
 	}
 
 	if b.spmdContiguousPtr != nil {
-		b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop, scalarIndex: scalarIndex}
+		b.spmdContiguousPtr[expr] = &spmdContiguousInfo{scalarPtr: ptr, loop: loop, scalarIndex: scalarIndex, ssaSource: expr.X}
 	}
 	return ptr, nil
 }

@@ -2411,7 +2411,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 					if b.spmdContiguousPtr != nil {
 						if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
 							// Cap-based optimization: use load-blend-store when safe.
-							if !ci.sliceCap.IsNil() && !b.spmdIsConstAllOnesMask(parentMask) {
+							if !b.spmdIsConstAllOnesMask(parentMask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
 								b.spmdFullStoreWithBlend(selected, ci, parentMask)
 								b.currentBlockInfo.exit = b.GetInsertBlock()
 							} else {
@@ -2466,7 +2466,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 					llvmVal = b.splatScalar(llvmVal, vecType)
 				}
 				// Cap-based optimization: use load-blend-store when safe.
-				if !ci.sliceCap.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
+				if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
 					b.spmdFullStoreWithBlend(llvmVal, ci, mask)
 					b.currentBlockInfo.exit = b.GetInsertBlock()
 				} else {
@@ -4734,7 +4734,7 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(ci.loop.laneCount), ci.loop.laneCount))
 				}
 				// Cap-based optimization: use full v128.load + select when safe.
-				if !ci.sliceCap.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
+				if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
 					result := b.spmdFullLoadWithSelect(vecType, ci, mask)
 					b.currentBlockInfo.exit = b.GetInsertBlock()
 					return result, nil

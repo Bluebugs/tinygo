@@ -8,9 +8,12 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"reflect"
 	"testing"
+	"unsafe"
 
 	"github.com/tinygo-org/tinygo/loader"
+	"golang.org/x/tools/go/ssa"
 )
 
 // TestSPMDExtractNoSPMDCode verifies that packages without SPMD code return empty results.
@@ -575,6 +578,77 @@ func TestSPMDGetSPMDLoopAt(t *testing.T) {
 	emptyCtx := &compilerContext{}
 	if emptyCtx.getSPMDLoopAt(token.Pos(100)) != nil {
 		t.Error("expected nil for context without SPMD info")
+	}
+}
+
+// ssaAllocWithType creates an *ssa.Alloc with the given type set via reflection,
+// because ssa.Alloc.setType is unexported.
+func ssaAllocWithType(t types.Type, heap bool) *ssa.Alloc {
+	alloc := &ssa.Alloc{Heap: heap}
+	// Access the unexported typ field through the embedded register struct.
+	// reflect.ValueOf(alloc).Elem() gives the Alloc struct value.
+	// The first field of Alloc is the embedded register struct (anInstruction + num + typ ...).
+	// We traverse the struct fields to find "typ" in the embedded register.
+	v := reflect.ValueOf(alloc).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+		if field.Kind() == reflect.Struct {
+			for j := 0; j < field.NumField(); j++ {
+				inner := field.Type().Field(j)
+				if inner.Name == "typ" {
+					// Use unsafe to write through the unexported field.
+					ptr := (*types.Type)(unsafe.Pointer(field.Field(j).UnsafeAddr()))
+					*ptr = t
+					return alloc
+				}
+			}
+		}
+	}
+	panic("could not find typ field in ssa.Alloc — struct layout may have changed")
+}
+
+// TestSPMDIsAllocaOrigin verifies that spmdIsAllocaOriginStatic correctly
+// identifies stack-allocated arrays large enough for full vector operations.
+func TestSPMDIsAllocaOrigin(t *testing.T) {
+	i32Type := types.Typ[types.Int32]
+	arrType16 := types.NewArray(i32Type, 16)
+	ptrToArr16 := types.NewPointer(arrType16)
+
+	// Stack alloc (Heap=false) with array length 16.
+	stackAlloc := ssaAllocWithType(ptrToArr16, false)
+
+	if !spmdIsAllocaOriginStatic(stackAlloc, 4) {
+		t.Error("stack alloc with array[16] should be detected for laneCount=4")
+	}
+	if !spmdIsAllocaOriginStatic(stackAlloc, 16) {
+		t.Error("stack alloc with array[16] should be detected for laneCount=16")
+	}
+
+	// Heap alloc.
+	heapAlloc := ssaAllocWithType(ptrToArr16, true)
+	if spmdIsAllocaOriginStatic(heapAlloc, 4) {
+		t.Error("heap alloc should NOT be detected as alloca")
+	}
+
+	// Small array (length 2, less than laneCount=4).
+	arrType2 := types.NewArray(i32Type, 2)
+	ptrToArr2 := types.NewPointer(arrType2)
+	smallAlloc := ssaAllocWithType(ptrToArr2, false)
+	if spmdIsAllocaOriginStatic(smallAlloc, 4) {
+		t.Error("small array[2] should NOT be detected for laneCount=4")
+	}
+
+	// Array length exactly one less than laneCount — should NOT match.
+	arrType3 := types.NewArray(i32Type, 3)
+	ptrToArr3 := types.NewPointer(arrType3)
+	oneShortAlloc := ssaAllocWithType(ptrToArr3, false)
+	if spmdIsAllocaOriginStatic(oneShortAlloc, 4) {
+		t.Error("array[3] should NOT be detected for laneCount=4")
+	}
+
+	// Nil value should return false.
+	if spmdIsAllocaOriginStatic(nil, 4) {
+		t.Error("nil should NOT be detected as alloca")
 	}
 }
 
