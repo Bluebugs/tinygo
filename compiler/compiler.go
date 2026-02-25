@@ -2413,6 +2413,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 							// Cap-based optimization: use load-blend-store when safe.
 							if !ci.sliceCap.IsNil() && !b.spmdIsConstAllOnesMask(parentMask) {
 								b.spmdFullStoreWithBlend(selected, ci, parentMask)
+								b.currentBlockInfo.exit = b.GetInsertBlock()
 							} else {
 								b.spmdMaskedStore(selected, ci.scalarPtr, parentMask)
 							}
@@ -2467,6 +2468,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 				// Cap-based optimization: use load-blend-store when safe.
 				if !ci.sliceCap.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
 					b.spmdFullStoreWithBlend(llvmVal, ci, mask)
+					b.currentBlockInfo.exit = b.GetInsertBlock()
 				} else {
 					b.spmdMaskedStore(llvmVal, ci.scalarPtr, mask)
 				}
@@ -4733,7 +4735,9 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 				}
 				// Cap-based optimization: use full v128.load + select when safe.
 				if !ci.sliceCap.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
-					return b.spmdFullLoadWithSelect(vecType, ci, mask), nil
+					result := b.spmdFullLoadWithSelect(vecType, ci, mask)
+					b.currentBlockInfo.exit = b.GetInsertBlock()
+					return result, nil
 				}
 				return b.spmdMaskedLoad(vecType, ci.scalarPtr, mask), nil
 			}
