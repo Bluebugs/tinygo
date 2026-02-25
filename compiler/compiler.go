@@ -1840,6 +1840,36 @@ func (b *builder) createFunction() {
 				[]llvm.Value{zero, mainIterNext},
 				[]llvm.BasicBlock{entryPredExit, mainLoopExit},
 			)
+
+			// Wire accumulator phi incoming values.
+			for ssaPhi, accLLVMPhi := range peeled.accumulatorPhis {
+				// Find the initial value from the entry edge.
+				var initVal llvm.Value
+				phiBlock := ssaPhi.Block()
+				for i, pred := range phiBlock.Preds {
+					_, isBody := b.spmdLoopState.bodyBlocks[pred.Index]
+					_, isLoop := b.spmdLoopState.loopBlocks[pred.Index]
+					isInterior := peeled.bodyBlockSet[pred.Index]
+					if !isBody && !isLoop && !isInterior {
+						// This is the entry predecessor edge.
+						initVal = b.getValue(ssaPhi.Edges[i], getPos(ssaPhi))
+						break
+					}
+				}
+				if initVal.IsNil() {
+					// Fallback: use zero value.
+					initVal = llvm.ConstNull(b.getLLVMType(ssaPhi.Type()))
+				}
+				// Main loop's final value (b.locals restored to post-main-loop state).
+				mainAccVal := b.locals[ssaPhi]
+				if mainAccVal.IsNil() {
+					mainAccVal = llvm.ConstNull(b.getLLVMType(ssaPhi.Type()))
+				}
+				accLLVMPhi.AddIncoming(
+					[]llvm.Value{initVal, mainAccVal},
+					[]llvm.BasicBlock{entryPredExit, mainLoopExit},
+				)
+			}
 		}
 	}
 
