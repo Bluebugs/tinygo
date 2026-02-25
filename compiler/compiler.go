@@ -2249,7 +2249,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		// runs only when there is at least one full vector worth of elements.
 		// If alignedBound == 0, skip directly to tail.check.
 		// For rangeindex: entry → loop (succIdx is loop block).
-		// (rangeint loops are excluded from peeling by spmdShouldPeelLoop.)
+		// For rangeint: entry → body (succIdx is body block).
 		// IMPORTANT: Only match the actual entry block, NOT body/interior blocks
 		// that also jump to the loop block (e.g., if.then, if.else in rangeindex).
 		if b.spmdPeeledLoops != nil && b.spmdLoopState != nil {
