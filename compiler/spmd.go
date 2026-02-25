@@ -5508,6 +5508,37 @@ func (b *builder) emitSPMDTailCheck(peeled *spmdPeeledLoop) {
 	phi := b.CreatePHI(iterType, "spmd.tail.iter")
 	peeled.tailIterPhi = phi
 
+	// Create accumulator phis in tail.check for any additional phis beyond the
+	// iterator. Accumulator phis carry values (running sums, etc.) from the main
+	// loop exit into the tail iteration.
+	// Collect phis from both body and loop blocks (rangeint has iter phi in body,
+	// rangeindex has iter phi in loop; accumulators can be in either).
+	peeled.accumulatorPhis = make(map[*ssa.Phi]llvm.Value)
+	collectAccPhis := func(block *ssa.BasicBlock) {
+		for _, instr := range block.Instrs {
+			ssaPhi, ok := instr.(*ssa.Phi)
+			if !ok {
+				break // phis are always first
+			}
+			// Skip the iterator phi (already handled by tailIterPhi).
+			if loopMatch, matched := b.spmdLoopState.activeLoops[ssaPhi]; matched && loopMatch == loop {
+				continue
+			}
+			// This is an accumulator phi — create a corresponding LLVM phi in tail.check.
+			accType := b.getLLVMType(ssaPhi.Type())
+			accPhi := b.CreatePHI(accType, "spmd.tail.acc")
+			peeled.accumulatorPhis[ssaPhi] = accPhi
+		}
+	}
+	loopBlock := loop.incrBinOp.Block()
+	collectAccPhis(loopBlock)
+	if loop.iterPhi != nil {
+		bodyBlock := loop.iterPhi.Block()
+		if bodyBlock != loopBlock {
+			collectAccPhis(bodyBlock)
+		}
+	}
+
 	// Branch: tailIter < bound → tail.body, else → exit.
 	boundScalar := b.getValue(loop.boundValue, token.NoPos)
 	hasTail := b.CreateICmp(llvm.IntSLT, phi, boundScalar, "spmd.has.tail")
