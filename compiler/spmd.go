@@ -460,6 +460,34 @@ type spmdActiveLoop struct {
 	scalarIterVal llvm.Value // scalar LLVM value (before override to lane indices)
 }
 
+// entryPredecessor returns the unique predecessor that enters this loop from
+// outside (not a back-edge from inside the loop).
+// For rangeint: body block's predecessor that isn't the loop block.
+// For rangeindex: loop block's predecessor that isn't a body/interior block.
+// bodyBlockSet may be nil; when nil, interior-block filtering is skipped
+// (only relevant for rangeindex; rangeint ignores it).
+func (loop *spmdActiveLoop) entryPredecessor(state *spmdLoopState, bodyBlockSet map[int]bool) *ssa.BasicBlock {
+	if loop.isRangeIndex {
+		loopBlock := loop.incrBinOp.Block()
+		for _, pred := range loopBlock.Preds {
+			if _, isBody := state.bodyBlocks[pred.Index]; !isBody {
+				if bodyBlockSet != nil && bodyBlockSet[pred.Index] {
+					continue
+				}
+				return pred
+			}
+		}
+	} else {
+		bodyBlock := loop.iterPhi.Block()
+		for _, pred := range bodyBlock.Preds {
+			if _, isLoop := state.loopBlocks[pred.Index]; !isLoop {
+				return pred
+			}
+		}
+	}
+	return nil
+}
+
 // spmdLoopPhase tracks whether we're emitting the main loop body (all-ones mask)
 // or the tail body (computed mask) during loop peeling.
 type spmdLoopPhase int

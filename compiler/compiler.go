@@ -1785,40 +1785,10 @@ func (b *builder) createFunction() {
 
 			// Find the entry predecessor block — the block that enters the SPMD loop
 			// from outside (not a back-edge from inside the loop).
-			// For rangeint: entry → body → loop → body. Body preds include entry.
-			// For rangeindex: entry → loop → body → loop. Body pred is only loop.
-			//   So for rangeindex, look at the loop block's predecessors instead.
 			var entryPredExit llvm.BasicBlock
-			if loop.isRangeIndex {
-				// rangeindex: find the loop block's predecessor that isn't the body.
-				for loopIdx, loopMatch := range b.spmdLoopState.loopBlocks {
-					if loopMatch == loop {
-						loopBlock := b.fn.Blocks[loopIdx]
-						for _, pred := range loopBlock.Preds {
-							if _, isBody := b.spmdLoopState.bodyBlocks[pred.Index]; !isBody {
-								if peeled.bodyBlockSet[pred.Index] {
-									continue // interior block, skip
-								}
-								entryPredExit = b.blockInfo[pred.Index].exit
-								break
-							}
-						}
-						break
-					}
-				}
-			} else {
-				// rangeint: find the body block's predecessor that isn't the loop block.
-				for _, block := range b.fn.DomPreorder() {
-					if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
-						for _, pred := range block.Preds {
-							if _, isLoop := b.spmdLoopState.loopBlocks[pred.Index]; !isLoop {
-								entryPredExit = b.blockInfo[pred.Index].exit
-								break
-							}
-						}
-						break
-					}
-				}
+			entryPred := loop.entryPredecessor(b.spmdLoopState, peeled.bodyBlockSet)
+			if entryPred != nil {
+				entryPredExit = b.blockInfo[entryPred.Index].exit
 			}
 
 			// Find the loop block's exit LLVM block and the main incrBinOp value.
