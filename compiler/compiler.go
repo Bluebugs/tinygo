@@ -2138,13 +2138,53 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		block := instr.Block()
 		blockThen := b.blockInfo[block.Succs[0].Index].entry
 		blockElse := b.blockInfo[block.Succs[1].Index].entry
-		// SPMD loop peeling: redirect the loop block's false (exit) branch to tail.check.
-		// This applies only to the main phase — in the tail phase the loop block is not
-		// emitted at all, so there is no branch to redirect.
+		// SPMD loop peeling: redirect the loop block's branches.
+		// Main phase: false (exit) branch → tail.check (instead of original exit).
+		// Tail phase: for merged body+loop (rangeint), the If acts as the loop-back
+		// terminator. Redirect to tailExitBlock so the tail runs at most once.
 		if b.spmdPeeledLoops != nil && b.spmdLoopState != nil {
 			if loop, ok := b.spmdLoopState.loopBlocks[block.Index]; ok {
-				if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseMain {
-					blockElse = peeled.tailCheckBlock
+				if peeled, ok := b.spmdPeeledLoops[loop]; ok {
+					if peeled.phase == spmdLoopPhaseMain {
+						blockElse = peeled.tailCheckBlock
+					} else if peeled.phase == spmdLoopPhaseTail {
+						// Tail phase: prevent loop-back. Branch to tailExitBlock unconditionally.
+						b.CreateBr(peeled.tailExitBlock)
+						break
+					}
+				}
+			}
+		}
+		// SPMD loop peeling: entry If for rangeint loops.
+		// rangeint entry blocks terminate with If(0 < bound), not Jump.
+		// During main phase, replace with condBr(alignedBound > 0, mainEntry, tailCheckBlock).
+		// The tailCheckBlock already checks tailIter < bound, which handles both
+		// "no main elements, some tail" and "no elements at all" paths.
+		if b.spmdPeeledLoops != nil && b.spmdLoopState != nil {
+			// Exclude loop blocks — they already have their own redirect above.
+			if _, isLoop := b.spmdLoopState.loopBlocks[block.Index]; !isLoop {
+				succIdx := block.Succs[0].Index // true branch → body block
+				var loop *spmdActiveLoop
+				if l, ok := b.spmdLoopState.bodyBlocks[succIdx]; ok {
+					loop = l
+				} else if l, ok := b.spmdLoopState.loopBlocks[succIdx]; ok {
+					loop = l
+				}
+				if loop != nil {
+					if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseMain {
+						// Only the entry block gets this override, not body/interior blocks.
+						if !peeled.bodyBlockSet[block.Index] {
+							if peeled.alignedBound.IsNil() {
+								boundScalar := b.getValue(loop.boundValue, getPos(instr))
+								peeled.alignedBound = b.spmdComputeAlignedBound(boundScalar, loop.laneCount)
+							}
+							mainEntry := b.blockInfo[succIdx].entry
+							zero := llvm.ConstInt(peeled.alignedBound.Type(), 0, false)
+							hasMain := b.CreateICmp(llvm.IntSGT, peeled.alignedBound, zero, "spmd.has.main")
+							b.CreateCondBr(hasMain, mainEntry, peeled.tailCheckBlock)
+							break
+						}
+					}
 				}
 			}
 		}

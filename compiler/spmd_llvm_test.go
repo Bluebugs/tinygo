@@ -1332,8 +1332,11 @@ func TestSPMDLoopPeelingEligibility(t *testing.T) {
 		want      bool
 		wantPanic bool
 	}{
-		// rangeint loops are now eligible for peeling (gate removed).
-		// Without a real SSA BinOp (incrBinOp == nil) the nil guard returns false.
+		// Both rangeint and rangeindex are eligible, but accumulator phis
+		// (totalPhiCount > 1) cause exclusion. These tests hit the incrBinOp nil
+		// guard (returns false) since constructing real SSA blocks is out of scope.
+		// The accumulator gate is covered by E2E: simple-sum has an accumulator
+		// phi and must NOT be peeled (verified by correct output: Sum=136).
 		{"rangeint_nil_incrBinOp", spmdActiveLoop{laneCount: 16}, false, false, false},
 		// rangeindex loops: same nil guard behavior.
 		{"rangeindex_nil_incrBinOp", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, false, false, false},

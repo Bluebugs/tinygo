@@ -493,10 +493,12 @@ type spmdPeeledLoop struct {
 
 // spmdShouldPeelLoop returns true if the given SPMD loop is eligible for peeling.
 // Supports both rangeindex (range-over-slice) and rangeint (range N) loops.
-// Accumulator phis are counted across both body and loop blocks; loops with
-// accumulators are still peeled (forwarding is handled by accumulatorPhis in
-// spmdPeeledLoop). SPMD function bodies are excluded via a panic assertion
-// because the activeLoops state implies spmdFuncIsBody is always false here.
+// Loops with accumulator phis (totalPhiCount > 1) are excluded because post-loop
+// uses of the accumulator would not be dominated after peeling introduces
+// alternative paths (entry → tail.check → exit). Accumulator peeling requires
+// RAUW of post-loop references — deferred for future work.
+// SPMD function bodies are excluded via a panic assertion because the activeLoops
+// state implies spmdFuncIsBody is always false here.
 func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
 	// spmdFuncIsBody implies spmdLoopState == nil, which means there are no
 	// go-for loops to peel. This function is only called for loops in
@@ -549,10 +551,9 @@ func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
 		}
 	}
 	// The iterator phi is the one allowed phi. Any additional phis are accumulators
-	// that need forwarding through tail.check.
+	// that need post-loop RAUW to fix dominance. Defer accumulator peeling for now.
 	if totalPhiCount > 1 {
-		// Accumulator phis present — still peel, but will need forwarding.
-		// (Handled by accumulatorPhis in spmdPeeledLoop.)
+		return false
 	}
 	return true
 }
