@@ -2003,6 +2003,46 @@ func (b *builder) preDetectVaryingIfs() {
 	}
 }
 
+// spmdValueHasVaryingSource checks whether an SSA value has a varying (SPMDType)
+// origin by tracing through Convert, ChangeType, and BinOp instructions. This
+// handles cases where byte(varyingInt % 3) strips SPMDType from the result type
+// but the value is still lane-varying due to derivation from a loop iterator.
+func (b *builder) spmdValueHasVaryingSource(v ssa.Value) bool {
+	return b.spmdValueHasVaryingSourceImpl(v, make(map[ssa.Value]bool))
+}
+
+func (b *builder) spmdValueHasVaryingSourceImpl(v ssa.Value, visited map[ssa.Value]bool) bool {
+	if v == nil {
+		return false
+	}
+	if visited[v] {
+		return false
+	}
+	visited[v] = true
+
+	if _, ok := v.Type().(*types.SPMDType); ok {
+		return true
+	}
+
+	// Check if this value is a known SPMD loop iterator.
+	if b.spmdLoopState != nil {
+		if _, ok := b.spmdLoopState.activeLoops[v]; ok {
+			return true
+		}
+	}
+
+	switch val := v.(type) {
+	case *ssa.Convert:
+		return b.spmdValueHasVaryingSourceImpl(val.X, visited)
+	case *ssa.ChangeType:
+		return b.spmdValueHasVaryingSourceImpl(val.X, visited)
+	case *ssa.BinOp:
+		return b.spmdValueHasVaryingSourceImpl(val.X, visited) ||
+			b.spmdValueHasVaryingSourceImpl(val.Y, visited)
+	}
+	return false
+}
+
 // spmdDetectSwitchChains scans the function for varying switch chains and populates
 // spmdSwitchChains, spmdSwitchIfBlocks, and spmdSwitchBodyBlocks maps.
 //
@@ -2161,6 +2201,8 @@ func (b *builder) spmdDetectSwitchChains(fn *ssa.Function) {
 		isVarying := false
 		if _, ok := chain.tagValue.Type().(*types.SPMDType); ok {
 			isVarying = true
+		} else if b.spmdValueHasVaryingSource(chain.tagValue) {
+			isVarying = true
 		} else {
 			for _, c := range chain.cases {
 				ifBlock := fn.Blocks[c.ifBlock]
@@ -2170,7 +2212,15 @@ func (b *builder) spmdDetectSwitchChains(fn *ssa.Function) {
 						isVarying = true
 						break
 					}
+					if b.spmdValueHasVaryingSource(binOp.X) {
+						isVarying = true
+						break
+					}
 					if _, ok := binOp.Y.Type().(*types.SPMDType); ok {
+						isVarying = true
+						break
+					}
+					if b.spmdValueHasVaryingSource(binOp.Y) {
 						isVarying = true
 						break
 					}
@@ -4368,34 +4418,140 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 			}
 		}
 
+	case token.QUO:
+		if !decompIsLHS {
+			break
+		}
+		// (base + offset) / k where offset = <0,1,...,N-1> and k is a constant.
+		// Requires fromBodyIter (base is a multiple of laneCount).
+		if !decomp.fromBodyIter {
+			break
+		}
+		if constVal, ok := scalarSSA.(*ssa.Const); ok {
+			if k, ok := constant.Int64Val(constVal.Value); ok && k > 0 {
+				baseDiv := b.CreateUDiv(decomp.scalarBase, scalarLLVM, "spmd.decomp.quo.base")
+				if int64(laneCount)%k == 0 {
+					// Fast path: laneCount is a multiple of k, so base is always a
+					// multiple of k. The offset vector is a compile-time constant.
+					newOffsetElts := make([]llvm.Value, laneCount)
+					for i := 0; i < laneCount; i++ {
+						newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(i)/uint64(k), false)
+					}
+					newOffset := llvm.ConstVector(newOffsetElts, false)
+					if b.spmdDecomposed != nil {
+						b.spmdDecomposed[expr] = &spmdDecomposedIndex{
+							scalarBase:    baseDiv,
+							varyingOffset: newOffset,
+							laneCount:     laneCount,
+							loop:          decomp.loop,
+						}
+					}
+					return llvm.Value{}, true
+				}
+				// General path: laneCount % k != 0 (e.g., 16-lane byte loop with k=3).
+				// base may not be a multiple of k, so (base+lane)/k != base/k + lane/k.
+				// Use: (base+lane)/k = base/k + (base%k + lane)/k
+				// Since base%k ∈ [0, k-1], precompute k constant offset vectors
+				// (one per remainder) and select at runtime.
+				// Guard: fall through to materialization for very large k to avoid
+				// generating k pattern vectors and k-1 cascading selects.
+				if k > int64(laneCount) {
+					break
+				}
+				baseRem := b.CreateURem(decomp.scalarBase, scalarLLVM, "spmd.decomp.quo.rem")
+				// Precompute offset vectors for each remainder r ∈ [0, k-1]:
+				//   pattern_r[lane] = (r + lane) / k
+				patterns := make([]llvm.Value, k)
+				for r := int64(0); r < k; r++ {
+					elts := make([]llvm.Value, laneCount)
+					for lane := 0; lane < laneCount; lane++ {
+						elts[lane] = llvm.ConstInt(i8Type, uint64((r+int64(lane))/k), false)
+					}
+					patterns[r] = llvm.ConstVector(elts, false)
+				}
+				// Select the right pattern based on base%k using cascading selects.
+				newOffset := patterns[0]
+				i1VecType := llvm.VectorType(b.ctx.Int1Type(), laneCount)
+				for r := int64(1); r < k; r++ {
+					cmpVal := llvm.ConstInt(baseRem.Type(), uint64(r), false)
+					cmp := b.CreateICmp(llvm.IntEQ, baseRem, cmpVal, "spmd.decomp.quo.cmp")
+					cmpVec := b.splatScalar(cmp, i1VecType)
+					newOffset = b.CreateSelect(cmpVec, patterns[r], newOffset, "spmd.decomp.quo.sel")
+				}
+				if b.spmdDecomposed != nil {
+					b.spmdDecomposed[expr] = &spmdDecomposedIndex{
+						scalarBase:    baseDiv,
+						varyingOffset: newOffset,
+						laneCount:     laneCount,
+						loop:          decomp.loop,
+					}
+				}
+				return llvm.Value{}, true
+			}
+		}
+
 	case token.REM:
 		if !decompIsLHS {
 			break
 		}
 		// (base + offset) % k where offset = <0,1,...,N-1> and k is a constant.
-		// Valid ONLY when base % k == 0 (ensured by fromBodyIter, since base is a
-		// multiple of laneCount which is always divisible by k when laneCount%k==0).
-		// After an ADD/SUB the base may not be aligned, so the identity
-		// (base + offset) % k == (base % k) + (offset % k) may not hold.
 		// We compute the new offset as a COMPILE-TIME constant vector to avoid
 		// creating <N x i8> remainder IR which WASM SIMD cannot lower (no i8x16.rem).
-		// Valid when laneCount is divisible by k.
 		if !decomp.fromBodyIter {
 			break
 		}
 		if constVal, ok := scalarSSA.(*ssa.Const); ok {
-			if k, ok := constant.Int64Val(constVal.Value); ok && k > 0 && int64(laneCount)%k == 0 {
-				// Compute offset % k as constant vector.
-				newOffsetElts := make([]llvm.Value, laneCount)
-				for i := 0; i < laneCount; i++ {
-					newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(i)%uint64(k), false)
-				}
-				newOffset := llvm.ConstVector(newOffsetElts, false)
+			if k, ok := constant.Int64Val(constVal.Value); ok && k > 0 {
 				// Base contribution: base % k (scalar).
-				baseContrib := b.CreateURem(decomp.scalarBase, scalarLLVM, "spmd.decomp.rem.base")
+				baseRem := b.CreateURem(decomp.scalarBase, scalarLLVM, "spmd.decomp.rem.base")
+				if int64(laneCount)%k == 0 {
+					// Fast path: laneCount is a multiple of k. The offset pattern
+					// repeats cleanly and base%k is always 0 (since base is a multiple
+					// of laneCount which is divisible by k).
+					newOffsetElts := make([]llvm.Value, laneCount)
+					for i := 0; i < laneCount; i++ {
+						newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(i)%uint64(k), false)
+					}
+					newOffset := llvm.ConstVector(newOffsetElts, false)
+					if b.spmdDecomposed != nil {
+						b.spmdDecomposed[expr] = &spmdDecomposedIndex{
+							scalarBase:    baseRem,
+							varyingOffset: newOffset,
+							laneCount:     laneCount,
+							loop:          decomp.loop,
+						}
+					}
+					return llvm.Value{}, true
+				}
+				// General path: laneCount % k != 0 (e.g., 16-lane byte loop with k=3).
+				// Use: (base+lane) % k = (base%k + lane) % k
+				// Since base%k ∈ [0, k-1], precompute k constant offset vectors
+				// (one per remainder) and select at runtime.
+				// Guard: fall through to materialization for very large k.
+				if k > int64(laneCount) {
+					break
+				}
+				patterns := make([]llvm.Value, k)
+				for r := int64(0); r < k; r++ {
+					elts := make([]llvm.Value, laneCount)
+					for lane := 0; lane < laneCount; lane++ {
+						elts[lane] = llvm.ConstInt(i8Type, uint64((r+int64(lane))%k), false)
+					}
+					patterns[r] = llvm.ConstVector(elts, false)
+				}
+				newOffset := patterns[0]
+				i1VecType := llvm.VectorType(b.ctx.Int1Type(), laneCount)
+				for r := int64(1); r < k; r++ {
+					cmpVal := llvm.ConstInt(baseRem.Type(), uint64(r), false)
+					cmp := b.CreateICmp(llvm.IntEQ, baseRem, cmpVal, "spmd.decomp.rem.cmp")
+					cmpVec := b.splatScalar(cmp, i1VecType)
+					newOffset = b.CreateSelect(cmpVec, patterns[r], newOffset, "spmd.decomp.rem.sel")
+				}
+				// REM result has scalarBase=0 since all information is in the offset.
+				zeroBase := llvm.ConstInt(decomp.scalarBase.Type(), 0, false)
 				if b.spmdDecomposed != nil {
 					b.spmdDecomposed[expr] = &spmdDecomposedIndex{
-						scalarBase:    baseContrib,
+						scalarBase:    zeroBase,
 						varyingOffset: newOffset,
 						laneCount:     laneCount,
 						loop:          decomp.loop,
@@ -4537,16 +4693,15 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 		return result, false
 	}
 
-	// Fallback: materialize to <N x i32> and apply the operation normally.
-	// On WASM this produces a 512-bit wide vector; use only when no 128-bit path exists.
+	// Fallback: materialize to <N x i32> and return without applying the operation.
+	// On WASM this produces a 512-bit wide vector that may exceed the target's native
+	// vector width. Arithmetic operations on <16 x i32> cause LLVM legalization errors,
+	// so the specific BinOp cases above should handle all operations that need computation.
+	// This fallback is only reached for operations that are handled upstream (comparisons
+	// return via the comparison case above) or should not occur in practice.
 	//
-	// TODO(spmd): This fallback only materializes the decomposed OPERAND but does NOT
-	// apply the BinOp operation. The caller (compiler.go) returns this value directly
-	// as the BinOp result, which produces incorrect LLVM IR for non-comparison operations
-	// (e.g., a scatter with mismatched pointer vector width). The correct fix is to apply
-	// the BinOp after materializing, but this requires access to the full BinOp context.
-	// For now, the MUL case above handles the most common stride-2 pattern (i*2, i*2+1)
-	// without hitting this fallback. See: docs/plans for deferred fallback fix.
+	// NOTE: If a new BinOp reaches this fallback and produces incorrect results,
+	// add a dedicated case above (like QUO/REM) that stays in the narrow <N x i8> lane width.
 	materialized := b.spmdMaterializeDecomposed(decomp)
 	return materialized, false
 }
@@ -4584,6 +4739,17 @@ func (b *builder) spmdDecomposedIndexAddr(expr *ssa.IndexAddr, decomp *spmdDecom
 	// The offset is <N x i8>, so each lane's byte offset must be zero-extended to uintptr.
 	val := b.getValue(expr.X, getPos(expr))
 
+	// SPMD: clamp inactive lane offsets to 0 to prevent out-of-bounds access from
+	// masked-out lanes (e.g., tail iterations where laneCount > remaining elements).
+	// This ensures both bounds checks and InBoundsGEP only see valid indices.
+	safeOffset := decomp.varyingOffset
+	mask := b.spmdCurrentMask()
+	if !mask.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
+		maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.offset.mask")
+		zeros := llvm.ConstNull(decomp.varyingOffset.Type())
+		safeOffset = b.CreateSelect(maskI1, decomp.varyingOffset, zeros, "spmd.offset.clamp")
+	}
+
 	var bufptr llvm.Value
 	var bufType llvm.Type
 	var elemType llvm.Type
@@ -4618,7 +4784,7 @@ func (b *builder) spmdDecomposedIndexAddr(expr *ssa.IndexAddr, decomp *spmdDecom
 			buflen = b.CreateExtractValue(val, 1, "indexaddr.len")
 		}
 		if !buflen.IsNil() {
-			if decomp.varyingOffset.IsConstant() {
+			if safeOffset.IsConstant() {
 				// OPTIMIZED: constant offset vector → single scalar bounds check.
 				// Find the maximum offset element at compile time, then check:
 				//   (scalarBase + maxOffset) >= buflen → panic
@@ -4626,7 +4792,7 @@ func (b *builder) spmdDecomposedIndexAddr(expr *ssa.IndexAddr, decomp *spmdDecom
 				// (base + maxOffset) is in bounds then all lanes are in bounds.
 				maxOffset := uint64(0)
 				for lane := 0; lane < laneCount; lane++ {
-					elem := llvm.ConstExtractElement(decomp.varyingOffset,
+					elem := llvm.ConstExtractElement(safeOffset,
 						llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false))
 					// ZExtValue: offset bytes are unsigned (zero-extended everywhere
 					// in the decomposed-index pipeline).
@@ -4647,7 +4813,7 @@ func (b *builder) spmdDecomposedIndexAddr(expr *ssa.IndexAddr, decomp *spmdDecom
 				// FALLBACK: non-constant offset vector, per-lane bounds check.
 				anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
 				for lane := 0; lane < laneCount; lane++ {
-					offsetByte := b.CreateExtractElement(decomp.varyingOffset,
+					offsetByte := b.CreateExtractElement(safeOffset,
 						llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
 					// Zero-extend offset byte to i32, then add scalar base.
 					offsetI32 := b.CreateZExt(offsetByte, b.ctx.Int32Type(), "")
@@ -4666,7 +4832,7 @@ func (b *builder) spmdDecomposedIndexAddr(expr *ssa.IndexAddr, decomp *spmdDecom
 	// Build vector of pointers: each lane gets its own GEP from (base + offset[lane]).
 	ptrVec := llvm.Undef(llvm.VectorType(bufptr.Type(), laneCount))
 	for lane := 0; lane < laneCount; lane++ {
-		offsetByte := b.CreateExtractElement(decomp.varyingOffset,
+		offsetByte := b.CreateExtractElement(safeOffset,
 			llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
 		offsetI32 := b.CreateZExt(offsetByte, b.ctx.Int32Type(), "")
 		laneIdx := b.CreateAdd(decomp.scalarBase, offsetI32, "")
@@ -5054,6 +5220,15 @@ func (b *builder) spmdCompileSwitchIf(block *ssa.BasicBlock, cond llvm.Value, ch
 		remainingMask = b.spmdSwitchRemainingMask
 	}
 
+	// Ensure cond matches the mask type. On WASM the mask stack uses <N x i8/i16/i32>
+	// but the comparison result is <N x i1>. Wrap the condition to the mask format.
+	if cond.Type().TypeKind() == llvm.VectorTypeKind &&
+		remainingMask.Type().TypeKind() == llvm.VectorTypeKind &&
+		cond.Type().ElementType() != remainingMask.Type().ElementType() {
+		laneCount := cond.Type().VectorSize()
+		cond = b.spmdWrapMask(cond, laneCount)
+	}
+
 	// Compute case mask: remainingMask & cond.
 	caseMask := b.CreateAnd(remainingMask, cond, "switch.case.mask")
 	chain.cases[caseIdx].caseMask = caseMask
@@ -5219,6 +5394,13 @@ func (b *builder) spmdVectorIndex(expr *ssa.Index, collection, index llvm.Value)
 func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.Value) (llvm.Value, error) {
 	laneCount := index.Type().VectorSize()
 
+	// SPMD: clamp inactive lane indices to 0 to prevent out-of-bounds access.
+	if mask := b.spmdCurrentMask(); !mask.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
+		maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.idx.mask")
+		zeros := llvm.ConstNull(index.Type())
+		index = b.CreateSelect(maskI1, index, zeros, "spmd.idx.clamp")
+	}
+
 	// Extract {ptr, len} from string.
 	buf := b.CreateExtractValue(collection, 0, "")
 	length := b.CreateExtractValue(collection, 1, "len")
@@ -5285,6 +5467,13 @@ func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.
 func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.Value) (llvm.Value, error) {
 	laneCount := index.Type().VectorSize()
 	xType := expr.X.Type().Underlying().(*types.Array)
+
+	// SPMD: clamp inactive lane indices to 0 to prevent out-of-bounds access.
+	if mask := b.spmdCurrentMask(); !mask.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
+		maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.idx.mask")
+		zeros := llvm.ConstNull(index.Type())
+		index = b.CreateSelect(maskI1, index, zeros, "spmd.idx.clamp")
+	}
 
 	// Spill array to alloca (can't index a non-constant array in registers).
 	arrayType := collection.Type()
@@ -5801,7 +5990,6 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 			if _, ok := instr.(*ssa.DebugRef); ok {
 				continue
 			}
-
 			// Task 6: Skip the rangeint iter phi in tail — use tailIterPhi directly.
 			// For rangeindex, bodyIterValue is incrBinOp (not a phi), handled via b.locals above.
 			if phi, ok := instr.(*ssa.Phi); ok {

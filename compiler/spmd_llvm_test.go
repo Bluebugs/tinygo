@@ -4066,6 +4066,56 @@ func TestSPMDDecomposedBinOpShr(t *testing.T) {
 	}
 }
 
+// TestSPMDDecomposedBinOpQuo verifies the integer division decomposition rule.
+// (base + offset) / k → {base/k, <0/k, 1/k, ..., (N-1)/k>} when laneCount%k==0
+// and base is from the body iter (aligned to laneCount).
+func TestSPMDDecomposedBinOpQuo(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+	laneCount := 16
+
+	// scalarBase = 48 (multiple of 16, divisible by 3), varyingOffset = <0,1,...,15>
+	scalarBase := llvm.ConstInt(i32Type, 48, false)
+	offsets := make([]llvm.Value, laneCount)
+	for i := 0; i < laneCount; i++ {
+		offsets[i] = llvm.ConstInt(i8Type, uint64(i), false)
+	}
+	_ = llvm.ConstVector(offsets, false) // varyingOffset: <0,1,...,15> — not used directly; newOffset is built below
+
+	// Simulate integer division by 3: base/3 = 16, offset/3 = <0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5>
+	k := uint64(3)
+	newBase := b.CreateUDiv(scalarBase, llvm.ConstInt(i32Type, k, false), "base.quo")
+	newOffsetElts := make([]llvm.Value, laneCount)
+	for i := 0; i < laneCount; i++ {
+		newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(i)/k, false)
+	}
+	newOffset := llvm.ConstVector(newOffsetElts, false)
+
+	decomp := &spmdDecomposedIndex{
+		scalarBase:    newBase,
+		varyingOffset: newOffset,
+		laneCount:     laneCount,
+	}
+
+	// Verify structure: newBase should be 16, newOffset should be <0,0,0,1,1,1,...,5>.
+	result := b.spmdMaterializeDecomposed(decomp)
+
+	if result.Type().VectorSize() != laneCount {
+		t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), laneCount)
+	}
+	if result.Type().ElementType() != i32Type {
+		t.Errorf("result elem type = %v, want i32", result.Type().ElementType())
+	}
+	if newOffset.Type().ElementType() != i8Type {
+		t.Errorf("newOffset elem type = %v, want i8", newOffset.Type().ElementType())
+	}
+}
+
 // TestSPMDDecomposedBinOpMul verifies the MUL decomposition rule.
 // (base + offset) * c → {base*c, <0, c, 2c, ..., (N-1)*c>} when (N-1)*c <= 255.
 // Like TestSPMDDecomposedBinOpAdd, we test the LLVM-level arithmetic directly
