@@ -508,7 +508,12 @@ type spmdPeeledLoop struct {
 	tailIterPhi    llvm.Value       // phi in tailCheck for the iter value at main loop exit
 	bodyBlockSet   map[int]bool     // set of SSA block indices belonging to this loop body
 	phase           spmdLoopPhase              // current emission phase (Main or Tail)
-	accumulatorPhis map[*ssa.Phi]llvm.Value   // SSA accumulator phi → tail.check LLVM phi
+	accumulatorPhis   map[*ssa.Phi]llvm.Value // SSA accumulator phi → tail.check LLVM phi
+	tailAccResults    map[*ssa.Phi]llvm.Value // SSA accumulator phi → tail body's final accumulator value
+	doneBlockIdx      int                     // SSA index of the loop's done/exit block
+	tailBodyExitBlock llvm.BasicBlock         // last tail body block (used as done-block phi predecessor)
+	trampolineBlock   llvm.BasicBlock         // fresh block before done (avoids DbgRecords on PHI)
+	trampolinePhis    map[*ssa.Phi]llvm.Value // SSA phi → trampoline merge phi (for done-block phis)
 
 	// Advancing pointer phis for interleaved store groups (main phase only).
 	// Each group's destination pointer advances by stride*laneCount bytes per
@@ -521,10 +526,8 @@ type spmdPeeledLoop struct {
 
 // spmdShouldPeelLoop returns true if the given SPMD loop is eligible for peeling.
 // Supports both rangeindex (range-over-slice) and rangeint (range N) loops.
-// Loops with accumulator phis (totalPhiCount > 1) are excluded because post-loop
-// uses of the accumulator would not be dominated after peeling introduces
-// alternative paths (entry → tail.check → exit). Accumulator peeling requires
-// RAUW of post-loop references — deferred for future work.
+// Loops with accumulator phis are supported: the tail.check block gets
+// accumulator phis, and post-loop uses are redirected via b.locals RAUW.
 // SPMD function bodies are excluded via a panic assertion because the activeLoops
 // state implies spmdFuncIsBody is always false here.
 func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
@@ -546,44 +549,77 @@ func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
 	if loop.laneCount <= 0 {
 		return false
 	}
-	// Check for accumulator phis beyond the iterator phi.
-	// Accumulator phis live in different blocks depending on the loop pattern:
-	// - rangeindex: iterator phi + accumulators in loop block (rangeindex.loop)
-	// - rangeint: iterator phi in body block (rangeint.body), accumulators also in body block
-	// Both patterns may also have phis in the other block (though uncommon).
-	// Count phis in both the body and loop blocks; only the single iterator phi is allowed.
 	if loop.incrBinOp == nil {
 		return false // defensive: incrBinOp must be set for any real loop
 	}
-	totalPhiCount := 0
-	// Count phis in the loop block (where incrBinOp lives).
-	loopBlock := loop.incrBinOp.Block()
-	for _, instr := range loopBlock.Instrs {
-		if _, isPhi := instr.(*ssa.Phi); isPhi {
-			totalPhiCount++
-		} else {
-			break
-		}
-	}
-	// Count phis in the body block (where iterPhi lives, for rangeint).
-	if loop.iterPhi != nil {
-		bodyBlock := loop.iterPhi.Block()
-		if bodyBlock != loopBlock {
-			for _, instr := range bodyBlock.Instrs {
-				if _, isPhi := instr.(*ssa.Phi); isPhi {
-					totalPhiCount++
-				} else {
-					break
-				}
-			}
-		}
-	}
-	// The iterator phi is the one allowed phi. Any additional phis are accumulators
-	// that need post-loop RAUW to fix dominance. Defer accumulator peeling for now.
-	if totalPhiCount > 1 {
+	// Don't peel loops that have both accumulator phis AND varying control
+	// flow in the body. The trampoline approach for accumulator phis can't
+	// handle complex interior block structures (varying if/else/switch),
+	// and peeling itself changes done-block predecessors which breaks
+	// dominance for phis referencing body-interior values.
+	if b.spmdLoopHasAccumulatorPhis(loop) && b.spmdLoopBodyHasVaryingControlFlow(loop) {
 		return false
 	}
 	return true
+}
+
+// spmdLoopHasAccumulatorPhis returns true if the loop has non-iterator phis
+// (running sums, counters, etc.) in its loop or body blocks.
+func (b *builder) spmdLoopHasAccumulatorPhis(loop *spmdActiveLoop) bool {
+	check := func(block *ssa.BasicBlock) bool {
+		for _, instr := range block.Instrs {
+			ssaPhi, ok := instr.(*ssa.Phi)
+			if !ok {
+				return false // phis are always first
+			}
+			if l, m := b.spmdLoopState.activeLoops[ssaPhi]; m && l == loop {
+				continue // skip the iterator phi
+			}
+			return true // found a non-iterator phi
+		}
+		return false
+	}
+	loopBlock := loop.incrBinOp.Block()
+	if check(loopBlock) {
+		return true
+	}
+	if loop.iterPhi != nil {
+		bodyBlock := loop.iterPhi.Block()
+		if bodyBlock != loopBlock {
+			return check(bodyBlock)
+		}
+	}
+	return false
+}
+
+// spmdLoopBodyHasVaryingControlFlow returns true if any block dominated by
+// the loop body contains varying control flow (varying if/else, compound
+// boolean chains, or varying switch). Checks spmdVaryingIfs and
+// spmdSwitchIfBlocks which cover all varying control flow patterns
+// (including cases where spmdMaskTransitions is incomplete, such as LOR
+// chains skipping then/else transitions and loop headers skipping merge pops).
+func (b *builder) spmdLoopBodyHasVaryingControlFlow(loop *spmdActiveLoop) bool {
+	for idx, l := range b.spmdLoopState.bodyBlocks {
+		if l != loop {
+			continue
+		}
+		bodyBlock := b.fn.Blocks[idx]
+		for _, block := range b.fn.DomPreorder() {
+			if !bodyBlock.Dominates(block) {
+				continue
+			}
+			// Varying if/else (includes && and || chain outer blocks).
+			if _, ok := b.spmdVaryingIfs[block.Index]; ok {
+				return true
+			}
+			// Varying switch comparison blocks (switch head may be the
+			// body block itself when go/ssa merges the first comparison).
+			if _, ok := b.spmdSwitchIfBlocks[block.Index]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // spmdComputeAlignedBound computes bound & ~(laneCount-1) to get the last
@@ -707,25 +743,39 @@ func (b *builder) spmdCreateTailBlocks(loop *spmdActiveLoop) *spmdPeeledLoop {
 		bodyBlockSet:  make(map[int]bool),
 	}
 
-	// Identify all SSA blocks belonging to this loop body or interior to it.
-	// Body blocks are tracked directly in spmdLoopState.bodyBlocks.
-	// Interior blocks (if.then/else/done) are identified via isBlockInSPMDBody
-	// which uses dominator analysis. Loop blocks are excluded — the tail does
-	// not loop back.
+	// Identify all SSA blocks belonging to THIS loop's body or interior to it.
+	// Body and loop blocks are filtered by the specific loop being peeled —
+	// in multi-loop functions, other loops' blocks must not be included.
+	// Interior blocks (if.then/else/done) are identified via dominator analysis:
+	// a block is interior if any body block of THIS loop dominates it.
+	// Loop blocks are excluded — the tail does not loop back.
+	//
+	// Find all body block indices for this specific loop.
+	loopBodyIndices := make(map[int]bool)
+	for idx, l := range b.spmdLoopState.bodyBlocks {
+		if l == loop {
+			loopBodyIndices[idx] = true
+		}
+	}
 	for _, block := range b.fn.DomPreorder() {
-		if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
+		if loopBodyIndices[block.Index] {
 			peeled.bodyBlockSet[block.Index] = true
 			continue
 		}
-		if _, isLoop := b.spmdLoopState.loopBlocks[block.Index]; isLoop {
-			// Loop block is not part of the tail body (tail doesn't loop).
+		if l, isLoop := b.spmdLoopState.loopBlocks[block.Index]; isLoop && l == loop {
+			// Loop block for THIS loop is not part of the tail body (tail doesn't loop).
 			continue
 		}
-		// Check if this block is interior to the loop body (if.then/else/done etc).
-		// isBlockInSPMDBody returns non-nil for blocks dominated by an SPMD body block.
-		// Skip SPMD function bodies here — those use a different code path.
-		if !b.spmdFuncIsBody && b.isBlockInSPMDBody(block) != nil {
-			peeled.bodyBlockSet[block.Index] = true
+		// Check if this block is interior to THIS loop's body (if.then/else/done etc).
+		// Only include blocks dominated by a body block of this specific loop.
+		if !b.spmdFuncIsBody {
+			for bodyIdx := range loopBodyIndices {
+				bodyBlock := b.fn.Blocks[bodyIdx]
+				if bodyBlock.Dominates(block) {
+					peeled.bodyBlockSet[block.Index] = true
+					break
+				}
+			}
 		}
 	}
 
@@ -5542,29 +5592,39 @@ func (b *builder) emitSPMDTailCheck(peeled *spmdPeeledLoop) {
 	// loop exit into the tail iteration.
 	// Collect phis from both body and loop blocks (rangeint has iter phi in body,
 	// rangeindex has iter phi in loop; accumulators can be in either).
+	//
+	// Skip accumulator phi collection when the loop body contains varying
+	// control flow (varying if/else/switch/compound booleans). The trampoline
+	// approach for accumulator phis doesn't handle complex interior block
+	// structures. Uses the same check as spmdShouldPeelLoop to ensure
+	// consistency (spmdShouldPeelLoop already prevents peeling when both
+	// accumulators AND varying control flow are present, but this is a
+	// belt-and-suspenders defense).
 	peeled.accumulatorPhis = make(map[*ssa.Phi]llvm.Value)
-	collectAccPhis := func(block *ssa.BasicBlock) {
-		for _, instr := range block.Instrs {
-			ssaPhi, ok := instr.(*ssa.Phi)
-			if !ok {
-				break // phis are always first
+	if !b.spmdLoopBodyHasVaryingControlFlow(loop) {
+		collectAccPhis := func(block *ssa.BasicBlock) {
+			for _, instr := range block.Instrs {
+				ssaPhi, ok := instr.(*ssa.Phi)
+				if !ok {
+					break // phis are always first
+				}
+				// Skip the iterator phi (already handled by tailIterPhi).
+				if loopMatch, matched := b.spmdLoopState.activeLoops[ssaPhi]; matched && loopMatch == loop {
+					continue
+				}
+				// This is an accumulator phi — create a corresponding LLVM phi in tail.check.
+				accType := b.getLLVMType(ssaPhi.Type())
+				accPhi := b.CreatePHI(accType, "spmd.tail.acc")
+				peeled.accumulatorPhis[ssaPhi] = accPhi
 			}
-			// Skip the iterator phi (already handled by tailIterPhi).
-			if loopMatch, matched := b.spmdLoopState.activeLoops[ssaPhi]; matched && loopMatch == loop {
-				continue
-			}
-			// This is an accumulator phi — create a corresponding LLVM phi in tail.check.
-			accType := b.getLLVMType(ssaPhi.Type())
-			accPhi := b.CreatePHI(accType, "spmd.tail.acc")
-			peeled.accumulatorPhis[ssaPhi] = accPhi
 		}
-	}
-	loopBlock := loop.incrBinOp.Block()
-	collectAccPhis(loopBlock)
-	if loop.iterPhi != nil {
-		bodyBlock := loop.iterPhi.Block()
-		if bodyBlock != loopBlock {
-			collectAccPhis(bodyBlock)
+		loopBlock := loop.incrBinOp.Block()
+		collectAccPhis(loopBlock)
+		if loop.iterPhi != nil {
+			bodyBlock := loop.iterPhi.Block()
+			if bodyBlock != loopBlock {
+				collectAccPhis(bodyBlock)
+			}
 		}
 	}
 
@@ -5656,6 +5716,14 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 	// For rangeindex, bodyIterValue is the incrBinOp (in loop block, already in locals).
 	if loop.bodyIterValue != nil {
 		b.locals[loop.bodyIterValue] = peeled.tailIterPhi
+	}
+
+	// Apply accumulator phi overrides for tail phase.
+	// Accumulator phis may live in the loop block (not the body block), so the
+	// per-instruction override in the body block loop wouldn't reach them.
+	// Set b.locals upfront so all instructions see the tail.check accumulator phi.
+	for ssaPhi, accPhi := range peeled.accumulatorPhis {
+		b.locals[ssaPhi] = accPhi
 	}
 
 	// Swap blockInfo to tail blocks.
@@ -5754,6 +5822,34 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 			}
 
 			b.createInstruction(instr)
+		}
+	}
+
+	// tailBodyExitBlock is recorded in the Jump/If handlers at the point where
+	// they branch to tailExitBlock. This captures the actual LLVM block (which
+	// may be a load-merge block etc., not the originally created tail body block).
+
+	// Save the tail body's final accumulator values before restoring state.
+	// After the tail body compiles, b.locals[backEdgeValue] holds the tail's
+	// computed accumulator result. This is needed to create a merge phi in
+	// the done block (which has paths from both tail.check and tail.body).
+	if len(peeled.accumulatorPhis) > 0 {
+		peeled.tailAccResults = make(map[*ssa.Phi]llvm.Value)
+		for ssaPhi := range peeled.accumulatorPhis {
+			phiBlock := ssaPhi.Block()
+			for i, pred := range phiBlock.Preds {
+				_, isBody := b.spmdLoopState.bodyBlocks[pred.Index]
+				_, isLoop := b.spmdLoopState.loopBlocks[pred.Index]
+				isInterior := peeled.bodyBlockSet[pred.Index]
+				if isBody || isLoop || isInterior {
+					// This is the body/back-edge predecessor.
+					backEdgeVal := ssaPhi.Edges[i]
+					if result, ok := b.locals[backEdgeVal]; ok && !result.IsNil() {
+						peeled.tailAccResults[ssaPhi] = result
+					}
+					break
+				}
+			}
 		}
 	}
 

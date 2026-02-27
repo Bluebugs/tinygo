@@ -1763,6 +1763,7 @@ func (b *builder) createFunction() {
 					loopBlock := b.fn.Blocks[loopIdx]
 					if len(loopBlock.Succs) > 1 {
 						peeled.tailExitBlock = b.blockInfo[loopBlock.Succs[1].Index].entry
+						peeled.doneBlockIdx = loopBlock.Succs[1].Index
 					}
 					break
 				}
@@ -1811,27 +1812,37 @@ func (b *builder) createFunction() {
 				[]llvm.BasicBlock{entryPredExit, mainLoopExit},
 			)
 
-			// Wire accumulator phi incoming values.
+			// Wire accumulator phi incoming values in tail.check.
 			for ssaPhi, accLLVMPhi := range peeled.accumulatorPhis {
-				// Find the initial value from the entry edge.
-				var initVal llvm.Value
+				var initVal, mainAccVal llvm.Value
 				phiBlock := ssaPhi.Block()
 				for i, pred := range phiBlock.Preds {
 					_, isBody := b.spmdLoopState.bodyBlocks[pred.Index]
 					_, isLoop := b.spmdLoopState.loopBlocks[pred.Index]
 					isInterior := peeled.bodyBlockSet[pred.Index]
-					if !isBody && !isLoop && !isInterior {
-						// This is the entry predecessor edge.
+					if isBody || isLoop || isInterior {
+						// Back-edge value.
+						// For rangeint (merged body+loop): the loop phi gives the
+						// TOP-of-iteration value, not the accumulated result. Use
+						// the back-edge SSA value (e.g., total_new) which is defined
+						// in the same merged block and has the final accumulated value.
+						// For rangeindex (separate loop+body): the loop phi IS the
+						// correct accumulated value at exit (because the phi resolves
+						// from the body's back-edge). Use the phi directly because the
+						// back-edge value is in the body block and doesn't structurally
+						// dominate the loop block.
+						if loop.isRangeIndex {
+							mainAccVal = b.locals[ssaPhi]
+						} else {
+							mainAccVal = b.getValue(ssaPhi.Edges[i], getPos(ssaPhi))
+						}
+					} else {
 						initVal = b.getValue(ssaPhi.Edges[i], getPos(ssaPhi))
-						break
 					}
 				}
 				if initVal.IsNil() {
-					// Fallback: use zero value.
 					initVal = llvm.ConstNull(b.getLLVMType(ssaPhi.Type()))
 				}
-				// Main loop's final value (b.locals restored to post-main-loop state).
-				mainAccVal := b.locals[ssaPhi]
 				if mainAccVal.IsNil() {
 					mainAccVal = llvm.ConstNull(b.getLLVMType(ssaPhi.Type()))
 				}
@@ -1839,6 +1850,170 @@ func (b *builder) createFunction() {
 					[]llvm.Value{initVal, mainAccVal},
 					[]llvm.BasicBlock{entryPredExit, mainLoopExit},
 				)
+			}
+
+			// Create trampoline block for accumulator merge phis.
+			// After peeling, the body phi doesn't dominate the done block
+			// because there's a path (entry → tail.check → done) that
+			// bypasses the body. We create a fresh block (no DbgRecords)
+			// containing merge phis for ALL done-block values, redirect
+			// predecessors there, and branch to the original done block.
+			doneBlockEntry := b.blockInfo[peeled.doneBlockIdx].entry
+			if len(peeled.accumulatorPhis) > 0 && !doneBlockEntry.IsNil() && !peeled.tailBodyExitBlock.IsNil() {
+				trampoline := b.ctx.AddBasicBlock(b.llvmFn, "spmd.acc.trampoline")
+				peeled.trampolineBlock = trampoline
+				peeled.trampolinePhis = make(map[*ssa.Phi]llvm.Value)
+				b.SetInsertPointAtEnd(trampoline)
+
+				// Create accumulator merge phis in the trampoline.
+				for ssaPhi, accLLVMPhi := range peeled.accumulatorPhis {
+					tailAccResult := peeled.tailAccResults[ssaPhi]
+					if tailAccResult.IsNil() {
+						tailAccResult = llvm.ConstNull(b.getLLVMType(ssaPhi.Type()))
+					}
+					mergePhi := b.CreatePHI(b.getLLVMType(ssaPhi.Type()), "spmd.acc.merge")
+					mergePhi.AddIncoming(
+						[]llvm.Value{accLLVMPhi, tailAccResult},
+						[]llvm.BasicBlock{peeled.tailCheckBlock, peeled.tailBodyExitBlock},
+					)
+					peeled.trampolinePhis[ssaPhi] = mergePhi
+
+					// Replace references to the body phi in done block instructions.
+					mainAccVal := b.locals[ssaPhi]
+					if !mainAccVal.IsNil() {
+						for instr := doneBlockEntry.FirstInstruction(); !instr.IsNil(); instr = llvm.NextInstruction(instr) {
+							for i := 0; i < instr.OperandsCount(); i++ {
+								if instr.Operand(i).C == mainAccVal.C {
+									instr.SetOperand(i, mergePhi)
+								}
+							}
+						}
+					}
+					b.locals[ssaPhi] = mergePhi
+				}
+
+				// Create trampoline merge phis for non-accumulator done-block phis.
+				// These phis also need to go through the trampoline because the
+				// predecessor redirect changes the done block's predecessors.
+				//
+				// Build a map of accumulator back-edge SSA values → merge phis.
+				// Done-block phis whose body-exit edge references the same SSA
+				// value as an accumulator's back-edge are "accumulator aliases"
+				// (e.g., the done-block phi that carries the loop result to
+				// post-loop code). These must use the accumulator merge phi
+				// directly, because both the entry and body-exit values are
+				// subsumed by the accumulator's tail.check phi.
+				accBackEdgeMerge := make(map[ssa.Value]llvm.Value)
+				for ssaPhi := range peeled.accumulatorPhis {
+					phiBlock := ssaPhi.Block()
+					for i, pred := range phiBlock.Preds {
+						_, isBody := b.spmdLoopState.bodyBlocks[pred.Index]
+						_, isLoop := b.spmdLoopState.loopBlocks[pred.Index]
+						isInterior := peeled.bodyBlockSet[pred.Index]
+						if isBody || isLoop || isInterior {
+							accBackEdgeMerge[ssaPhi.Edges[i]] = peeled.trampolinePhis[ssaPhi]
+							break
+						}
+					}
+				}
+
+				entryPred := peeled.loop.entryPredecessor(b.spmdLoopState, peeled.bodyBlockSet)
+				for _, phi := range b.phis {
+					if phi.ssa.Block().Index != peeled.doneBlockIdx {
+						continue
+					}
+					if _, isAcc := peeled.accumulatorPhis[phi.ssa]; isAcc {
+						continue // already handled above
+					}
+
+					// Check if this is an accumulator alias: its body-exit edge
+					// references the same SSA value as an accumulator's back-edge.
+					// If so, reuse the accumulator merge phi directly (it already
+					// covers both the no-tail and tail-completed paths).
+					isAccAlias := false
+					for i, pred := range phi.ssa.Block().Preds {
+						if entryPred != nil && pred.Index == entryPred.Index {
+							continue // skip entry edge
+						}
+						if accMerge, ok := accBackEdgeMerge[phi.ssa.Edges[i]]; ok {
+							peeled.trampolinePhis[phi.ssa] = accMerge
+							isAccAlias = true
+							break
+						}
+					}
+					if isAccAlias {
+						continue
+					}
+
+					// Non-alias phi: create a new trampoline merge phi with
+					// entry and body-exit edge values.
+					var entryVal, bodyExitVal llvm.Value
+					for i, pred := range phi.ssa.Block().Preds {
+						if entryPred != nil && pred.Index == entryPred.Index {
+							entryVal = b.getValue(phi.ssa.Edges[i], getPos(phi.ssa))
+						} else {
+							bodyExitVal = b.getValue(phi.ssa.Edges[i], getPos(phi.ssa))
+						}
+					}
+					if entryVal.IsNil() {
+						entryVal = llvm.ConstNull(phi.llvm.Type())
+					}
+					if bodyExitVal.IsNil() {
+						bodyExitVal = llvm.ConstNull(phi.llvm.Type())
+					}
+					mergePhi := b.CreatePHI(phi.llvm.Type(), "spmd.done.merge")
+					mergePhi.AddIncoming(
+						[]llvm.Value{entryVal, bodyExitVal},
+						[]llvm.BasicBlock{peeled.tailCheckBlock, peeled.tailBodyExitBlock},
+					)
+					peeled.trampolinePhis[phi.ssa] = mergePhi
+				}
+
+				b.CreateBr(doneBlockEntry)
+
+				// Redirect predecessors: tail.check and tail body exit → trampoline.
+				tailCheckTerm := peeled.tailCheckBlock.LastInstruction()
+				if !tailCheckTerm.IsNil() {
+					for i := 0; i < tailCheckTerm.OperandsCount(); i++ {
+						if tailCheckTerm.Operand(i).C == doneBlockEntry.AsValue().C {
+							tailCheckTerm.SetOperand(i, trampoline.AsValue())
+						}
+					}
+				}
+				tailBodyTerm := peeled.tailBodyExitBlock.LastInstruction()
+				if !tailBodyTerm.IsNil() {
+					for i := 0; i < tailBodyTerm.OperandsCount(); i++ {
+						if tailBodyTerm.Operand(i).C == doneBlockEntry.AsValue().C {
+							tailBodyTerm.SetOperand(i, trampoline.AsValue())
+						}
+					}
+				}
+			} else if len(peeled.accumulatorPhis) > 0 {
+				// Fallback: simple RAUW when done block info is incomplete.
+				for ssaPhi, accLLVMPhi := range peeled.accumulatorPhis {
+					b.locals[ssaPhi] = accLLVMPhi
+				}
+			}
+		}
+	}
+
+	// Build a set of done-block indices affected by peeling.
+	// After peeling, done blocks have LLVM predecessors [tailCheckBlock, tailBodyExitBlock]
+	// instead of the original SSA predecessors. The standard phi resolution would wire
+	// done-block phis with wrong predecessors, so they must be handled manually.
+	var peeledDoneBlocks map[int]*spmdPeeledLoop
+	if b.spmdPeeledLoops != nil {
+		peeledDoneBlocks = make(map[int]*spmdPeeledLoop)
+		seen := make(map[*spmdPeeledLoop]bool)
+		for _, peeled := range b.spmdPeeledLoops {
+			if seen[peeled] {
+				continue
+			}
+			seen[peeled] = true
+			// doneBlockIdx is 0 when unset (SSA block 0 is always the entry
+			// block, never a done block, so 0 serves as a safe sentinel).
+			if peeled.doneBlockIdx > 0 {
+				peeledDoneBlocks[peeled.doneBlockIdx] = peeled
 			}
 		}
 	}
@@ -1869,6 +2044,13 @@ func (b *builder) createFunction() {
 			}
 		}
 		if isDeferredSwitch {
+			continue
+		}
+
+		// SPMD: skip phis in peeled done blocks — they're wired manually below.
+		// After loop peeling, the done block's LLVM predecessors are
+		// [tailCheckBlock, tailBodyExitBlock], not the original SSA predecessors.
+		if peeled, isPeeledDone := peeledDoneBlocks[phi.ssa.Block().Index]; isPeeledDone && peeled != nil {
 			continue
 		}
 
@@ -1990,6 +2172,56 @@ func (b *builder) createFunction() {
 					break
 				}
 			}
+		}
+	}
+
+	// SPMD: manually wire phis in peeled done blocks.
+	// After loop peeling, the done block has LLVM predecessors:
+	//   - With trampoline (accumulator loops): [trampoline] (single predecessor)
+	//   - Without trampoline: [tailCheckBlock, tailBodyExitBlock]
+	if peeledDoneBlocks != nil {
+		for _, phi := range b.phis {
+			peeled, isPeeledDone := peeledDoneBlocks[phi.ssa.Block().Index]
+			if !isPeeledDone || peeled == nil {
+				continue
+			}
+
+			// If a trampoline exists, done block has single predecessor (trampoline).
+			// All merge phis were already created in the trampoline.
+			if !peeled.trampolineBlock.IsNil() {
+				if trampolinePhi, ok := peeled.trampolinePhis[phi.ssa]; ok {
+					phi.llvm.AddIncoming(
+						[]llvm.Value{trampolinePhi},
+						[]llvm.BasicBlock{peeled.trampolineBlock},
+					)
+				}
+				continue
+			}
+
+			// No trampoline: wire with [tailCheckBlock, tailBodyExitBlock].
+			if peeled.tailBodyExitBlock.IsNil() {
+				panic(fmt.Sprintf("spmd: loop peeling: tailBodyExitBlock not set for done-block phi in %s", b.fn.Name()))
+			}
+			var entryVal, bodyExitVal llvm.Value
+			phiBlock := phi.ssa.Block()
+			entryPred := peeled.loop.entryPredecessor(b.spmdLoopState, peeled.bodyBlockSet)
+			for i, pred := range phiBlock.Preds {
+				if entryPred != nil && pred.Index == entryPred.Index {
+					entryVal = b.getValue(phi.ssa.Edges[i], getPos(phi.ssa))
+				} else {
+					bodyExitVal = b.getValue(phi.ssa.Edges[i], getPos(phi.ssa))
+				}
+			}
+			if entryVal.IsNil() {
+				entryVal = llvm.ConstNull(phi.llvm.Type())
+			}
+			if bodyExitVal.IsNil() {
+				bodyExitVal = llvm.ConstNull(phi.llvm.Type())
+			}
+			phi.llvm.AddIncoming(
+				[]llvm.Value{entryVal, bodyExitVal},
+				[]llvm.BasicBlock{peeled.tailCheckBlock, peeled.tailBodyExitBlock},
+			)
 		}
 	}
 
@@ -2119,6 +2351,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 						blockElse = peeled.tailCheckBlock
 					} else if peeled.phase == spmdLoopPhaseTail {
 						// Tail phase: prevent loop-back. Branch to tailExitBlock unconditionally.
+						peeled.tailBodyExitBlock = b.GetInsertBlock()
 						b.CreateBr(peeled.tailExitBlock)
 						break
 					}
@@ -2249,6 +2482,10 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			succIdx := instr.Block().Succs[0].Index
 			if loop, ok := b.spmdLoopState.loopBlocks[succIdx]; ok {
 				if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseTail {
+					// Record the actual LLVM block that branches to tailExitBlock.
+					// This may differ from tailBlockInfo (e.g., when masked loads
+					// create merge blocks that move the insert point).
+					peeled.tailBodyExitBlock = b.GetInsertBlock()
 					b.CreateBr(peeled.tailExitBlock)
 					break
 				}
@@ -2357,7 +2594,8 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			if b.spmdShouldPopBeforeJump(instr.Block()) {
 				b.spmdPopMask()
 			}
-			blockJump := b.blockInfo[instr.Block().Succs[0].Index].entry
+			succIdx := instr.Block().Succs[0].Index
+			blockJump := b.blockInfo[succIdx].entry
 			b.CreateBr(blockJump)
 		}
 	case *ssa.MapUpdate:
