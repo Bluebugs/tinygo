@@ -2094,6 +2094,7 @@ func (b *builder) createFunction() {
 						continue // Skip: this block doesn't branch to doneBlock in LLVM
 					}
 					val := b.getValue(edge, getPos(phi.ssa))
+					val = b.spmdRangeIndexInitOverride(phi.ssa, i, val)
 					llvmBlock := b.blockInfo[pred.Index].exit
 					if llvmBlock.IsNil() {
 						llvmBlock = b.blockInfo[pred.Index].entry
@@ -2193,14 +2194,7 @@ func (b *builder) createFunction() {
 			}
 
 			llvmVal := b.getValue(edge, getPos(phi.ssa))
-			// SPMD: rangeindex loop phi starts at -1; change to -laneCount.
-			if b.spmdLoopState != nil {
-				if loop, ok := b.spmdLoopState.activeLoops[phi.ssa]; ok && loop.isRangeIndex {
-					if i == loop.initEdgeIndex {
-						llvmVal = llvm.ConstInt(llvmVal.Type(), uint64(int64(-loop.laneCount)), true)
-					}
-				}
-			}
+			llvmVal = b.spmdRangeIndexInitOverride(phi.ssa, i, llvmVal)
 			llvmBlock := b.blockInfo[block.Preds[i].Index].exit
 			phi.llvm.AddIncoming([]llvm.Value{llvmVal}, []llvm.BasicBlock{llvmBlock})
 		}

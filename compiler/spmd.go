@@ -1091,6 +1091,25 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 	return state
 }
 
+// spmdRangeIndexInitOverride replaces val with -laneCount if phi is a
+// rangeindex loop phi and i is its entry-edge index. The rangeindex pattern
+// starts the loop phi at -1; SPMD vectorization must change this to
+// -laneCount so the first iteration produces indices [0, 1, ..., N-1].
+// Called from every phi-resolution path that calls b.getValue on a loop phi.
+func (b *builder) spmdRangeIndexInitOverride(phi *ssa.Phi, i int, val llvm.Value) llvm.Value {
+	if b.spmdLoopState == nil {
+		return val
+	}
+	loop, ok := b.spmdLoopState.activeLoops[phi]
+	if !ok || !loop.isRangeIndex {
+		return val
+	}
+	if i == loop.initEdgeIndex {
+		return llvm.ConstInt(val.Type(), uint64(int64(-loop.laneCount)), true)
+	}
+	return val
+}
+
 // spmdLaneOffsetConst creates a constant vector <0, 1, 2, ..., laneCount-1>.
 func (c *compilerContext) spmdLaneOffsetConst(laneCount int, elemType llvm.Type) llvm.Value {
 	elts := make([]llvm.Value, laneCount)
