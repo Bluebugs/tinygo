@@ -1612,7 +1612,33 @@ func (b *builder) createFunction() {
 				case "pushThen":
 					parentMask := b.spmdCurrentMask()
 					if !parentMask.IsNil() {
-						thenMask := b.CreateAnd(parentMask, tr.cond, "spmd.then.mask")
+						// tr.cond may be <N x i1> (comparison) while parentMask is <N x iW> (WASM).
+						cond := tr.cond
+						if cond.IsNil() {
+							panic(fmt.Sprintf("SPMD pushThen: tr.cond is nil for block %d (%s)", block.Index, block.Comment))
+						}
+						cond = b.spmdMatchMaskFormat(cond, parentMask)
+						if cond.Type() != parentMask.Type() {
+							// Type mismatch: both are vectors but different element widths.
+							// This can happen when a condition comes from a mixed-width context
+							// (e.g., zext'd byte comparisons in 4-lane loop). Convert via trunc
+							// if cond is wider than parentMask, or sext if narrower.
+							condElem := cond.Type().ElementType()
+							maskElem := parentMask.Type().ElementType()
+							lc := cond.Type().VectorSize()
+							if condElem.IntTypeWidth() > maskElem.IntTypeWidth() {
+								cond = b.CreateTrunc(cond, parentMask.Type(), "")
+							} else if condElem.IntTypeWidth() < maskElem.IntTypeWidth() {
+								cond = b.CreateSExt(cond, parentMask.Type(), "")
+							} else if condElem != maskElem {
+								// Same width but different type — bitcast.
+								cond = b.CreateBitCast(cond, parentMask.Type(), "")
+							} else {
+								panic(fmt.Sprintf("SPMD pushThen: unresolvable type mismatch: cond elemW=%d maskElemW=%d laneCount=%d block=%d (%s)",
+									condElem.IntTypeWidth(), maskElem.IntTypeWidth(), lc, block.Index, block.Comment))
+							}
+						}
+						thenMask := b.CreateAnd(parentMask, cond, "spmd.then.mask")
 						b.spmdPushMask(thenMask)
 					}
 				case "swapElse":
@@ -1620,7 +1646,9 @@ func (b *builder) createFunction() {
 					b.spmdPopMask()
 					parentMask := b.spmdCurrentMask()
 					if !parentMask.IsNil() {
-						notCond := b.CreateNot(tr.cond, "")
+						// tr.cond may be <N x i1> while parentMask is <N x iW>. Match first.
+						cond := b.spmdMatchMaskFormat(tr.cond, parentMask)
+						notCond := b.CreateNot(cond, "")
 						elseMask := b.CreateAnd(parentMask, notCond, "spmd.else.mask")
 						b.spmdPushMask(elseMask)
 					}
@@ -1740,6 +1768,22 @@ func (b *builder) createFunction() {
 		b.SetInsertPointBefore(dsp.llvm)
 		selectVal, ok := b.spmdCreateSwitchMergeSelect(dsp.phi, dsp.chainIdx)
 		if ok {
+			// Normalize selectVal to match the placeholder phi's type.
+			// spmdCreateSwitchMergeSelect may produce <N x iW> (WASM mask format)
+			// when the phi is Varying[bool] (<N x i1>), because case values from
+			// BinOp comparisons are wrapped to WASM format inside the cascaded
+			// select. The placeholder was created with getLLVMType (which returns
+			// <N x i1> for bool), so we must truncate back before ReplaceAllUsesWith
+			// to prevent downstream instructions (e.g. reduce.Any → anytrue.v4i1)
+			// from having their operand silently changed to <N x iW> by LLVM.
+			phiLLVMType := dsp.llvm.Type()
+			if selectVal.Type() != phiLLVMType {
+				if phiLLVMType.TypeKind() == llvm.VectorTypeKind &&
+					selectVal.Type().TypeKind() == llvm.VectorTypeKind &&
+					phiLLVMType.ElementType() == b.ctx.Int1Type() {
+					selectVal = b.CreateTrunc(selectVal, phiLLVMType, "spmd.bool.trunc")
+				}
+			}
 			dsp.llvm.ReplaceAllUsesWith(selectVal)
 			dsp.llvm.EraseFromParentAsInstruction()
 			// Update locals cache so subsequent getValue calls return the select.
@@ -2041,6 +2085,12 @@ func (b *builder) createFunction() {
 
 	// Resolve phi nodes
 	for _, phi := range b.phis {
+		// SPMD: skip phis that were already resolved during tail-phase emission
+		// (emitSPMDTailBody marks them by setting phi.llvm to the zero Value).
+		if phi.llvm.IsNil() {
+			continue
+		}
+
 		// SPMD: skip deferred switch phis entirely — they'll be resolved below.
 		isDeferredSwitch := false
 		for _, dsp := range b.spmdDeferredSwitchPhis {
@@ -2178,20 +2228,36 @@ func (b *builder) createFunction() {
 						b.SetInsertPointAtEnd(survivingBB)
 					}
 
-					// Create select for the then/else pair.
-					thenValue := b.getValue(phi.ssa.Edges[override.thenEdgeIdx], getPos(phi.ssa))
-					elseValue := b.getValue(phi.ssa.Edges[override.elseEdgeIdx], getPos(phi.ssa))
-					thenValue, elseValue = b.spmdBroadcastMatch(thenValue, elseValue)
-
-					// Use masked select (handles WASM i32 masks).
-					thenIsVec := thenValue.Type().TypeKind() == llvm.VectorTypeKind
-					elseIsVec := elseValue.Type().TypeKind() == llvm.VectorTypeKind
 					var selected llvm.Value
-					if thenIsVec || elseIsVec {
-						selected = b.spmdMaskSelect(override.info.cond, thenValue, elseValue)
+				if override.info.isValueLOR {
+						// "a || b" VALUE expression: result = a | b (bitwise OR of both conditions).
+						// elseEdgeIdx carries the RHS condition (cond_b from binop.rhs).
+						rhsVal := b.getValue(phi.ssa.Edges[override.elseEdgeIdx], getPos(phi.ssa))
+						lhsCond := override.info.cond
+						rhsCond := rhsVal
+						if lhsCond.Type() != rhsCond.Type() {
+							// Normalize to same mask format: convert <N x i1> → <N x iW>.
+							rhsCond = b.spmdMatchMaskFormat(rhsVal, lhsCond)
+							if lhsCond.Type() != rhsCond.Type() {
+								lhsCond = b.spmdMatchMaskFormat(override.info.cond, rhsVal)
+							}
+						}
+						selected = b.CreateOr(lhsCond, rhsCond, "spmd.lor.value")
 					} else {
-						scalarCond := b.spmdVectorAnyTrue(override.info.cond)
-						selected = b.CreateSelect(scalarCond, thenValue, elseValue, "")
+						// Standard case: create select for the then/else pair.
+						thenValue := b.getValue(phi.ssa.Edges[override.thenEdgeIdx], getPos(phi.ssa))
+						elseValue := b.getValue(phi.ssa.Edges[override.elseEdgeIdx], getPos(phi.ssa))
+						thenValue, elseValue = b.spmdBroadcastMatch(thenValue, elseValue)
+
+						// Use masked select (handles WASM i32 masks).
+						thenIsVec := thenValue.Type().TypeKind() == llvm.VectorTypeKind
+						elseIsVec := elseValue.Type().TypeKind() == llvm.VectorTypeKind
+						if thenIsVec || elseIsVec {
+							selected = b.spmdMaskSelect(override.info.cond, thenValue, elseValue)
+						} else {
+							scalarCond := b.spmdVectorAnyTrue(override.info.cond)
+							selected = b.CreateSelect(scalarCond, thenValue, elseValue, "")
+						}
 					}
 
 					phi.llvm.AddIncoming([]llvm.Value{selected}, []llvm.BasicBlock{survivingBB})
@@ -2297,7 +2363,11 @@ func (b *builder) createFunction() {
 	if b.NeedsStackObjects {
 		// Track phi nodes. Skip erased deferred switch phis (their LLVM values
 		// were freed by EraseFromParentAsInstruction and must not be accessed).
+		// Also skip phis whose llvm field was zeroed during tail-phase resolution.
 		for _, phi := range b.phis {
+			if phi.llvm.IsNil() {
+				continue
+			}
 			if b.spmdErasedSwitchPhis[phi.llvm] {
 				continue
 			}
@@ -2427,6 +2497,34 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 				}
 			}
 		}
+		// SPMD loop peeling: in tail phase, redirect If successors that target the
+		// loop block to tailExitBlock. This handles body blocks (e.g., binop.done)
+		// whose false branch goes back to the loop block for the next main iteration.
+		// In the tail body, there is no "next main iteration" — after processing
+		// the tail element, we must exit the body, not re-enter the main loop.
+		// Example: if reduce.Any(cond) { return error } else → rangeindex.loop
+		//   In tail phase: → tailExitBlock instead.
+		if b.spmdPeeledLoops != nil && b.spmdLoopState != nil {
+			for _, peeled := range b.spmdPeeledLoops {
+				if peeled.phase != spmdLoopPhaseTail {
+					continue
+				}
+				loop := peeled.loop
+				thenIsLoop := b.spmdLoopState.loopBlocks[block.Succs[0].Index] == loop
+				elseIsLoop := b.spmdLoopState.loopBlocks[block.Succs[1].Index] == loop
+				if thenIsLoop || elseIsLoop {
+					// Redirect the loop-targeting successor to tailExitBlock.
+					if thenIsLoop {
+						blockThen = peeled.tailExitBlock
+					} else {
+						blockElse = peeled.tailExitBlock
+					}
+					// Record the tail body exit block.
+					peeled.tailBodyExitBlock = b.GetInsertBlock()
+				}
+			}
+		}
+
 		// SPMD loop peeling: entry If for rangeint loops.
 		// rangeint entry blocks terminate with If(0 < bound), not Jump.
 		// During main phase, replace with condBr(alignedBound > 0, mainEntry, tailCheckBlock).
@@ -2497,12 +2595,26 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			}
 			// Linearize: branch to next in chain or to then-body.
 			// For && (LAND): always Succs[0] (next cond.true, or if.then for last)
-			// For || (LOR): Succs[1] for non-last (next cond.false), Succs[0] for last (shared T)
+			// For || (LOR), non-last: Succs[1] (next cond.false)
+			// For || (LOR), last:
+			//   - isValueLOR (VALUE expression A||B||C): Succs[1] (elseTarget) — must evaluate C
+			//   - control-flow OR (if A||B||C): Succs[0] (shared true target = body)
 			if chain.op == token.LAND {
 				b.CreateBr(blockThen) // Succs[0]
 			} else {
 				if isLast {
-					b.CreateBr(blockThen) // Succs[0] = shared true target
+					outerBlock := b.fn.Blocks[chain.outerIfBlock]
+					isValueLOR := false
+					if outerInfo, ok := b.spmdVaryingIfs[outerBlock.Index]; ok {
+						isValueLOR = outerInfo.isValueLOR
+					}
+					if isValueLOR {
+						// VALUE LOR: fall through to elseTarget to evaluate the final operand C.
+						// All lanes must evaluate C; the OR result is computed at the merge.
+						b.CreateBr(blockElse) // Succs[1] = elseTarget (e.g., binop.rhs)
+					} else {
+						b.CreateBr(blockThen) // Succs[0] = shared true target (if-then body)
+					}
 				} else {
 					b.CreateBr(blockElse) // Succs[1] = next cond.false
 				}
@@ -2538,7 +2650,14 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		// SPMD: linearize varying if/else (vector condition).
 		if (b.spmdLoopState != nil || b.spmdFuncIsBody) && cond.Type().TypeKind() == llvm.VectorTypeKind {
 			b.spmdDetectVaryingIf(block, cond)
-			b.CreateBr(blockThen)
+			// For "a || b" VALUE expressions (isValueLOR): thenEntry == merge.
+			// Branch to elseEntry (binop.rhs) so all lanes evaluate b.
+			// spmdCreateMergeSelect will compute the OR result at the merge point.
+			if info, ok := b.spmdVaryingIfs[block.Index]; ok && info.isValueLOR {
+				b.CreateBr(blockElse)
+			} else {
+				b.CreateBr(blockThen)
+			}
 		} else {
 			b.CreateCondBr(cond, blockThen, blockElse)
 		}
@@ -2779,8 +2898,22 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 					llvmAddr := b.getValue(instr.Addr, getPos(instr))
 					if b.spmdContiguousPtr != nil {
 						if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
-							// Cap-based optimization: use load-blend-store when safe.
-							if !b.spmdIsConstAllOnesMask(parentMask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
+							// Determine if narrowing is needed on WASM.
+							// Use the destination pointer element type first (go/ssa uses scalar
+							// types for range values, not SPMDType), then fall back to SPMDType.
+							var narrowBits uint64
+							if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
+								narrowBits = b.spmdNarrowStoreElemBits(selected, addrPtrType.Elem())
+							}
+							if narrowBits == 0 {
+								if spmdVal, ok := coal.elseStore.Val.Type().(*types.SPMDType); ok {
+									narrowBits = b.spmdNarrowStoreElemBits(selected, spmdVal.Elem())
+								}
+							}
+							if narrowBits > 0 {
+								b.spmdMaskedStoreNarrow(selected, narrowBits, ci.scalarPtr, parentMask)
+							} else if !b.spmdIsConstAllOnesMask(parentMask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
+								// Cap-based optimization: use load-blend-store when safe.
 								b.spmdFullStoreWithBlend(selected, ci, parentMask)
 								b.currentBlockInfo.exit = b.GetInsertBlock()
 							} else {
@@ -2845,8 +2978,26 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 					vecType := llvm.VectorType(llvmVal.Type(), ci.loop.laneCount)
 					llvmVal = b.splatScalar(llvmVal, vecType)
 				}
-				// Cap-based optimization: use load-blend-store when safe.
-				if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
+				// Determine if the value needs narrowing on WASM (e.g., <4 x i32>
+				// value from a masked bool/byte conversion stored to *bool/*uint8 memory).
+				// Use the destination's element type from instr.Addr's pointer dereference,
+				// because go/ssa uses scalar types (bool, uint8) for range iteration values
+				// even though TinyGo generates vector LLVM IR (<4 x i32>) for them.
+				// Fall back to instr.Val.Type() when it is an explicit SPMDType.
+				var narrowBits uint64
+				if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
+					narrowBits = b.spmdNarrowStoreElemBits(llvmVal, addrPtrType.Elem())
+				}
+				if narrowBits == 0 {
+					if spmdVal, ok := instr.Val.Type().(*types.SPMDType); ok {
+						narrowBits = b.spmdNarrowStoreElemBits(llvmVal, spmdVal.Elem())
+					}
+				}
+				if narrowBits > 0 {
+					// Use the narrow path: pack to scalar and load-blend-store.
+					b.spmdMaskedStoreNarrow(llvmVal, narrowBits, ci.scalarPtr, mask)
+				} else if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
+					// Cap-based optimization: use load-blend-store when safe.
 					b.spmdFullStoreWithBlend(llvmVal, ci, mask)
 					b.currentBlockInfo.exit = b.GetInsertBlock()
 				} else {
@@ -3595,6 +3746,21 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					// vector — use the source directly to avoid an invalid bitcast
 					// between differently-sized vectors.
 					changeTypeResult = x
+				} else if x.Type().VectorSize() != llvmType.VectorSize() &&
+					x.Type().ElementType().TypeKind() == llvm.IntegerTypeKind &&
+					llvmType.ElementType().TypeKind() == llvm.IntegerTypeKind &&
+					x.Type().ElementType().IntTypeWidth() > llvmType.ElementType().IntTypeWidth() {
+					// SPMD: source vector has wider elements than target (e.g., <4 x i32>
+					// from a zext byte gather) but a different lane count (e.g., target
+					// is <16 x i8>). This arises when spmdVectorIndexArray zero-extends a
+					// sub-128-bit gather result for WASM compatibility, and the result is
+					// ChangeType'd to the natural Varying[byte] type (<16 x i8>).
+					// Do NOT truncate back to the sub-128-bit target element width: on WASM
+					// sub-128-bit vectors (e.g., <4 x i8> = 32 bits) are illegal. Keep
+					// the source directly so all downstream comparisons and arithmetic
+					// operate on the WASM-legal wider representation. spmdBroadcastMatch
+					// will resize constants to match at comparison sites.
+					changeTypeResult = x
 				} else {
 					changeTypeResult = b.CreateBitCast(x, llvmType, "changetype.vec")
 				}
@@ -4147,22 +4313,9 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		if val, ok := b.spmdCreateMergeSelect(expr); ok {
 			return val, nil
 		}
-		phiType := b.getLLVMType(expr.Type())
-		// SPMD: if this phi has type Varying[bool] and we're inside a loop body,
-		// use the loop's mask format (e.g., <4 x i32>) instead of <16 x i1>.
-		// This prevents type mismatches when phi incoming values are WASM-wrapped
-		// mask comparisons (<4 x i32>) while the phi declares <16 x i1>.
-		if b.spmdLoopState != nil && phiType.TypeKind() == llvm.VectorTypeKind {
-			if spmdType, ok := expr.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
-				elem := spmdType.Elem().Underlying()
-				if basic, ok := elem.(*types.Basic); ok && basic.Info()&types.IsBoolean != 0 {
-					if activeLoop := b.spmdFindActiveLoopForBlock(b.currentBlock); activeLoop != nil {
-						maskElem := b.spmdMaskElemType(activeLoop.laneCount)
-						phiType = llvm.VectorType(maskElem, activeLoop.laneCount)
-					}
-				}
-			}
-		}
+		// SPMD: for Varying[bool] phis, use the active loop's mask format (e.g., <16 x i8>)
+		// instead of getLLVMType's <16 x i1>. Delegates to spmdVaryingBoolPhiType.
+		phiType := b.spmdVaryingBoolPhiType(expr)
 		phi := b.CreatePHI(phiType, "")
 		b.phis = append(b.phis, phiNode{expr, phi})
 		return phi, nil
@@ -5028,6 +5181,28 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 		if typeFrom.Info()&types.IsInteger != 0 && typeTo.Info()&types.IsInteger != 0 {
 			// Conversion between two integers.
 			if sizeFrom > sizeTo {
+				// SPMD on WASM: vector truncation to a sub-128-bit vector type
+				// (e.g., <4 x i32> → <4 x i8> = 32 bits) is illegal because WASM
+				// only supports 128-bit vectors. Even using per-element scalar
+				// extract+trunc+insert to build the narrow vector would be undone
+				// by LLVM InstCombine, which recognizes the pattern and converts
+				// it back to the illegal vector trunc instruction.
+				//
+				// Instead, keep the wider LLVM vector type (<4 x i32>) and AND
+				// each element with the truncation mask (e.g., 0xFF for uint8)
+				// to enforce correct truncation semantics in the wider type.
+				// Store paths that know the target element size use
+				// spmdWASMNarrowAndPack to extract+shift+OR into a scalar integer,
+				// never producing a sub-128-bit vector in any form.
+				if b.spmdIsWASM() &&
+					llvmTypeTo.TypeKind() == llvm.VectorTypeKind &&
+					b.targetData.TypeAllocSize(llvmTypeTo)*8 < 128 {
+					elemBits := llvmTypeTo.ElementType().IntTypeWidth()
+					mask := llvm.ConstInt(value.Type().ElementType(),
+						(1<<elemBits)-1, false)
+					maskVec := b.splatScalar(mask, value.Type())
+					return b.CreateAnd(value, maskVec, "spmd.trunc.mask"), nil
+				}
 				return b.CreateTrunc(value, llvmTypeTo, ""), nil
 			} else if typeFrom.Info()&types.IsUnsigned != 0 { // if unsigned
 				return b.CreateZExt(value, llvmTypeTo, ""), nil
@@ -5214,11 +5389,47 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 		// When x is detected as a contiguous SPMD IndexAddr, load a full vector.
 		if b.spmdContiguousPtr != nil {
 			if ci, ok := b.spmdContiguousPtr[unop.X]; ok {
-				elemType := b.getLLVMType(unop.X.Type().Underlying().(*types.Pointer).Elem())
-				vecType := llvm.VectorType(elemType, ci.loop.laneCount)
+				ssaElemType := unop.X.Type().Underlying().(*types.Pointer).Elem()
+				elemType := b.getLLVMType(ssaElemType)
+				laneCount := ci.loop.laneCount
+				// WASM narrow load: when the SSA element type occupies fewer bytes than
+				// the WASM-legal vector element (e.g., bool = 1 byte vs i32 = 4 bytes),
+				// a <N x i32> load reads N×4 bytes instead of N×1 bytes, corrupting
+				// adjacent elements. Use spmdMaskedLoadNarrow which loads exactly
+				// N×targetElemBits/8 bytes and unpacks per lane to <N x i32>.
+				if narrowBits := b.spmdNarrowLoadElemBits(ssaElemType, laneCount); narrowBits > 0 {
+					mask := b.spmdCurrentMask()
+					if mask.IsNil() {
+						mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount))
+					}
+					return b.spmdMaskedLoadNarrow(narrowBits, ci.scalarPtr, laneCount, mask), nil
+				}
+				// WASM: sub-128-bit vector loads (e.g., <4 x i1> for bool arrays
+				// in tail phases) are illegal. Widen the element type to the WASM
+				// mask element type (i32) so the load produces a WASM-legal 128-bit
+				// vector. The loaded values are zero-extended booleans (0 or 1)
+				// which remain semantically correct for comparison and mask ops.
+				//
+				// We check element size (not vector size) to catch i1 which has
+				// TypeAllocSize 1 byte but TypeSizeInBits 1 bit, giving <4 x i1>
+				// = 4 bits total = sub-128-bit.
+				if b.spmdIsWASM() {
+					elemBitSize := uint64(b.targetData.TypeAllocSize(elemType)) * 8
+					if elemBitSize == 0 {
+						// i1 has non-standard bit size. Treat it as 1 bit,
+						// so 4 lanes = 4 bits — definitely sub-128-bit.
+						elemType = b.spmdMaskElemType(laneCount)
+					} else {
+						vecBits := elemBitSize * uint64(laneCount)
+						if vecBits < 128 {
+							elemType = b.spmdMaskElemType(laneCount)
+						}
+					}
+				}
+				vecType := llvm.VectorType(elemType, laneCount)
 				mask := b.spmdCurrentMask()
 				if mask.IsNil() {
-					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(ci.loop.laneCount), ci.loop.laneCount))
+					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount))
 				}
 				// Cap-based optimization: use full v128.load + select when safe.
 				if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
