@@ -2560,12 +2560,10 @@ func (b *builder) spmdTryGetValue(expr ssa.Value) (llvm.Value, bool) {
 	}
 	switch expr := expr.(type) {
 	case *ssa.Const:
-		file := b.program.Fset.File(b.fn.Pos())
-		pos := token.NoPos
-		if file != nil {
-			pos = file.Pos(0)
-		}
-		return b.createConst(expr, pos), true
+		// Use getValue so that Varying[bool] constants are converted to the
+		// active loop's mask format (e.g., <4 x i32> not <16 x i1>).
+		// getValue is safe for constants: it never panics on missing locals.
+		return b.getValue(expr, token.NoPos), true
 	case *ssa.Function:
 		// Functions are compiled separately; returning false here is conservative
 		// (getFunction could provide the value), but function-valued phi edges at
@@ -3106,6 +3104,119 @@ func (b *builder) spmdNormalizeBoolVecToI1(vec llvm.Value) llvm.Value {
 	laneCount := vec.Type().VectorSize()
 	i1Type := llvm.VectorType(b.ctx.Int1Type(), laneCount)
 	return b.CreateTrunc(vec, i1Type, "")
+}
+
+// spmdIsVaryingBoolPhi reports whether the given SSA phi node has type Varying[bool].
+// Used to restrict mask-format reconciliation to only phi nodes that carry boolean
+// SPMD masks, avoiding spurious conversions on unrelated vector type mismatches.
+func (b *builder) spmdIsVaryingBoolPhi(phi *ssa.Phi) bool {
+	spmdType, ok := phi.Type().(*types.SPMDType)
+	if !ok || !spmdType.IsVarying() {
+		return false
+	}
+	elem := spmdType.Elem().Underlying()
+	basic, ok := elem.(*types.Basic)
+	return ok && basic.Info()&types.IsBoolean != 0
+}
+
+// spmdFindActiveLoopForBlock returns the active SPMD loop for the given SSA
+// block, or nil if the block is not inside any SPMD loop body. Checks the
+// direct bodyBlocks lookup first (O(1)), then falls back to dominance to
+// find loops whose body blocks dominate interior if.then/if.else/if.done blocks.
+func (b *builder) spmdFindActiveLoopForBlock(block *ssa.BasicBlock) *spmdActiveLoop {
+	if b.spmdLoopState == nil || block == nil {
+		return nil
+	}
+	// Direct lookup: is this block a recognized body block?
+	if loop, ok := b.spmdLoopState.bodyBlocks[block.Index]; ok {
+		return loop
+	}
+	// Dominance fallback: find a body block that dominates this block.
+	// iterPhi is nil for rangeindex loops, so check isRangeIndex first.
+	for _, loop := range b.spmdLoopState.bodyBlocks {
+		var bodyBlock *ssa.BasicBlock
+		if loop.isRangeIndex {
+			// For rangeindex, incrBinOp lives in the loop block which is the
+			// immediate predecessor of the body block. Use its block as a proxy.
+			bodyBlock = loop.incrBinOp.Block()
+		} else {
+			bodyBlock = loop.iterPhi.Block()
+		}
+		if bodyBlock.Dominates(block) {
+			return loop
+		}
+	}
+	return nil
+}
+
+// spmdConvertMaskFormat converts a vector mask value to a different vector mask
+// format without changing its logical meaning (all-ones = true, all-zeros = false).
+// This handles conversions between <16 x i1>, <4 x i32>, <8 x i16>, <16 x i8>, etc.
+// Used to reconcile Varying[bool] type mismatches when phi incoming values or
+// constants carry a different mask format than the phi node's declared type.
+func (b *builder) spmdConvertMaskFormat(mask llvm.Value, targetType llvm.Type) llvm.Value {
+	if mask.Type() == targetType {
+		return mask
+	}
+	if mask.Type().TypeKind() != llvm.VectorTypeKind || targetType.TypeKind() != llvm.VectorTypeKind {
+		return mask // Not a vector-to-vector conversion; leave unchanged.
+	}
+
+	// For LLVM constants, just produce the correct constant without emitting instructions.
+	if mask.IsConstant() {
+		if mask.IsNull() {
+			return llvm.ConstNull(targetType)
+		}
+		return llvm.ConstAllOnes(targetType)
+	}
+
+	srcLanes := mask.Type().VectorSize()
+	srcElem := mask.Type().ElementType()
+	targetLanes := targetType.VectorSize()
+	targetElem := targetType.ElementType()
+	i1Type := b.ctx.Int1Type()
+
+	// Step 1: normalize source to <srcLanes x i1>.
+	var i1Vec llvm.Value
+	if srcElem == i1Type {
+		i1Vec = mask
+	} else {
+		i1Vec = b.CreateTrunc(mask, llvm.VectorType(i1Type, srcLanes), "spmd.mask.cvt.trunc")
+	}
+
+	// Step 2: resize lane count if needed via shufflevector.
+	// CreateShuffleVector expects an llvm.Value (constant <N x i32> vector) as mask.
+	if srcLanes != targetLanes {
+		if targetLanes < srcLanes {
+			// Truncate: keep the first targetLanes elements.
+			maskElems := make([]llvm.Value, targetLanes)
+			for i := range maskElems {
+				maskElems[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+			}
+			shuffleMask := llvm.ConstVector(maskElems, false)
+			undef := llvm.Undef(llvm.VectorType(i1Type, srcLanes))
+			i1Vec = b.CreateShuffleVector(i1Vec, undef, shuffleMask, "spmd.mask.cvt.shuf")
+		} else {
+			// Extend: keep existing lanes, fill rest by repeating lane 0.
+			maskElems := make([]llvm.Value, targetLanes)
+			for i := range maskElems {
+				idx := i
+				if idx >= srcLanes {
+					idx = 0 // repeat lane 0 as a safe placeholder
+				}
+				maskElems[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(idx), false)
+			}
+			shuffleMask := llvm.ConstVector(maskElems, false)
+			undef := llvm.Undef(llvm.VectorType(i1Type, srcLanes))
+			i1Vec = b.CreateShuffleVector(i1Vec, undef, shuffleMask, "spmd.mask.cvt.ext")
+		}
+	}
+
+	// Step 3: widen element type if the target element is wider than i1.
+	if targetElem == i1Type {
+		return i1Vec
+	}
+	return b.CreateSExt(i1Vec, targetType, "spmd.mask.cvt.sext")
 }
 
 // spmdCallMask returns the mask value to pass when calling an SPMD function.

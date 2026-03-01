@@ -2201,6 +2201,18 @@ func (b *builder) createFunction() {
 
 			llvmVal := b.getValue(edge, getPos(phi.ssa))
 			llvmVal = b.spmdRangeIndexInitOverride(phi.ssa, i, llvmVal)
+			// SPMD: reconcile Varying[bool] mask format mismatches. A phi may
+			// carry type <16 x i1> (from getLLVMType on Varying[bool]) while an
+			// incoming edge carries <4 x i32> (WASM-wrapped comparison from a
+			// 4-lane loop), or vice versa. Only apply when the SSA phi type is
+			// Varying[bool] to avoid converting unrelated vector type mismatches.
+			if b.spmdLoopState != nil && llvmVal.Type() != phi.llvm.Type() {
+				if b.spmdIsVaryingBoolPhi(phi.ssa) &&
+					phi.llvm.Type().TypeKind() == llvm.VectorTypeKind &&
+					llvmVal.Type().TypeKind() == llvm.VectorTypeKind {
+					llvmVal = b.spmdConvertMaskFormat(llvmVal, phi.llvm.Type())
+				}
+			}
 			llvmBlock := b.blockInfo[block.Preds[i].Index].exit
 			phi.llvm.AddIncoming([]llvm.Value{llvmVal}, []llvm.BasicBlock{llvmBlock})
 		}
@@ -3333,7 +3345,25 @@ func (b *builder) getValue(expr ssa.Value, pos token.Pos) llvm.Value {
 				pos = file.Pos(0)
 			}
 		}
-		return b.createConst(expr, pos)
+		val := b.createConst(expr, pos)
+		// SPMD: Varying[bool] constants are created with type <16 x i1> (128/1=16 lanes)
+		// by createSPMDConst, but inside a 4-lane or 8-lane loop the expected mask
+		// format is <4 x i32> or <8 x i16>. Convert to the active loop's mask format.
+		if b.spmdLoopState != nil {
+			if spmdType, ok := expr.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
+				elem := spmdType.Elem().Underlying()
+				if basic, ok := elem.(*types.Basic); ok && basic.Info()&types.IsBoolean != 0 {
+					if activeLoop := b.spmdFindActiveLoopForBlock(b.currentBlock); activeLoop != nil {
+						maskElem := b.spmdMaskElemType(activeLoop.laneCount)
+						targetType := llvm.VectorType(maskElem, activeLoop.laneCount)
+						if val.Type() != targetType {
+							val = b.spmdConvertMaskFormat(val, targetType)
+						}
+					}
+				}
+			}
+		}
+		return val
 	case *ssa.Function:
 		if b.getFunctionInfo(expr).exported {
 			b.addError(expr.Pos(), "cannot use an exported function as value: "+expr.String())
@@ -4117,7 +4147,23 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		if val, ok := b.spmdCreateMergeSelect(expr); ok {
 			return val, nil
 		}
-		phi := b.CreatePHI(b.getLLVMType(expr.Type()), "")
+		phiType := b.getLLVMType(expr.Type())
+		// SPMD: if this phi has type Varying[bool] and we're inside a loop body,
+		// use the loop's mask format (e.g., <4 x i32>) instead of <16 x i1>.
+		// This prevents type mismatches when phi incoming values are WASM-wrapped
+		// mask comparisons (<4 x i32>) while the phi declares <16 x i1>.
+		if b.spmdLoopState != nil && phiType.TypeKind() == llvm.VectorTypeKind {
+			if spmdType, ok := expr.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
+				elem := spmdType.Elem().Underlying()
+				if basic, ok := elem.(*types.Basic); ok && basic.Info()&types.IsBoolean != 0 {
+					if activeLoop := b.spmdFindActiveLoopForBlock(b.currentBlock); activeLoop != nil {
+						maskElem := b.spmdMaskElemType(activeLoop.laneCount)
+						phiType = llvm.VectorType(maskElem, activeLoop.laneCount)
+					}
+				}
+			}
+		}
+		phi := b.CreatePHI(phiType, "")
 		b.phis = append(b.phis, phiNode{expr, phi})
 		return phi, nil
 	case *ssa.Range:
