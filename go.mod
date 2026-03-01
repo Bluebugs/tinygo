@@ -1,6 +1,6 @@
 module github.com/tinygo-org/tinygo
 
-go 1.22.0
+go 1.25.0
 
 require (
 	github.com/aykevl/go-wasm v0.0.2-0.20250317121156-42b86c494139
@@ -14,8 +14,8 @@ require (
 	github.com/sigurn/crc16 v0.0.0-20211026045750-20ab5afb07e3
 	github.com/tetratelabs/wazero v1.6.0
 	go.bug.st/serial v1.6.0
-	golang.org/x/sys v0.30.0
-	golang.org/x/tools v0.30.0
+	golang.org/x/sys v0.41.0
+	golang.org/x/tools v0.42.0
 	gopkg.in/yaml.v2 v2.4.0
 	tinygo.org/x/go-llvm v0.0.0-20250422114502-b8f170971e74
 )
@@ -26,4 +26,4 @@ require (
 	github.com/stretchr/testify v1.8.4 // indirect
 )
 
-replace golang.org/x/tools v0.30.0 => ../x-tools-spmd
+replace golang.org/x/tools v0.42.0 => ../x-tools-spmd
