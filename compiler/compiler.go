@@ -202,6 +202,7 @@ type builder struct {
 	spmdSwitchBodyBlocks    map[int]int                        // bodyBlock.Index -> chain index in spmdSwitchChains
 	spmdSwitchRemainingMask llvm.Value                         // remaining mask during switch chain compilation
 	spmdDeferredSwitchPhis  []spmdDeferredSwitchPhi            // switch.done phis deferred until all case masks are ready
+	spmdErasedSwitchPhis    map[llvm.Value]bool                // LLVM phi values that were erased during deferred switch phi resolution
 	spmdCondChains          map[int]*spmdCondChain             // outerIfBlock.Index -> chain
 	spmdCondChainInner      map[int]*spmdCondChain             // innerBlock.Index -> chain (lookup)
 	spmdPeeledLoops         map[*spmdActiveLoop]*spmdPeeledLoop // peeled loop state (nil if not peeled)
@@ -1721,24 +1722,29 @@ func (b *builder) createFunction() {
 	// emitSPMDTailBody re-processes body blocks including switch comparisons,
 	// which overwrites chain.cases[i].caseMask. Deferred phi resolution must
 	// read the main-phase caseMask values, so it runs first.
-	erasedSwitchPhis := make(map[*ssa.Phi]bool, len(b.spmdDeferredSwitchPhis))
+	//
+	// spmdErasedSwitchPhis tracks which LLVM phi VALUES (by pointer) have been
+	// resolved and erased, including both main-phase and tail-phase phis.
+	// Using the LLVM value as key (not the SSA phi) allows correct handling:
+	// the tail body creates separate LLVM phi placeholders for the same SSA phi,
+	// so SSA-keyed tracking would incorrectly skip tail-phase resolution.
+	// emitSPMDTailBody also records its erasures here so NeedsStackObjects
+	// tracking can skip freed phi values.
+	b.spmdErasedSwitchPhis = make(map[llvm.Value]bool, len(b.spmdDeferredSwitchPhis))
 	for _, dsp := range b.spmdDeferredSwitchPhis {
-		chain := &b.spmdSwitchChains[dsp.chainIdx]
-		// Set insert point to the switch.done block, just before the terminator.
-		doneBlock := b.blockInfo[chain.doneBlock].entry
-		term := doneBlock.LastInstruction()
-		if !term.IsNil() {
-			b.SetInsertPointBefore(term)
-		} else {
-			b.SetInsertPointAtEnd(doneBlock)
-		}
+		// Place the cascaded select at the position of the deferred phi placeholder.
+		// LLVM instructions that use this phi were emitted during block traversal
+		// and are positioned after the phi in the same block, so placing the select
+		// at the phi location ensures it dominates all uses. Placing it before the
+		// block terminator would cause domination violations.
+		b.SetInsertPointBefore(dsp.llvm)
 		selectVal, ok := b.spmdCreateSwitchMergeSelect(dsp.phi, dsp.chainIdx)
 		if ok {
 			dsp.llvm.ReplaceAllUsesWith(selectVal)
 			dsp.llvm.EraseFromParentAsInstruction()
 			// Update locals cache so subsequent getValue calls return the select.
 			b.locals[dsp.phi] = selectVal
-			erasedSwitchPhis[dsp.phi] = true
+			b.spmdErasedSwitchPhis[dsp.llvm] = true
 		}
 	}
 
@@ -2280,7 +2286,7 @@ func (b *builder) createFunction() {
 		// Track phi nodes. Skip erased deferred switch phis (their LLVM values
 		// were freed by EraseFromParentAsInstruction and must not be accessed).
 		for _, phi := range b.phis {
-			if erasedSwitchPhis[phi.ssa] {
+			if b.spmdErasedSwitchPhis[phi.llvm] {
 				continue
 			}
 			insertPoint := llvm.NextInstruction(phi.llvm)
@@ -2786,17 +2792,28 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		// First S-1 remainders save their values; last remainder emits interleaved stores.
 		if b.spmdInterleavedStores != nil {
 			if info, ok := b.spmdInterleavedStores[instr]; ok {
-				if info.remainder < info.group.stride-1 {
-					vals := b.spmdInterleavedValues[info.group]
-					if vals == nil {
-						vals = make([]llvm.Value, info.group.stride)
-						b.spmdInterleavedValues[info.group] = vals
+				// Skip interleaved store in tail phase — let normal scatter
+				// path handle it. The interleaved scalarBase is wrong for
+				// non-decomposed rangeint loops in the tail.
+				inTail := false
+				if b.spmdPeeledLoops != nil {
+					if peeled, ok := b.spmdPeeledLoops[info.group.loop]; ok && peeled.phase == spmdLoopPhaseTail {
+						inTail = true
 					}
-					vals[info.remainder] = b.getValue(instr.Val, getPos(instr))
+				}
+				if !inTail {
+					if info.remainder < info.group.stride-1 {
+						vals := b.spmdInterleavedValues[info.group]
+						if vals == nil {
+							vals = make([]llvm.Value, info.group.stride)
+							b.spmdInterleavedValues[info.group] = vals
+						}
+						vals[info.remainder] = b.getValue(instr.Val, getPos(instr))
+						return
+					}
+					b.spmdEmitInterleavedStore(instr, info)
 					return
 				}
-				b.spmdEmitInterleavedStore(instr, info)
-				return
 			}
 		}
 
@@ -3667,8 +3684,19 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		// The interleaved store emitter computes its own base pointer and bounds check;
 		// the IndexAddr itself only needs to produce a placeholder so getValue doesn't fail.
 		if b.spmdInterleavedAddrs != nil {
-			if _, ok := b.spmdInterleavedAddrs[expr]; ok {
-				return llvm.Undef(b.dataPtrType), nil
+			if info, ok := b.spmdInterleavedAddrs[expr]; ok {
+				// In the tail phase, skip interleaved optimization — let normal
+				// scatter path handle it. The interleaved store's scalarBase is
+				// wrong for non-decomposed rangeint loops in the tail.
+				inTail := false
+				if b.spmdPeeledLoops != nil {
+					if peeled, ok := b.spmdPeeledLoops[info.group.loop]; ok && peeled.phase == spmdLoopPhaseTail {
+						inTail = true
+					}
+				}
+				if !inTail {
+					return llvm.Undef(b.dataPtrType), nil
+				}
 			}
 		}
 
@@ -4031,6 +4059,14 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			}
 			if isMergePhi {
 				phiType := b.getLLVMType(expr.Type())
+				// SPMD: the go/ssa phi type reflects the declared Go variable type
+				// (e.g., int → i32), not the runtime varying type. Vectorize it so
+				// the placeholder phi has the correct type from the start, preventing
+				// type mismatches in downstream icmp/trunc instructions that use it.
+				laneCount := b.spmdSwitchLaneCount(chainIdx)
+				if laneCount > 0 && phiType.TypeKind() != llvm.VectorTypeKind {
+					phiType = llvm.VectorType(phiType, laneCount)
+				}
 				phi := b.CreatePHI(phiType, "switch.merge.deferred")
 				b.phis = append(b.phis, phiNode{expr, phi})
 				b.spmdDeferredSwitchPhis = append(b.spmdDeferredSwitchPhis, spmdDeferredSwitchPhi{

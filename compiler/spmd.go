@@ -655,7 +655,7 @@ func (b *builder) spmdCreateInterleavedPtrPhis(loop *spmdActiveLoop, peeled *spm
 	// Get the loop header LLVM block and its entry predecessor.
 	loopSSABlock := loop.incrBinOp.Block()
 	loopHeaderBlock := b.blockInfo[loopSSABlock.Index].entry
-	entryPredSSA := loopSSABlock.Preds[loop.initEdgeIndex]
+	entryPredSSA := loop.entryPredecessor(b.spmdLoopState, peeled.bodyBlockSet)
 	entryPredBlock := b.blockInfo[entryPredSSA.Index].exit
 
 	for _, group := range peeled.interleavedGroups {
@@ -5310,6 +5310,48 @@ func (b *builder) spmdIsSwitchDoneBlock(blockIdx int) int {
 	return -1
 }
 
+// spmdSwitchLaneCount returns the SPMD lane count for a switch chain by finding
+// the active SPMD loop whose body block dominates the switch. Returns 0 if not
+// inside any SPMD loop.
+//
+// The switch.done block is not directly registered in bodyBlocks or loopBlocks —
+// those maps only hold the entry block of each SPMD loop. To find the enclosing
+// loop, we check whether any loop's body block dominates one of the switch's
+// comparison (ifBlock) or case body blocks.
+func (b *builder) spmdSwitchLaneCount(chainIdx int) int {
+	if b.spmdLoopState == nil {
+		return 0
+	}
+	chain := &b.spmdSwitchChains[chainIdx]
+
+	// Collect candidate blocks from the switch chain to test for domination.
+	// Use ifBlocks (the switch.next comparison blocks) and case body blocks.
+	// Precondition: a valid switch chain always has at least one case or default body.
+	var candidates []*ssa.BasicBlock
+	for _, c := range chain.cases {
+		if c.ifBlock >= 0 && c.ifBlock < len(b.fn.Blocks) {
+			candidates = append(candidates, b.fn.Blocks[c.ifBlock])
+		}
+		if c.bodyBlock >= 0 && c.bodyBlock < len(b.fn.Blocks) {
+			candidates = append(candidates, b.fn.Blocks[c.bodyBlock])
+		}
+	}
+	if chain.defaultBody >= 0 && chain.defaultBody < len(b.fn.Blocks) {
+		candidates = append(candidates, b.fn.Blocks[chain.defaultBody])
+	}
+
+	// Find a loop whose body block dominates any candidate block.
+	for bodyIdx, loop := range b.spmdLoopState.bodyBlocks {
+		bodyBlock := b.fn.Blocks[bodyIdx]
+		for _, candidate := range candidates {
+			if bodyBlock.Dominates(candidate) {
+				return loop.laneCount
+			}
+		}
+	}
+	return 0
+}
+
 // spmdCreateSwitchMergeSelect creates the cascaded select instructions for a
 // phi at switch.done. This merges values from all case bodies using the case
 // masks computed during switch compilation.
@@ -5360,12 +5402,27 @@ func (b *builder) spmdCreateSwitchMergeSelect(phi *ssa.Phi, chainIdx int) (llvm.
 	var result llvm.Value
 	phiType := b.getLLVMType(phi.Type())
 
+	// SPMD: the go/ssa phi type comes from the declared Go variable (e.g., int),
+	// not the runtime varying type. Vectorize it so downstream icmp/trunc get the
+	// correct vector type instead of a scalar.
+	laneCount := b.spmdSwitchLaneCount(chainIdx)
+	if laneCount > 0 && phiType.TypeKind() != llvm.VectorTypeKind {
+		phiType = llvm.VectorType(phiType, laneCount)
+	}
+
 	if defaultEdgeIdx >= 0 {
 		result = b.getValue(phi.Edges[defaultEdgeIdx], getPos(phi))
 	} else if entryEdgeIdx >= 0 {
 		result = b.getValue(phi.Edges[entryEdgeIdx], getPos(phi))
 	} else {
 		result = llvm.ConstNull(phiType)
+	}
+
+	// Ensure the initial result is a vector when we are in an SPMD loop.
+	// getValue may return a scalar constant (e.g., i32 0) when the phi type
+	// is not wrapped in SPMDType.
+	if laneCount > 0 && result.Type().TypeKind() != llvm.VectorTypeKind {
+		result = b.splatScalar(result, phiType)
 	}
 
 	// Apply cascaded selects from first case to last.
@@ -5378,6 +5435,11 @@ func (b *builder) spmdCreateSwitchMergeSelect(phi *ssa.Phi, chainIdx int) (llvm.
 		caseMask := chain.cases[ci].caseMask
 		if caseMask.IsNil() {
 			continue
+		}
+
+		// Ensure case value is vectorized for SPMD context.
+		if laneCount > 0 && caseVal.Type().TypeKind() != llvm.VectorTypeKind {
+			caseVal = b.splatScalar(caseVal, phiType)
 		}
 
 		// Broadcast match if needed.
@@ -6035,6 +6097,51 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 	// tailBodyExitBlock is recorded in the Jump/If handlers at the point where
 	// they branch to tailExitBlock. This captures the actual LLVM block (which
 	// may be a load-merge block etc., not the originally created tail body block).
+
+	// Resolve tail-phase deferred switch phis before restoring b.locals.
+	// emitSPMDTailBody processes switch body blocks and creates new LLVM phi
+	// placeholders (via createExpr → deferred phi path) in the tail blocks.
+	// Those phis must be resolved NOW, while b.locals contains tail-phase values
+	// and chain.cases[i].caseMask holds tail-phase masks. After state is
+	// restored, b.locals reverts to main-phase values and the case body
+	// instructions would no longer dominate the tail switch.done block.
+	//
+	// Identify tail-phase phis by checking if their parent LLVM block is one of
+	// the tail blocks created for this peeled loop.
+	tailBlockSet := make(map[llvm.BasicBlock]bool, len(peeled.tailBlockInfo))
+	for _, info := range peeled.tailBlockInfo {
+		if !info.entry.IsNil() {
+			tailBlockSet[info.entry] = true
+		}
+	}
+	if !peeled.tailCheckBlock.IsNil() {
+		tailBlockSet[peeled.tailCheckBlock] = true
+	}
+	for _, dsp := range b.spmdDeferredSwitchPhis {
+		if dsp.llvm.IsNil() {
+			continue
+		}
+		// Skip phis already resolved (and erased) by the main-phase resolution
+		// loop. Calling InstructionParent on an erased LLVM value is a
+		// use-after-free crash because the underlying C memory is freed.
+		if b.spmdErasedSwitchPhis[dsp.llvm] {
+			continue
+		}
+		parentBB := dsp.llvm.InstructionParent()
+		if !tailBlockSet[parentBB] {
+			continue // Main-phase phi; handled by the main resolution loop.
+		}
+		b.SetInsertPointBefore(dsp.llvm)
+		selectVal, ok := b.spmdCreateSwitchMergeSelect(dsp.phi, dsp.chainIdx)
+		if ok {
+			dsp.llvm.ReplaceAllUsesWith(selectVal)
+			dsp.llvm.EraseFromParentAsInstruction()
+			b.locals[dsp.phi] = selectVal
+			// Record in b.spmdErasedSwitchPhis so the NeedsStackObjects loop
+			// in createFunction doesn't attempt to access the freed LLVM value.
+			b.spmdErasedSwitchPhis[dsp.llvm] = true
+		}
+	}
 
 	// Save the tail body's final accumulator values before restoring state.
 	// After the tail body compiles, b.locals[backEdgeValue] holds the tail's
