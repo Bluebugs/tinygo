@@ -2994,6 +2994,12 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 					vecType := llvm.VectorType(llvmVal.Type(), ci.loop.laneCount)
 					llvmVal = b.splatScalar(llvmVal, vecType)
 				}
+				// Bool store fix: llvm.masked.store.v<N>i1 packs N bits, but
+				// [N]bool memory expects 1 byte per element. Widen to <N x i8>.
+				if llvmVal.Type().TypeKind() == llvm.VectorTypeKind &&
+					llvmVal.Type().ElementType() == b.ctx.Int1Type() {
+					llvmVal = b.CreateZExt(llvmVal, llvm.VectorType(b.ctx.Int8Type(), ci.loop.laneCount), "")
+				}
 				// Determine if the value needs narrowing on WASM (e.g., <4 x i32>
 				// value from a masked bool/byte conversion stored to *bool/*uint8 memory).
 				// Use the destination's element type from instr.Addr's pointer dereference,
@@ -5420,26 +5426,20 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 					}
 					return b.spmdMaskedLoadNarrow(narrowBits, ci.scalarPtr, laneCount, mask), nil
 				}
-				// WASM: sub-128-bit vector loads (e.g., <4 x i1> for bool arrays
-				// in tail phases) are illegal. Widen the element type to the WASM
-				// mask element type (i32) so the load produces a WASM-legal 128-bit
-				// vector. The loaded values are zero-extended booleans (0 or 1)
-				// which remain semantically correct for comparison and mask ops.
-				//
-				// We check element size (not vector size) to catch i1 which has
-				// TypeAllocSize 1 byte but TypeSizeInBits 1 bit, giving <4 x i1>
-				// = 4 bits total = sub-128-bit.
+				// Bool (i1) contiguous load fix: llvm.masked.load.v<N>i1 reads
+				// N bits (bit-packed), but [N]bool in memory stores 1 byte per
+				// element. Load as <N x i8> to read the correct byte-per-element
+				// layout, then truncate to <N x i1>.
+				isBoolLoad := elemType == b.ctx.Int1Type()
+				if isBoolLoad {
+					elemType = b.ctx.Int8Type()
+				}
+				// WASM: sub-128-bit vector loads are illegal. Widen the element
+				// type so the load produces a WASM-legal 128-bit vector.
 				if b.spmdIsWASM() {
-					elemBitSize := uint64(b.targetData.TypeAllocSize(elemType)) * 8
-					if elemBitSize == 0 {
-						// i1 has non-standard bit size. Treat it as 1 bit,
-						// so 4 lanes = 4 bits — definitely sub-128-bit.
+					vecBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8 * uint64(laneCount)
+					if vecBits < 128 {
 						elemType = b.spmdMaskElemType(laneCount)
-					} else {
-						vecBits := elemBitSize * uint64(laneCount)
-						if vecBits < 128 {
-							elemType = b.spmdMaskElemType(laneCount)
-						}
 					}
 				}
 				vecType := llvm.VectorType(elemType, laneCount)
@@ -5448,12 +5448,18 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount))
 				}
 				// Cap-based optimization: use full v128.load + select when safe.
+				var result llvm.Value
 				if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
-					result := b.spmdFullLoadWithSelect(vecType, ci, mask)
+					result = b.spmdFullLoadWithSelect(vecType, ci, mask)
 					b.currentBlockInfo.exit = b.GetInsertBlock()
-					return result, nil
+				} else {
+					result = b.spmdMaskedLoad(vecType, ci.scalarPtr, mask)
 				}
-				return b.spmdMaskedLoad(vecType, ci.scalarPtr, mask), nil
+				// Bool: loaded as <N x i8> (byte-per-element), truncate to <N x i1>.
+				if isBoolLoad {
+					result = b.CreateTrunc(result, llvm.VectorType(b.ctx.Int1Type(), laneCount), "")
+				}
+				return result, nil
 			}
 		}
 
