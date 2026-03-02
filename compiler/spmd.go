@@ -1923,10 +1923,9 @@ func (b *builder) spmdDetectCondChains() {
 		}
 		outerBlock := block.Preds[0]
 
-		// Outer block must also end with If and have a varying (SPMDType or
-		// varying-source) condition. The condition may be a bare 'bool' in go/ssa
-		// types when it comes from loading a [N]bool at a varying index (e.g.,
-		// dotMask[varyingIdx]); spmdValueHasVaryingSource detects that case.
+		// Outer block must also end with If and have a varying condition.
+		// The IsVarying flag is set during SSA construction and handles cases
+		// like dotMask[varyingIdx] where the condition type is plain bool.
 		if len(outerBlock.Instrs) == 0 {
 			continue
 		}
@@ -1934,12 +1933,7 @@ func (b *builder) spmdDetectCondChains() {
 		if !ok {
 			continue
 		}
-		outerCondIsVarying := false
-		if _, ok := outerIf.Cond.Type().(*types.SPMDType); ok {
-			outerCondIsVarying = true
-		} else if b.spmdValueHasVaryingSource(outerIf.Cond) {
-			outerCondIsVarying = true
-		}
+		outerCondIsVarying := outerIf.IsVarying
 		if !outerCondIsVarying {
 			continue
 		}
@@ -2056,7 +2050,7 @@ func (b *builder) preDetectVaryingIfs() {
 	// Detect varying switch chains first, so that the individual varying-if
 	// detection below can skip switch.next blocks (preventing map collisions
 	// in spmdMergeSelects where all cases share the same switch.done merge).
-	b.spmdDetectSwitchChains(b.fn)
+	b.spmdPopulateSwitchChains()
 
 	// Detect condition chains (short-circuit && / ||).
 	b.spmdDetectCondChains()
@@ -2086,18 +2080,13 @@ func (b *builder) preDetectVaryingIfs() {
 			continue
 		}
 
-		// Check if condition is varying (SPMDType or varying-source).
-		// Chain heads may have a non-SPMDType condition (e.g., bool from loading a [N]bool
-		// at a varying index) but still need spmdAnalyzeVaryingIf called so that
-		// spmdMergeSelects[merge] is populated before the merge block's phis are compiled.
-		condIsVarying := false
-		if _, ok := ifInstr.Cond.Type().(*types.SPMDType); ok {
-			condIsVarying = true
-		} else if _, isChainHead := b.spmdCondChains[block.Index]; isChainHead {
-			// Chain head with non-SPMDType condition (e.g., dotMask[varyingIdx]).
-			// The combined condition will be built during compilation, but we need
-			// spmdAnalyzeVaryingIf now so that spmdMergeSelects[merge] is set.
-			condIsVarying = true
+		// Check if condition is varying. IsVarying is set during SSA construction.
+		// Chain head fallback kept as safety net during migration.
+		condIsVarying := ifInstr.IsVarying
+		if !condIsVarying {
+			if _, isChainHead := b.spmdCondChains[block.Index]; isChainHead {
+				condIsVarying = true
+			}
 		}
 		if condIsVarying {
 			b.spmdAnalyzeVaryingIf(block)
@@ -2109,281 +2098,29 @@ func (b *builder) preDetectVaryingIfs() {
 	}
 }
 
-// spmdValueHasVaryingSource checks whether an SSA value has a varying (SPMDType)
-// origin by tracing through Convert, ChangeType, and BinOp instructions. This
-// handles cases where byte(varyingInt % 3) strips SPMDType from the result type
-// but the value is still lane-varying due to derivation from a loop iterator.
-func (b *builder) spmdValueHasVaryingSource(v ssa.Value) bool {
-	return b.spmdValueHasVaryingSourceImpl(v, make(map[ssa.Value]bool))
-}
-
-func (b *builder) spmdValueHasVaryingSourceImpl(v ssa.Value, visited map[ssa.Value]bool) bool {
-	if v == nil {
-		return false
-	}
-	if visited[v] {
-		return false
-	}
-	visited[v] = true
-
-	if _, ok := v.Type().(*types.SPMDType); ok {
-		return true
-	}
-
-	// Check if this value is a known SPMD loop iterator.
-	if b.spmdLoopState != nil {
-		if _, ok := b.spmdLoopState.activeLoops[v]; ok {
-			return true
-		}
-	}
-
-	switch val := v.(type) {
-	case *ssa.Convert:
-		return b.spmdValueHasVaryingSourceImpl(val.X, visited)
-	case *ssa.ChangeType:
-		return b.spmdValueHasVaryingSourceImpl(val.X, visited)
-	case *ssa.BinOp:
-		return b.spmdValueHasVaryingSourceImpl(val.X, visited) ||
-			b.spmdValueHasVaryingSourceImpl(val.Y, visited)
-	case *ssa.UnOp:
-		// Handle pointer dereference (*ptr) and unary negation/not: trace the operand.
-		// For *ptr where ptr is &arr[varyingIdx], the load result is varying.
-		return b.spmdValueHasVaryingSourceImpl(val.X, visited)
-	case *ssa.IndexAddr:
-		// &arr[varyingIdx]: the address (and loaded value) is varying if the index is.
-		return b.spmdValueHasVaryingSourceImpl(val.Index, visited) ||
-			b.spmdValueHasVaryingSourceImpl(val.X, visited)
-	case *ssa.Phi:
-		// Trace through phi: if any incoming value is varying, the phi is varying.
-		for _, edge := range val.Edges {
-			if b.spmdValueHasVaryingSourceImpl(edge, visited) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// spmdDetectSwitchChains scans the function for varying switch chains and populates
-// spmdSwitchChains, spmdSwitchIfBlocks, and spmdSwitchBodyBlocks maps.
-//
-// Switch chains in go/ssa are represented as chains of If instructions with block
-// comments following the pattern: "switch.next" (comparison blocks), "switch.body"
-// (case bodies), and "switch.done" (merge point).
-//
-// go/ssa may merge the first case comparison into the parent block (e.g.,
-// "rangeint.body"), so the chain head may not have a "switch.next" comment.
-// The default case may be a "switch.next" block ending with Jump (not If),
-// containing the default case's code with its single successor being switch.done.
-func (b *builder) spmdDetectSwitchChains(fn *ssa.Function) {
-	// Find all switch.next blocks that are chain heads (not pointed to by another switch.next).
-	var chainStarts []*ssa.BasicBlock
-	for _, block := range fn.Blocks {
-		if b.isBlockInSPMDBody(block) == nil {
-			continue
-		}
-		if !strings.HasPrefix(block.Comment, "switch.next") {
-			continue
-		}
-		isFirst := true
-		for _, otherBlock := range fn.Blocks {
-			if len(otherBlock.Succs) >= 2 && otherBlock.Succs[1] == block &&
-				strings.HasPrefix(otherBlock.Comment, "switch.next") {
-				isFirst = false
-				break
-			}
-		}
-		if isFirst {
-			chainStarts = append(chainStarts, block)
-		}
-	}
-
-	// spmdExtractSwitchTag extracts the non-constant operand from a BinOp EQL
-	// condition, which is the switch tag value.
-	extractTag := func(block *ssa.BasicBlock) ssa.Value {
-		if len(block.Instrs) == 0 {
-			return nil
-		}
-		ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If)
-		if !ok {
-			return nil
-		}
-		binOp, ok := ifInstr.Cond.(*ssa.BinOp)
-		if !ok || binOp.Op != token.EQL {
-			return nil
-		}
-		if _, isConst := binOp.Y.(*ssa.Const); isConst {
-			return binOp.X
-		}
-		if _, isConst := binOp.X.(*ssa.Const); isConst {
-			return binOp.Y
-		}
-		return binOp.X
-	}
-
-	// For each chain start, check if its predecessor also compares the same tag.
-	// go/ssa may merge the first comparison into the parent block (e.g., rangeint.body).
-	actualChainStarts := make([]*ssa.BasicBlock, 0, len(chainStarts))
-	for _, start := range chainStarts {
-		actualStart := start
-		startTag := extractTag(start)
-		if startTag != nil {
-			for _, pred := range start.Preds {
-				if b.isBlockInSPMDBody(pred) == nil {
-					continue
-				}
-				predTag := extractTag(pred)
-				if predTag == startTag {
-					// The predecessor compares the same tag — it's the actual first case.
-					actualStart = pred
-					break
-				}
-			}
-		}
-		actualChainStarts = append(actualChainStarts, actualStart)
-	}
-
-	// Process each chain.
-	for _, startBlock := range actualChainStarts {
+// spmdPopulateSwitchChains converts the go/ssa SPMDSwitchChain metadata into
+// the internal spmdSwitchChain format and populates spmdSwitchIfBlocks and
+// spmdSwitchBodyBlocks maps.
+func (b *builder) spmdPopulateSwitchChains() {
+	for _, ssaChain := range b.fn.SPMDSwitchChains {
 		chain := spmdSwitchChain{
 			defaultBody: -1,
-			doneBlock:   -1,
+			doneBlock:   ssaChain.DoneBlock.Index,
+			tagValue:    ssaChain.TagValue,
 		}
-
-		// Walk the chain: collect cases and extract the switch tag.
-		// The walk handles three block types:
-		//   1. If block (case comparison): Succs[0]=body, Succs[1]=next
-		//   2. switch.next with Jump: default case body, Succs[0]=done
-		//   3. Other: end of chain
-		currentBlock := startBlock
-		for {
-			if len(currentBlock.Instrs) == 0 {
-				break
-			}
-			lastInstr := currentBlock.Instrs[len(currentBlock.Instrs)-1]
-
-			if ifInstr, ok := lastInstr.(*ssa.If); ok {
-				// Case comparison block.
-				if binOp, ok := ifInstr.Cond.(*ssa.BinOp); ok && binOp.Op == token.EQL {
-					if chain.tagValue == nil {
-						if _, isConst := binOp.Y.(*ssa.Const); isConst {
-							chain.tagValue = binOp.X
-						} else if _, isConst := binOp.X.(*ssa.Const); isConst {
-							chain.tagValue = binOp.Y
-						} else {
-							chain.tagValue = binOp.X
-						}
-					} else {
-						if chain.tagValue != binOp.X && chain.tagValue != binOp.Y {
-							break // Inconsistent tag.
-						}
-					}
-				}
-
-				caseBody := currentBlock.Succs[0]
-				chain.cases = append(chain.cases, spmdSwitchCase{
-					ifBlock:   currentBlock.Index,
-					bodyBlock: caseBody.Index,
-					caseMask:  llvm.Value{},
-				})
-
-				nextBlock := currentBlock.Succs[1]
-				if strings.HasPrefix(nextBlock.Comment, "switch.next") {
-					currentBlock = nextBlock
-				} else {
-					// Last case: Succs[1] is default body or switch.done.
-					if strings.HasPrefix(nextBlock.Comment, "switch.body") {
-						chain.defaultBody = nextBlock.Index
-					} else {
-						chain.doneBlock = nextBlock.Index
-					}
-					break
-				}
-			} else if _, ok := lastInstr.(*ssa.Jump); ok && strings.HasPrefix(currentBlock.Comment, "switch.next") {
-				// A switch.next block ending with Jump is the default/fallthrough path.
-				// The block itself contains default case code; its successor is switch.done.
-				if len(currentBlock.Succs) == 1 {
-					chain.defaultBody = currentBlock.Index
-					chain.doneBlock = currentBlock.Succs[0].Index
-				}
-				break
-			} else {
-				break
-			}
+		for _, ifInstr := range ssaChain.Cases {
+			ifBlock := ifInstr.Block()
+			chain.cases = append(chain.cases, spmdSwitchCase{
+				ifBlock:   ifBlock.Index,
+				bodyBlock: ifBlock.Succs[0].Index,
+				caseMask:  llvm.Value{},
+			})
 		}
-
-		// Check if the switch is varying. A switch is varying if either:
-		// (a) the tag value has SPMDType, OR
-		// (b) any comparison operand has SPMDType (go/ssa may type the tag as
-		//     a plain type while case constants carry SPMDType).
-		if chain.tagValue == nil {
-			continue
-		}
-		isVarying := false
-		if _, ok := chain.tagValue.Type().(*types.SPMDType); ok {
-			isVarying = true
-		} else if b.spmdValueHasVaryingSource(chain.tagValue) {
-			isVarying = true
-		} else {
-			for _, c := range chain.cases {
-				ifBlock := fn.Blocks[c.ifBlock]
-				ifInstr := ifBlock.Instrs[len(ifBlock.Instrs)-1].(*ssa.If)
-				if binOp, ok := ifInstr.Cond.(*ssa.BinOp); ok {
-					if _, ok := binOp.X.Type().(*types.SPMDType); ok {
-						isVarying = true
-						break
-					}
-					if b.spmdValueHasVaryingSource(binOp.X) {
-						isVarying = true
-						break
-					}
-					if _, ok := binOp.Y.Type().(*types.SPMDType); ok {
-						isVarying = true
-						break
-					}
-					if b.spmdValueHasVaryingSource(binOp.Y) {
-						isVarying = true
-						break
-					}
-				}
-			}
-		}
-		if !isVarying {
-			continue
-		}
-
-		// Find switch.done by looking at where body blocks jump.
-		if chain.doneBlock == -1 {
-			for _, caseInfo := range chain.cases {
-				bodyBlock := fn.Blocks[caseInfo.bodyBlock]
-				if len(bodyBlock.Succs) != 1 {
-					chain.doneBlock = -1
-					break
-				}
-				target := bodyBlock.Succs[0].Index
-				if chain.doneBlock == -1 {
-					chain.doneBlock = target
-				} else if chain.doneBlock != target {
-					chain.doneBlock = -1
-					break
-				}
-			}
-		}
-		// Validate default body jumps to the same done block.
-		if chain.doneBlock != -1 && chain.defaultBody != -1 {
-			defBlock := fn.Blocks[chain.defaultBody]
-			if len(defBlock.Succs) != 1 || defBlock.Succs[0].Index != chain.doneBlock {
-				chain.doneBlock = -1
-			}
-		}
-
-		// Register validated chain.
-		if len(chain.cases) == 0 || chain.doneBlock == -1 {
-			continue
+		if ssaChain.DefaultBlock != nil {
+			chain.defaultBody = ssaChain.DefaultBlock.Index
 		}
 		chainIdx := len(b.spmdSwitchChains)
 		b.spmdSwitchChains = append(b.spmdSwitchChains, chain)
-
 		for i := range chain.cases {
 			b.spmdSwitchIfBlocks[chain.cases[i].ifBlock] = chainIdx
 			b.spmdSwitchBodyBlocks[chain.cases[i].bodyBlock] = chainIdx
