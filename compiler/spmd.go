@@ -297,25 +297,36 @@ func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.B
 	}
 
 	// Strategy 2: scan the body block for an IndexAddr whose index traces back
-	// to incrBinOp, and extract the slice element type from its base.
+	// to incrBinOp, and extract the element type from its base.
+	//
+	// In SPMD context, the index may be wrapped in a ChangeType to lanes.Varying[int],
+	// so we unwrap ChangeType chains before comparing.
 	for _, instr := range bodyBlock.Instrs {
 		ia, ok := instr.(*ssa.IndexAddr)
 		if !ok {
 			continue
 		}
-		// The index must be the increment BinOp (the SPMD iterator).
-		if ia.Index != ssa.Value(incrBinOp) {
+		// Unwrap ChangeType chains from the index (SPMD wraps int → Varying[int]).
+		idx := ia.Index
+		for ct, ok := idx.(*ssa.ChangeType); ok; ct, ok = idx.(*ssa.ChangeType) {
+			idx = ct.X
+		}
+		// The unwrapped index must be the increment BinOp (the SPMD iterator).
+		if idx != ssa.Value(incrBinOp) {
 			continue
 		}
+		// Determine element type to compute lane count.
+		var elemType types.Type
 		if sliceType, ok := ia.X.Type().Underlying().(*types.Slice); ok {
-			elemLLVM := b.getLLVMType(sliceType.Elem())
-			return b.spmdLaneCount(elemLLVM)
-		}
-		if ptrType, ok := ia.X.Type().Underlying().(*types.Pointer); ok {
+			elemType = sliceType.Elem()
+		} else if ptrType, ok := ia.X.Type().Underlying().(*types.Pointer); ok {
 			if arrType, ok := ptrType.Elem().Underlying().(*types.Array); ok {
-				elemLLVM := b.getLLVMType(arrType.Elem())
-				return b.spmdLaneCount(elemLLVM)
+				elemType = arrType.Elem()
 			}
+		}
+		if elemType != nil {
+			elemLLVM := b.getLLVMType(elemType)
+			return b.spmdLaneCount(elemLLVM)
 		}
 	}
 
@@ -2539,7 +2550,7 @@ func (b *builder) spmdCreateValueLOR(phi *ssa.Phi, info *spmdVaryingIf) (llvm.Va
 	if condReady && rhsOK {
 		// Both a's condition and b's value are ready: compute a | b immediately.
 		// Normalize both operands to the same mask format. On WASM, comparisons
-		// may produce <N x i1> (unwrapped) or <N x i32> (wrapped). Normalize by
+		// may produce <N x i1> (unwrapped) or <N x iW> (wrapped). Normalize by
 		// converting whichever is <N x i1> to match the other's format.
 		lhsCond := info.cond
 		rhsCond := rhsVal
@@ -2551,7 +2562,14 @@ func (b *builder) spmdCreateValueLOR(phi *ssa.Phi, info *spmdVaryingIf) (llvm.Va
 				lhsCond = b.spmdMatchMaskFormat(info.cond, rhsVal)
 			}
 		}
-		return b.CreateOr(lhsCond, rhsCond, "spmd.lor.value"), true
+		result := b.CreateOr(lhsCond, rhsCond, "spmd.lor.value")
+		// Ensure the result matches the phi's expected mask format (e.g., <16 x i8>
+		// on WASM when both operands were raw <16 x i1> comparisons).
+		phiType := b.spmdVaryingBoolPhiType(phi)
+		if result.Type() != phiType {
+			result = b.spmdMatchMaskFormat(result, llvm.Undef(phiType))
+		}
+		return result, true
 	}
 
 	// Deferred path: create a phi with one incoming (from elseEntry/binop.rhs).
@@ -3084,22 +3102,29 @@ func (b *builder) spmdFindActiveLoopForBlock(block *ssa.BasicBlock) *spmdActiveL
 	if loop, ok := b.spmdLoopState.bodyBlocks[block.Index]; ok {
 		return loop
 	}
-	// Dominance fallback: find a body block that dominates this block.
-	// iterPhi is nil for rangeindex loops, so check isRangeIndex first.
+	// Dominance fallback: find the innermost body block that dominates this block.
+	// When multiple sequential loops exist in the same function, their body blocks
+	// may all dominate later blocks. We select the one with the highest block index
+	// (latest in the function), which corresponds to the innermost enclosing loop
+	// for sequential loop layouts.
+	var bestLoop *spmdActiveLoop
+	bestBlockIdx := -1
 	for _, loop := range b.spmdLoopState.bodyBlocks {
 		var bodyBlock *ssa.BasicBlock
 		if loop.isRangeIndex {
-			// For rangeindex, incrBinOp lives in the loop block which is the
-			// immediate predecessor of the body block. Use its block as a proxy.
+			// For rangeindex, use the loop header block (where incrBinOp lives)
+			// as a dominance proxy. It dominates the body block and thus also
+			// dominates any block dominated by the body block.
 			bodyBlock = loop.incrBinOp.Block()
 		} else {
 			bodyBlock = loop.iterPhi.Block()
 		}
-		if bodyBlock.Dominates(block) {
-			return loop
+		if bodyBlock.Dominates(block) && bodyBlock.Index > bestBlockIdx {
+			bestLoop = loop
+			bestBlockIdx = bodyBlock.Index
 		}
 	}
-	return nil
+	return bestLoop
 }
 
 // spmdConvertMaskFormat converts a vector mask value to a different vector mask
@@ -6592,6 +6617,11 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 							}
 						}
 						selected = b.CreateOr(lhsCond, rhsCond, "spmd.lor.value")
+						// Ensure the result matches the phi's expected mask format.
+						phiType := b.spmdVaryingBoolPhiType(phi.ssa)
+						if selected.Type() != phiType {
+							selected = b.spmdMatchMaskFormat(selected, llvm.Undef(phiType))
+						}
 					} else {
 						thenValue := b.getValue(phi.ssa.Edges[override.thenEdgeIdx], getPos(phi.ssa))
 						elseValue := b.getValue(phi.ssa.Edges[override.elseEdgeIdx], getPos(phi.ssa))

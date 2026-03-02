@@ -2243,6 +2243,11 @@ func (b *builder) createFunction() {
 							}
 						}
 						selected = b.CreateOr(lhsCond, rhsCond, "spmd.lor.value")
+						// Ensure the OR result matches the phi's expected mask format
+						// (e.g., <16 x i8> when both operands were raw <16 x i1>).
+						if selected.Type() != phi.llvm.Type() {
+							selected = b.spmdMatchMaskFormat(selected, phi.llvm)
+						}
 					} else {
 						// Standard case: create select for the then/else pair.
 						thenValue := b.getValue(phi.ssa.Edges[override.thenEdgeIdx], getPos(phi.ssa))
@@ -2580,10 +2585,21 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		}
 		if chain, ok := b.spmdCondChainInner[block.Index]; ok {
 			// Inner block: combine condition with running chain.
+			// Normalize mask formats: on WASM, comparisons produce <N x i1> but
+			// values from bool phis may be in mask format <N x iW>. Both operands
+			// must match for bitwise AND/OR.
+			lhs := chain.combinedCond
+			rhs := cond
+			if lhs.Type() != rhs.Type() {
+				rhs = b.spmdMatchMaskFormat(rhs, lhs)
+				if lhs.Type() != rhs.Type() {
+					lhs = b.spmdMatchMaskFormat(chain.combinedCond, rhs)
+				}
+			}
 			if chain.op == token.LAND {
-				chain.combinedCond = b.CreateAnd(chain.combinedCond, cond, "spmd.chain.and")
+				chain.combinedCond = b.CreateAnd(lhs, rhs, "spmd.chain.and")
 			} else {
-				chain.combinedCond = b.CreateOr(chain.combinedCond, cond, "spmd.chain.or")
+				chain.combinedCond = b.CreateOr(lhs, rhs, "spmd.chain.or")
 			}
 			// Check if this is the last inner block in the chain.
 			isLast := chain.innerBlocks[len(chain.innerBlocks)-1] == block.Index
