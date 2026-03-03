@@ -4892,7 +4892,18 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 		}
 		// Scalar-to-SPMD: convert the scalar value first, then splat to vector.
 		if value.Type().TypeKind() == llvm.VectorTypeKind {
-			return llvm.Value{}, b.makeError(pos, "internal error: scalar-to-SPMD convert received a vector value")
+			// The LLVM value is already a vector. This happens when:
+			// 1. Predicated SSA inserts Convert(bool → Varying[mask]) on a
+			//    comparison that TinyGo already vectorized to <N x i32>.
+			// 2. A value was vectorized by SPMD loop processing before the
+			//    Convert instruction is reached.
+			// Return the value as-is, with mask format conversion if needed.
+			vecType := b.getLLVMType(typeTo)
+			if value.Type() == vecType {
+				return value, nil
+			}
+			// Mask format conversion (e.g., <4 x i32> to <4 x i32> with different mask format).
+			return b.spmdConvertMaskFormat(value, vecType), nil
 		}
 		converted, err := b.createConvert(typeFrom, spmdTo.Elem(), value, pos)
 		if err != nil {
