@@ -6366,11 +6366,11 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// Determine the result type from the SSA result type.
 	resultType := b.getLLVMType(instr.Type())
 
-	laneCount := instr.Lanes
+	// Derive lane count from the mask vector, which always has the correct
+	// target-specific width. instr.Lanes may use host int sizes.
+	laneCount := mask.Type().VectorSize()
 
 	// If the address is a vector (varying pointers), emit a masked gather.
-	// Lane count is derived from addr's vector size; instr.Lanes must agree
-	// (enforced by the predication pass).
 	if addr.Type().TypeKind() == llvm.VectorTypeKind {
 		return b.spmdMaskedGather(resultType, addr, mask)
 	}
@@ -6406,6 +6406,19 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 	addr := b.getValue(instr.Addr, instr.Pos())
 	val := b.getValue(instr.Val, instr.Pos())
 	mask := b.getValue(instr.Mask, instr.Pos())
+
+	// The predicated SSA pass copies Store operands directly.
+	// When the original Store was inside a varying if/else, the SSA types
+	// may still be scalar (e.g., int32, *int32). SPMDStore needs vector
+	// operands, so splat scalar values using the active loop's lane count.
+	// Derive lane count from the mask vector, which always has the correct
+	// target-specific width. instr.Lanes may use host int sizes (e.g., 8 bytes
+	// on amd64 host) rather than target sizes (4 bytes on WASM).
+	laneCount := mask.Type().VectorSize()
+	if val.Type().TypeKind() != llvm.VectorTypeKind {
+		// Scalar value: splat to vector.
+		val = b.splatScalar(val, llvm.VectorType(val.Type(), laneCount))
+	}
 
 	// If the address is a vector (varying pointers), emit a masked scatter.
 	// spmdMaskedScatter handles mask format unwrapping internally.
