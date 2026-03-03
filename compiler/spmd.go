@@ -522,6 +522,7 @@ type spmdLoopState struct {
 // spmdActiveLoop holds state for one SPMD loop during compilation.
 type spmdActiveLoop struct {
 	info       *SPMDLoopInfo
+	ssaLoopInfo *ssa.SPMDLoopInfo // x-tools-spmd loop info (non-nil when isPeeled == true)
 	iterPhi    *ssa.Phi   // the "rangeint.iter" phi in body block (nil for rangeindex)
 	laneCount  int        // e.g. 4 for int32 on WASM SIMD128
 	boundValue ssa.Value  // N in "range N"
@@ -539,336 +540,15 @@ type spmdActiveLoop struct {
 	// operations decomposed algebraically. isDecomposed is set by analyzeSPMDLoops.
 	isDecomposed bool
 
+	// Peeling fields (only set when ssaLoopInfo.IsPeeled == true):
+	isPeeled bool // loop was peeled at SSA level; main body uses all-ones mask
+
 	// Set during IR generation:
 	laneIndices   llvm.Value // <iter, iter+1, ..., iter+laneCount-1> (nil when isDecomposed)
 	tailMask      llvm.Value // per-lane bounds check
 	scalarIterVal llvm.Value // scalar LLVM value (before override to lane indices)
 }
 
-// entryPredecessor returns the unique predecessor that enters this loop from
-// outside (not a back-edge from inside the loop).
-// For rangeint: body block's predecessor that isn't the loop block.
-// For rangeindex: loop block's predecessor that isn't a body/interior block.
-// bodyBlockSet may be nil; when nil, interior-block filtering is skipped
-// (only relevant for rangeindex; rangeint ignores it).
-func (loop *spmdActiveLoop) entryPredecessor(state *spmdLoopState, bodyBlockSet map[int]bool) *ssa.BasicBlock {
-	if loop.isRangeIndex {
-		loopBlock := loop.incrBinOp.Block()
-		for _, pred := range loopBlock.Preds {
-			if _, isBody := state.bodyBlocks[pred.Index]; !isBody {
-				if bodyBlockSet != nil && bodyBlockSet[pred.Index] {
-					continue
-				}
-				return pred
-			}
-		}
-	} else {
-		bodyBlock := loop.iterPhi.Block()
-		for _, pred := range bodyBlock.Preds {
-			if _, isLoop := state.loopBlocks[pred.Index]; !isLoop {
-				return pred
-			}
-		}
-	}
-	return nil
-}
-
-// spmdLoopPhase tracks whether we're emitting the main loop body (all-ones mask)
-// or the tail body (computed mask) during loop peeling.
-type spmdLoopPhase int
-
-const (
-	spmdLoopPhaseMain spmdLoopPhase = iota
-	spmdLoopPhaseTail
-)
-
-// spmdPeeledLoop holds state for an SPMD loop that has been split into
-// a main loop (full vectors, plain stores) and a tail (0-1 masked iterations).
-type spmdPeeledLoop struct {
-	loop           *spmdActiveLoop
-	alignedBound   llvm.Value       // bound & ~(laneCount-1)
-	tailCheckBlock llvm.BasicBlock  // phi + branch: hasTail → tail.body | exit
-	tailBlockInfo  map[int]blockInfo // SSA block index → tail LLVM blocks
-	tailExitBlock  llvm.BasicBlock  // convergence point (original loop exit)
-	tailIterPhi    llvm.Value       // phi in tailCheck for the iter value at main loop exit
-	bodyBlockSet   map[int]bool     // set of SSA block indices belonging to this loop body
-	phase           spmdLoopPhase              // current emission phase (Main or Tail)
-	accumulatorPhis   map[*ssa.Phi]llvm.Value // SSA accumulator phi → tail.check LLVM phi
-	tailAccResults    map[*ssa.Phi]llvm.Value // SSA accumulator phi → tail body's final accumulator value
-	doneBlockIdx      int                     // SSA index of the loop's done/exit block
-	tailBodyExitBlock llvm.BasicBlock         // last tail body block (used as done-block phi predecessor)
-	trampolineBlock   llvm.BasicBlock         // fresh block before done (avoids DbgRecords on PHI)
-	trampolinePhis    map[*ssa.Phi]llvm.Value // SSA phi → trampoline merge phi (for done-block phis)
-
-	// Advancing pointer phis for interleaved store groups (main phase only).
-	// Each group's destination pointer advances by stride*laneCount bytes per
-	// iteration, allowing stores to use phi + const_offset which the WASM
-	// backend folds into v128.store offset=K.
-	interleavedGroups []*spmdInterleavedStoreGroup                  // detected groups for this loop
-	dstPtrPhis        map[*spmdInterleavedStoreGroup]llvm.Value     // phi for each group's dst pointer
-	dstElemTypes      map[*spmdInterleavedStoreGroup]llvm.Type      // element type for GEP arithmetic
-}
-
-// spmdShouldPeelLoop returns true if the given SPMD loop is eligible for peeling.
-// Supports both rangeindex (range-over-slice) and rangeint (range N) loops.
-// Loops with accumulator phis are supported: the tail.check block gets
-// accumulator phis, and post-loop uses are redirected via b.locals RAUW.
-// SPMD function bodies are excluded via a panic assertion because the activeLoops
-// state implies spmdFuncIsBody is always false here.
-func (b *builder) spmdShouldPeelLoop(loop *spmdActiveLoop) bool {
-	// spmdFuncIsBody implies spmdLoopState == nil, which means there are no
-	// go-for loops to peel. This function is only called for loops in
-	// spmdLoopState.activeLoops, so spmdFuncIsBody should never be true here.
-	// If this invariant is violated (e.g., go-for nesting becomes allowed),
-	// peeling must be revisited to handle break mask interaction.
-	if b.spmdFuncIsBody {
-		panic("spmd: spmdShouldPeelLoop called with spmdFuncIsBody=true (invariant violation)")
-	}
-	// Don't peel loops inside closures (anonymous functions).
-	// Closures have complex entry blocks (captured variables, recover setup)
-	// that the entry predecessor detection doesn't handle.
-	if b.fn != nil && b.fn.Parent() != nil {
-		return false
-	}
-	// Lane count must be > 0 (sanity).
-	if loop.laneCount <= 0 {
-		return false
-	}
-	if loop.incrBinOp == nil {
-		return false // defensive: incrBinOp must be set for any real loop
-	}
-	// Don't peel loops that have both accumulator phis AND varying control
-	// flow in the body. The trampoline approach for accumulator phis can't
-	// handle complex interior block structures (varying if/else/switch),
-	// and peeling itself changes done-block predecessors which breaks
-	// dominance for phis referencing body-interior values.
-	if b.spmdLoopHasAccumulatorPhis(loop) && b.spmdLoopBodyHasVaryingControlFlow(loop) {
-		return false
-	}
-	return true
-}
-
-// spmdLoopHasAccumulatorPhis returns true if the loop has non-iterator phis
-// (running sums, counters, etc.) in its loop or body blocks.
-func (b *builder) spmdLoopHasAccumulatorPhis(loop *spmdActiveLoop) bool {
-	check := func(block *ssa.BasicBlock) bool {
-		for _, instr := range block.Instrs {
-			ssaPhi, ok := instr.(*ssa.Phi)
-			if !ok {
-				return false // phis are always first
-			}
-			if l, m := b.spmdLoopState.activeLoops[ssaPhi]; m && l == loop {
-				continue // skip the iterator phi
-			}
-			return true // found a non-iterator phi
-		}
-		return false
-	}
-	loopBlock := loop.incrBinOp.Block()
-	if check(loopBlock) {
-		return true
-	}
-	if loop.iterPhi != nil {
-		bodyBlock := loop.iterPhi.Block()
-		if bodyBlock != loopBlock {
-			return check(bodyBlock)
-		}
-	}
-	return false
-}
-
-// spmdLoopBodyHasVaryingControlFlow returns true if any block dominated by
-// the loop body contains varying control flow (varying if/else or compound
-// boolean chains). Checks spmdVaryingIfs which covers all varying control flow
-// patterns (including cases where spmdMaskTransitions is incomplete, such as
-// LOR chains skipping then/else transitions and loop headers skipping merge
-// pops).
-func (b *builder) spmdLoopBodyHasVaryingControlFlow(loop *spmdActiveLoop) bool {
-	for idx, l := range b.spmdLoopState.bodyBlocks {
-		if l != loop {
-			continue
-		}
-		bodyBlock := b.fn.Blocks[idx]
-		for _, block := range b.fn.DomPreorder() {
-			if !bodyBlock.Dominates(block) {
-				continue
-			}
-			// Varying if/else (includes && and || chain outer blocks).
-			if _, ok := b.spmdVaryingIfs[block.Index]; ok {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// spmdComputeAlignedBound computes bound & ~(laneCount-1) to get the last
-// multiple of laneCount that is <= bound. This is the exit condition for the
-// main (unmasked) loop; the remaining 0 to laneCount-1 elements are handled
-// by the tail.
-func (b *builder) spmdComputeAlignedBound(bound llvm.Value, laneCount int) llvm.Value {
-	mask := llvm.ConstInt(bound.Type(), ^uint64(laneCount-1), true)
-	return b.CreateAnd(bound, mask, "spmd.aligned.bound")
-}
-
-// spmdPeeledMainMask returns a ConstAllOnes mask for the main (unmasked) loop phase.
-// When LLVM sees masked.store/load with this mask, it optimizes to plain store/load.
-func (b *builder) spmdPeeledMainMask(laneCount int) llvm.Value {
-	maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
-	return llvm.ConstAllOnes(maskType)
-}
-
-// spmdCreateInterleavedPtrPhis creates advancing pointer phis for interleaved
-// store groups in a peeled main-phase loop. Each phi starts at the destination
-// buffer pointer and advances by stride*laneCount bytes per iteration. Stores
-// use phi (k=0) and GEP(phi, k*N) (k>0), preserving the base+const_offset
-// pattern that the WASM backend folds into v128.store offset=K.
-func (b *builder) spmdCreateInterleavedPtrPhis(loop *spmdActiveLoop, peeled *spmdPeeledLoop) {
-	if len(peeled.interleavedGroups) == 0 {
-		return
-	}
-	peeled.dstPtrPhis = make(map[*spmdInterleavedStoreGroup]llvm.Value)
-	peeled.dstElemTypes = make(map[*spmdInterleavedStoreGroup]llvm.Type)
-
-	savedInsert := b.GetInsertBlock()
-
-	// Get the loop header LLVM block and its entry predecessor.
-	loopSSABlock := loop.incrBinOp.Block()
-	loopHeaderBlock := b.blockInfo[loopSSABlock.Index].entry
-	entryPredSSA := loop.entryPredecessor(b.spmdLoopState, peeled.bodyBlockSet)
-	entryPredBlock := b.blockInfo[entryPredSSA.Index].exit
-
-	for _, group := range peeled.interleavedGroups {
-		// Extract bufptr in the entry predecessor block (before its terminator)
-		// so it dominates the loop header.
-		b.SetInsertPointBefore(entryPredBlock.LastInstruction())
-
-		sliceVal := b.getValue(group.baseSlice, token.NoPos)
-		var bufptr llvm.Value
-		var elemType llvm.Type
-
-		switch ptrTyp := group.addrs[0].X.Type().Underlying().(type) {
-		case *types.Slice:
-			bufptr = b.CreateExtractValue(sliceVal, 0, "interleaved.phi.ptr")
-			elemType = b.getLLVMType(ptrTyp.Elem())
-		case *types.Pointer:
-			typ := ptrTyp.Elem().Underlying()
-			if arr, ok := typ.(*types.Array); ok {
-				bufptr = sliceVal
-				elemType = b.getLLVMType(arr.Elem())
-			} else {
-				continue
-			}
-		default:
-			continue
-		}
-
-		// Create phi in loop header block (before first instruction, alongside
-		// existing phis like the iteration variable phi).
-		b.SetInsertPointBefore(loopHeaderBlock.FirstInstruction())
-		phi := b.CreatePHI(bufptr.Type(), "interleaved.dst.phi")
-		phi.AddIncoming([]llvm.Value{bufptr}, []llvm.BasicBlock{entryPredBlock})
-
-		peeled.dstPtrPhis[group] = phi
-		peeled.dstElemTypes[group] = elemType
-	}
-
-	b.SetInsertPointAtEnd(savedInsert)
-}
-
-// spmdIsLoopExitBound checks if a BinOp is the loop exit comparison (incr < bound)
-// for a peeled SPMD loop in the main phase, and returns the aligned bound to use
-// instead. The comparison must be LSS and the left operand must be the loop's
-// incrBinOp (the scalar increment), which has been pre-narrowed to a scalar by the
-// +laneCount override just before this check in createExpr.
-func (b *builder) spmdIsLoopExitBound(expr *ssa.BinOp) (llvm.Value, bool) {
-	if b.spmdPeeledLoops == nil || b.spmdLoopState == nil {
-		return llvm.Value{}, false
-	}
-	// This BinOp must reside in a loop block.
-	loop, ok := b.spmdLoopState.loopBlocks[b.currentBlock.Index]
-	if !ok {
-		return llvm.Value{}, false
-	}
-	peeled, ok := b.spmdPeeledLoops[loop]
-	if !ok || peeled.phase != spmdLoopPhaseMain {
-		return llvm.Value{}, false
-	}
-	// Must be a signed-less-than comparison where X is the loop increment.
-	if expr.Op != token.LSS {
-		return llvm.Value{}, false
-	}
-	if expr.X != loop.incrBinOp {
-		return llvm.Value{}, false
-	}
-	// alignedBound must have been computed (lazily in emitSPMDBodyPrologue).
-	if peeled.alignedBound.IsNil() {
-		return llvm.Value{}, false
-	}
-	return peeled.alignedBound, true
-}
-
-// spmdCreateTailBlocks creates the LLVM basic blocks needed for the tail body
-// of a peeled loop. This includes a tail.check block and a .tail version of
-// each body and interior block. Loop blocks are excluded since the tail does
-// not loop.
-//
-// This must be called after b.llvmFn is set and the main LLVM blocks have
-// been created. The returned *spmdPeeledLoop has phase set to spmdLoopPhaseMain
-// by default.
-func (b *builder) spmdCreateTailBlocks(loop *spmdActiveLoop) *spmdPeeledLoop {
-	peeled := &spmdPeeledLoop{
-		loop:          loop,
-		tailBlockInfo: make(map[int]blockInfo),
-		bodyBlockSet:  make(map[int]bool),
-	}
-
-	// Identify all SSA blocks belonging to THIS loop's body or interior to it.
-	// Body and loop blocks are filtered by the specific loop being peeled —
-	// in multi-loop functions, other loops' blocks must not be included.
-	// Interior blocks (if.then/else/done) are identified via dominator analysis:
-	// a block is interior if any body block of THIS loop dominates it.
-	// Loop blocks are excluded — the tail does not loop back.
-	//
-	// Find all body block indices for this specific loop.
-	loopBodyIndices := make(map[int]bool)
-	for idx, l := range b.spmdLoopState.bodyBlocks {
-		if l == loop {
-			loopBodyIndices[idx] = true
-		}
-	}
-	for _, block := range b.fn.DomPreorder() {
-		if loopBodyIndices[block.Index] {
-			peeled.bodyBlockSet[block.Index] = true
-			continue
-		}
-		if l, isLoop := b.spmdLoopState.loopBlocks[block.Index]; isLoop && l == loop {
-			// Loop block for THIS loop is not part of the tail body (tail doesn't loop).
-			continue
-		}
-		// Check if this block is interior to THIS loop's body (if.then/else/done etc).
-		// Only include blocks dominated by a body block of this specific loop.
-		if !b.spmdFuncIsBody {
-			for bodyIdx := range loopBodyIndices {
-				bodyBlock := b.fn.Blocks[bodyIdx]
-				if bodyBlock.Dominates(block) {
-					peeled.bodyBlockSet[block.Index] = true
-					break
-				}
-			}
-		}
-	}
-
-	// Create tail.check block and tail versions of each body/interior block.
-	peeled.tailCheckBlock = b.ctx.AddBasicBlock(b.llvmFn, "spmd.tail.check")
-	for idx := range peeled.bodyBlockSet {
-		block := b.fn.Blocks[idx]
-		tailBlock := b.ctx.AddBasicBlock(b.llvmFn, block.Comment+".tail")
-		peeled.tailBlockInfo[idx] = blockInfo{entry: tailBlock, exit: tailBlock}
-	}
-
-	return peeled
-}
 
 // spmdDecomposedIndex tracks a base+offset decomposed SPMD index value.
 // Used for byte-lane loops (laneCount > 4) where the full materialized vector
@@ -920,6 +600,80 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 	// handles cross-pattern nesting (rangeint outer + rangeindex inner, or
 	// vice versa).
 	seenLoopInfo := make(map[*SPMDLoopInfo]bool)
+
+	// Pass 0: Handle SSA-peeled loops directly from metadata.
+	// When peelSPMDLoops runs in go/ssa, it creates MainBodyBlock, TailBodyBlock,
+	// etc. The original body block becomes unreachable but is still in fn.Blocks.
+	// We claim the loopInfo here so the rangeint pass (below) skips the original
+	// unreachable body block.
+	for _, ssaLoop := range b.fn.SPMDLoops {
+		if !ssaLoop.IsPeeled {
+			continue
+		}
+
+		mainIterPhi := ssaLoop.MainIterPhi
+		if mainIterPhi == nil {
+			continue
+		}
+
+		// Deduplicate: map SSA loop info pointer to TinyGo loop info via position.
+		// The mainIterPhi is in MainBodyBlock; find the corresponding TinyGo SPMDLoopInfo.
+		var loopInfo *SPMDLoopInfo
+		for _, instr := range ssaLoop.MainBodyBlock.Instrs {
+			if pos := instr.(interface{ Pos() token.Pos }).Pos(); pos != token.NoPos {
+				loopInfo = b.isInSPMDLoop(pos)
+				if loopInfo != nil {
+					break
+				}
+			}
+		}
+		if loopInfo == nil {
+			continue
+		}
+		if seenLoopInfo[loopInfo] {
+			continue
+		}
+		seenLoopInfo[loopInfo] = true
+
+		// The main incr BinOp is the back-edge value of mainIterPhi.
+		// mainIterPhi.Edges = [zeroConst, mainIncr].
+		if len(mainIterPhi.Edges) < 2 {
+			continue
+		}
+		mainIncrBinOp, ok := mainIterPhi.Edges[1].(*ssa.BinOp)
+		if !ok || mainIncrBinOp.Op != token.ADD {
+			continue
+		}
+
+		// Compute lane count from iter phi type.
+		elemType := b.getLLVMType(mainIterPhi.Type())
+		laneCount := b.spmdLaneCount(elemType)
+
+		loop := &spmdActiveLoop{
+			info:          loopInfo,
+			ssaLoopInfo:   ssaLoop,
+			iterPhi:       mainIterPhi,
+			laneCount:     laneCount,
+			boundValue:    ssaLoop.BoundValue,
+			incrBinOp:     mainIncrBinOp,
+			bodyIterValue: mainIterPhi,
+			isPeeled:      true,
+		}
+
+		// Map main body: activeLoops[phi] triggers emitSPMDBodyPrologue via phi handler.
+		state.activeLoops[mainIterPhi] = loop
+		state.bodyBlocks[ssaLoop.MainBodyBlock.Index] = loop
+		state.loopBlocks[ssaLoop.MainBodyBlock.Index] = loop
+
+		// Map tail body: no iter phi in TailBodyBlock (TailIterPhi is in TailCheckBlock).
+		// The prologue is triggered by body block entry code (isPeeled check).
+		// Do NOT add TailIterPhi to activeLoops — TailCheckBlock is not a body block
+		// and the phi handler must not call emitSPMDBodyPrologue for it.
+		if ssaLoop.TailBodyBlock != nil {
+			state.bodyBlocks[ssaLoop.TailBodyBlock.Index] = loop
+			state.loopBlocks[ssaLoop.TailBodyBlock.Index] = loop
+		}
+	}
 
 	// Iterate over ALL blocks (not just DomPreorder) to find rangeint patterns.
 	for _, block := range b.fn.Blocks {
@@ -1214,6 +968,44 @@ func (c *compilerContext) spmdLaneOffsetConst(laneCount int, elemType llvm.Type)
 // offset to avoid creating a <16 x i32> 512-bit vector that would exceed WASM's
 // 128-bit SIMD registers. The decomposition is stored in b.spmdDecomposed.
 func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
+	// Peeled loop path: the SSA already contains MainBodyBlock and TailBodyBlock
+	// with correct phi and control flow. We just need to set up lane indices and
+	// the appropriate mask (all-ones for main, computed for tail).
+	if loop.isPeeled {
+		ssaLoop := loop.ssaLoopInfo
+		isMainBody := b.currentBlock.Index == ssaLoop.MainBodyBlock.Index
+
+		// Get the appropriate iter phi's scalar value.
+		var scalarPhi llvm.Value
+		if isMainBody {
+			scalarPhi = b.locals[ssaLoop.MainIterPhi]
+		} else {
+			scalarPhi = b.locals[ssaLoop.TailIterPhi]
+		}
+		loop.scalarIterVal = scalarPhi
+
+		// Compute lane indices: <iter, iter+1, ..., iter+laneCount-1>.
+		elemType := scalarPhi.Type()
+		vecType := llvm.VectorType(elemType, loop.laneCount)
+		iterVec := b.splatScalar(scalarPhi, vecType)
+		offsetVec := b.spmdLaneOffsetConst(loop.laneCount, elemType)
+		laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
+		loop.laneIndices = laneIndices
+
+		if isMainBody {
+			// Main body: all-ones mask (all lanes active).
+			maskType := llvm.VectorType(b.spmdMaskElemType(loop.laneCount), loop.laneCount)
+			loop.tailMask = llvm.ConstAllOnes(maskType)
+		} else {
+			// Tail body: compute tail mask (laneIndices < bound).
+			boundScalar := b.getValue(loop.boundValue, token.NoPos)
+			boundVec := b.splatScalar(boundScalar, vecType)
+			tailMaskI1 := b.CreateICmp(llvm.IntSLT, laneIndices, boundVec, "spmd.tail.mask")
+			loop.tailMask = b.spmdWrapMask(tailMaskI1, loop.laneCount)
+		}
+		return
+	}
+
 	// Obtain the scalar iteration value that the body block uses as its index.
 	var scalarPhi llvm.Value
 	if loop.isRangeIndex {
@@ -1245,19 +1037,6 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 				laneCount:     laneCount,
 				loop:          loop,
 				fromBodyIter:  true, // raw iterator: base is always a multiple of laneCount
-			}
-		}
-
-		// SPMD loop peeling: in main phase, compute aligned bound and use all-ones mask.
-		if b.spmdPeeledLoops != nil {
-			if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseMain {
-				if peeled.alignedBound.IsNil() {
-					boundScalar := b.getValue(loop.boundValue, token.NoPos)
-					peeled.alignedBound = b.spmdComputeAlignedBound(boundScalar, loop.laneCount)
-				}
-				loop.tailMask = b.spmdPeeledMainMask(loop.laneCount)
-				b.spmdCreateInterleavedPtrPhis(loop, peeled)
-				return
 			}
 		}
 
@@ -1307,20 +1086,6 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 
 	// Compute lane indices: <iter, iter+1, iter+2, ..., iter+laneCount-1>.
 	laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
-
-	// SPMD loop peeling: in main phase, compute aligned bound and use all-ones mask.
-	if b.spmdPeeledLoops != nil {
-		if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseMain {
-			if peeled.alignedBound.IsNil() {
-				boundScalar := b.getValue(loop.boundValue, token.NoPos)
-				peeled.alignedBound = b.spmdComputeAlignedBound(boundScalar, loop.laneCount)
-			}
-			loop.laneIndices = laneIndices
-			loop.tailMask = b.spmdPeeledMainMask(loop.laneCount)
-			b.spmdCreateInterleavedPtrPhis(loop, peeled)
-			return
-		}
-	}
 
 	// Get the bound value and splat it.
 	boundScalar := b.getValue(loop.boundValue, token.NoPos)
@@ -5625,423 +5390,6 @@ func spmdIndexMaxValue(v ssa.Value) (uint64, bool) {
 	return 0, false
 }
 
-// emitSPMDTailCheck emits the tail.check block that bridges the main loop exit
-// to either the tail body (if there are remaining elements) or the exit block.
-// The phi incoming values are wired later (after emitSPMDTailBody returns)
-// because the main loop's incrBinOp value is available in b.locals at that point.
-func (b *builder) emitSPMDTailCheck(peeled *spmdPeeledLoop) {
-	loop := peeled.loop
-
-	b.SetInsertPointAtEnd(peeled.tailCheckBlock)
-
-	// Create phi for iterator value: comes from entry (0) or main loop (mainIterNext).
-	// Incoming values are added by the caller after emitSPMDTailBody returns.
-	// Use the bound value's type (not hardcoded i32) for future 64-bit target support.
-	iterType := b.getLLVMType(loop.boundValue.Type())
-	phi := b.CreatePHI(iterType, "spmd.tail.iter")
-	peeled.tailIterPhi = phi
-
-	// Create accumulator phis in tail.check for any additional phis beyond the
-	// iterator. Accumulator phis carry values (running sums, etc.) from the main
-	// loop exit into the tail iteration.
-	// Collect phis from both body and loop blocks (rangeint has iter phi in body,
-	// rangeindex has iter phi in loop; accumulators can be in either).
-	//
-	// Skip accumulator phi collection when the loop body contains varying
-	// control flow (varying if/else/switch/compound booleans). The trampoline
-	// approach for accumulator phis doesn't handle complex interior block
-	// structures. Uses the same check as spmdShouldPeelLoop to ensure
-	// consistency (spmdShouldPeelLoop already prevents peeling when both
-	// accumulators AND varying control flow are present, but this is a
-	// belt-and-suspenders defense).
-	peeled.accumulatorPhis = make(map[*ssa.Phi]llvm.Value)
-	if !b.spmdLoopBodyHasVaryingControlFlow(loop) {
-		collectAccPhis := func(block *ssa.BasicBlock) {
-			for _, instr := range block.Instrs {
-				ssaPhi, ok := instr.(*ssa.Phi)
-				if !ok {
-					break // phis are always first
-				}
-				// Skip the iterator phi (already handled by tailIterPhi).
-				if loopMatch, matched := b.spmdLoopState.activeLoops[ssaPhi]; matched && loopMatch == loop {
-					continue
-				}
-				// This is an accumulator phi — create a corresponding LLVM phi in tail.check.
-				accType := b.getLLVMType(ssaPhi.Type())
-				accPhi := b.CreatePHI(accType, "spmd.tail.acc")
-				peeled.accumulatorPhis[ssaPhi] = accPhi
-			}
-		}
-		loopBlock := loop.incrBinOp.Block()
-		collectAccPhis(loopBlock)
-		if loop.iterPhi != nil {
-			bodyBlock := loop.iterPhi.Block()
-			if bodyBlock != loopBlock {
-				collectAccPhis(bodyBlock)
-			}
-		}
-	}
-
-	// Branch: tailIter < bound → tail.body, else → exit.
-	boundScalar := b.getValue(loop.boundValue, token.NoPos)
-	hasTail := b.CreateICmp(llvm.IntSLT, phi, boundScalar, "spmd.has.tail")
-
-	// Find the tail body entry block (first body block in DomPreorder).
-	var tailBodyEntry llvm.BasicBlock
-	for _, block := range b.fn.DomPreorder() {
-		if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
-			if info, exists := peeled.tailBlockInfo[block.Index]; exists {
-				tailBodyEntry = info.entry
-				break
-			}
-		}
-	}
-	if tailBodyEntry.IsNil() {
-		b.CreateBr(peeled.tailExitBlock)
-		return
-	}
-
-	b.CreateCondBr(hasTail, tailBodyEntry, peeled.tailExitBlock)
-}
-
-// emitSPMDTailBody re-processes the SPMD body blocks to emit the tail iteration
-// with a computed tail mask. The tail runs at most once (no loop-back).
-// All builder state is saved and restored so the main-phase state is preserved.
-func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
-	loop := peeled.loop
-
-	// Switch to tail phase.
-	peeled.phase = spmdLoopPhaseTail
-
-	// Save builder state.
-	savedLocals := b.locals
-	savedOverride := b.spmdValueOverride
-	savedDecomposed := b.spmdDecomposed
-	savedContiguous := b.spmdContiguousPtr
-	savedShifted := b.spmdShiftedPtr
-	savedMaskStack := b.spmdMaskStack
-	savedBlockInfo := make([]blockInfo, len(b.blockInfo))
-	copy(savedBlockInfo, b.blockInfo)
-
-	// Save varying if condition values. The tail body re-processes the varying If
-	// instruction, which calls spmdDetectVaryingIf and overwrites info.cond with
-	// the tail-phase condition LLVM value. But the main-phase merge phi overrides
-	// reference info.cond and are resolved AFTER this function returns (during phi
-	// resolution). Without save/restore, the main-phase select would use a
-	// tail-phase value that doesn't dominate the main-phase block.
-	savedVaryingIfConds := make(map[int]llvm.Value)
-	for idx, info := range b.spmdVaryingIfs {
-		savedVaryingIfConds[idx] = info.cond
-	}
-	savedMaskTransitionConds := make(map[int]llvm.Value)
-	for idx, tr := range b.spmdMaskTransitions {
-		savedMaskTransitionConds[idx] = tr.cond
-	}
-	// Save then-exit redirects. spmdDetectVaryingIf writes to spmdThenExitRedirects
-	// using tail-phase blockInfo, which would store tail LLVM blocks. While main-phase
-	// Jumps are compiled before tail emission, save/restore prevents future misuse.
-	savedThenExitRedirects := make(map[int]llvm.BasicBlock)
-	for idx, block := range b.spmdThenExitRedirects {
-		savedThenExitRedirects[idx] = block
-	}
-
-	// Clone locals: keep values defined outside the SPMD body (from dominating blocks).
-	b.locals = make(map[ssa.Value]llvm.Value)
-	for k, v := range savedLocals {
-		if k.Parent() != b.fn {
-			// Value from another function — keep unconditionally.
-			b.locals[k] = v
-			continue
-		}
-		// Only ssa.Instruction values have a Block() method; globals/freeVars do not.
-		if instr, ok := k.(ssa.Instruction); ok {
-			block := instr.Block()
-			if block != nil && peeled.bodyBlockSet[block.Index] {
-				// Value defined inside the body block set — don't copy to tail locals.
-				continue
-			}
-		}
-		// Value defined outside the body block set (or not an instruction) — available in tail.
-		b.locals[k] = v
-	}
-
-	// Override the body iterator value to the tailIterPhi from tail.check.
-	// For rangeint, bodyIterValue is the iterPhi (in body block).
-	// For rangeindex, bodyIterValue is the incrBinOp (in loop block, already in locals).
-	if loop.bodyIterValue != nil {
-		b.locals[loop.bodyIterValue] = peeled.tailIterPhi
-	}
-
-	// Apply accumulator phi overrides for tail phase.
-	// Accumulator phis may live in the loop block (not the body block), so the
-	// per-instruction override in the body block loop wouldn't reach them.
-	// Set b.locals upfront so all instructions see the tail.check accumulator phi.
-	for ssaPhi, accPhi := range peeled.accumulatorPhis {
-		b.locals[ssaPhi] = accPhi
-	}
-
-	// Swap blockInfo to tail blocks.
-	for idx, info := range peeled.tailBlockInfo {
-		b.blockInfo[idx] = info
-	}
-
-	// Fresh SPMD maps for tail phase.
-	b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
-	b.spmdDecomposed = make(map[ssa.Value]*spmdDecomposedIndex)
-	b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
-	b.spmdShiftedPtr = make(map[ssa.Value]*spmdShiftedLoadInfo)
-	b.spmdMaskStack = nil
-
-	// Process body blocks in DomPreorder order (tail phase).
-	for _, block := range b.fn.DomPreorder() {
-		if !peeled.bodyBlockSet[block.Index] {
-			continue
-		}
-		b.currentBlock = block
-		b.currentBlockInfo = &b.blockInfo[block.Index]
-		b.SetInsertPointAtEnd(b.currentBlockInfo.entry)
-
-		// Body block entry: reset overrides and emit prologue if rangeindex.
-		if _, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
-			b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
-			b.spmdDecomposed = make(map[ssa.Value]*spmdDecomposedIndex)
-
-			if loop.isRangeIndex {
-				// rangeindex body: bodyIterValue already overridden to tailIterPhi in b.locals.
-				// emitSPMDBodyPrologue reads b.locals[loop.bodyIterValue] directly.
-				b.emitSPMDBodyPrologue(loop)
-				if !loop.isDecomposed {
-					b.spmdValueOverride[loop.bodyIterValue] = loop.laneIndices
-				}
-				b.spmdMaskStack = []llvm.Value{loop.tailMask}
-			}
-		} else if b.spmdValueOverride != nil && b.isBlockInSPMDBody(block) != nil {
-			// Keep existing overrides for if.then/if.else/if.done inside tail body.
-		} else {
-			// Interior block that doesn't belong to the body: clear overrides.
-			// (Shouldn't happen since bodyBlockSet covers interior blocks too.)
-		}
-
-		// Apply mask transitions for interior blocks (if.then/else/done).
-		// Mask transitions are keyed by SSA block index and apply to the tail
-		// blocks as well since they encode the same logical control flow.
-		if b.spmdMaskTransitions != nil {
-			if tr, ok := b.spmdMaskTransitions[block.Index]; ok {
-				switch tr.kind {
-				case "pushThen":
-					parentMask := b.spmdCurrentMask()
-					if !parentMask.IsNil() {
-						// tr.cond may be <N x i1> (comparison result) while parentMask is
-						// <N x iW> (WASM format). Match formats before AND.
-						cond := tr.cond
-						if cond.IsNil() {
-							panic(fmt.Sprintf("SPMD tail pushThen: tr.cond is nil for block %d (%s)", block.Index, block.Comment))
-						}
-						cond = b.spmdMatchMaskFormat(cond, parentMask)
-						if cond.Type() != parentMask.Type() {
-							panic(fmt.Sprintf("SPMD tail pushThen: type mismatch after spmdMatchMaskFormat: cond=%s parentMask=%s block=%d (%s)", cond.Type().String(), parentMask.Type().String(), block.Index, block.Comment))
-						}
-						thenMask := b.CreateAnd(parentMask, cond, "spmd.then.mask")
-						b.spmdPushMask(thenMask)
-					}
-				case "swapElse":
-					b.spmdPopMask()
-					parentMask := b.spmdCurrentMask()
-					if !parentMask.IsNil() {
-						// tr.cond may be <N x i1> while parentMask is <N x iW>. Match first.
-						cond := b.spmdMatchMaskFormat(tr.cond, parentMask)
-						notCond := b.CreateNot(cond, "")
-						elseMask := b.CreateAnd(parentMask, notCond, "spmd.else.mask")
-						b.spmdPushMask(elseMask)
-					}
-				case "pop":
-					b.spmdPopMask()
-				case "pushDirect":
-					b.spmdPushMask(tr.cond)
-				}
-			}
-		}
-
-		// Process instructions.
-		for _, instr := range block.Instrs {
-			if _, ok := instr.(*ssa.DebugRef); ok {
-				continue
-			}
-			// Task 6: Skip the rangeint iter phi in tail — use tailIterPhi directly.
-			// For rangeindex, bodyIterValue is incrBinOp (not a phi), handled via b.locals above.
-			if phi, ok := instr.(*ssa.Phi); ok {
-				if loopMatch, matched := b.spmdLoopState.activeLoops[phi]; matched && loopMatch == loop {
-					// Override phi to use tailIterPhi from tail.check.
-					b.locals[phi] = peeled.tailIterPhi
-					// Emit prologue for rangeint pattern (rangeindex handled at body block entry).
-					b.emitSPMDBodyPrologue(loop)
-					b.spmdValueOverride[phi] = loop.laneIndices
-					b.spmdMaskStack = []llvm.Value{loop.tailMask}
-					continue // skip normal createInstruction for this phi
-				}
-				// Check for accumulator phi — override to tail.check accumulator phi.
-				if accPhi, ok := peeled.accumulatorPhis[phi]; ok {
-					b.locals[phi] = accPhi
-					continue // skip normal createInstruction for this phi
-				}
-			}
-
-			b.createInstruction(instr)
-		}
-	}
-
-	// tailBodyExitBlock is recorded in the Jump/If handlers at the point where
-	// they branch to tailExitBlock. This captures the actual LLVM block (which
-	// may be a load-merge block etc., not the originally created tail body block).
-
-	// Identify tail-phase phis by checking if their parent LLVM block is one of
-	// the tail blocks created for this peeled loop.
-	tailBlockSet := make(map[llvm.BasicBlock]bool, len(peeled.tailBlockInfo))
-	for _, info := range peeled.tailBlockInfo {
-		if !info.entry.IsNil() {
-			tailBlockSet[info.entry] = true
-		}
-	}
-	if !peeled.tailCheckBlock.IsNil() {
-		tailBlockSet[peeled.tailCheckBlock] = true
-	}
-
-	// Resolve tail-phase merge phi overrides (LOR value expressions and
-	// multi-pred merge phis) before restoring b.locals and b.blockInfo.
-	//
-	// In the tail phase, spmdCreateValueLOR (and spmdCreateMultiPredMergeSelect)
-	// may take the deferred path (when the RHS SSA value isn't ready yet in
-	// DomPreorder order) and add a new phiNode to b.phis with a tail-phase LLVM
-	// phi placeholder. The main-phase phi resolution loop (in createFunction)
-	// resolves these phis after emitSPMDTailBody returns, by which time b.blockInfo
-	// has been restored to main-phase values. This causes the phi to receive the
-	// wrong (main-phase) LLVM predecessor block (e.g., %binop.rhs19 instead of
-	// %binop.rhs.tail).
-	//
-	// Fix: identify tail-phase phis that have merge phi overrides, resolve them
-	// NOW while b.blockInfo still contains tail-phase block mappings, and mark
-	// them as already resolved so the main-phase phi resolution loop skips them.
-	if b.spmdMergePhiOverrides != nil {
-		for i, phi := range b.phis {
-			if phi.llvm.IsNil() {
-				continue
-			}
-			override, hasOverride := b.spmdMergePhiOverrides[phi.ssa]
-			if !hasOverride {
-				continue
-			}
-			// Only process phis whose LLVM placeholder is in a tail block.
-			parentBB := phi.llvm.InstructionParent()
-			if !tailBlockSet[parentBB] {
-				continue
-			}
-			block := phi.ssa.Block()
-			// Resolve the surviving edge using tail-phase blockInfo.
-			for j, edge := range phi.ssa.Edges {
-				if j == override.skipEdgeIdx {
-					continue
-				}
-				if j == override.thenEdgeIdx || j == override.elseEdgeIdx {
-					var survivingBB llvm.BasicBlock
-					if override.info.hasElse {
-						survivingBB = b.blockInfo[block.Preds[override.elseEdgeIdx].Index].exit
-					} else {
-						survivingBB = b.blockInfo[block.Preds[override.thenEdgeIdx].Index].exit
-					}
-					term := survivingBB.LastInstruction()
-					b.SetInsertPointBefore(term)
-					var selected llvm.Value
-					if override.info.isValueLOR {
-						rhsVal := b.getValue(edge, getPos(phi.ssa))
-						lhsCond := override.info.cond
-						rhsCond := rhsVal
-						if lhsCond.Type() != rhsCond.Type() {
-							rhsCond = b.spmdMatchMaskFormat(rhsVal, lhsCond)
-							if lhsCond.Type() != rhsCond.Type() {
-								lhsCond = b.spmdMatchMaskFormat(override.info.cond, rhsVal)
-							}
-						}
-						selected = b.CreateOr(lhsCond, rhsCond, "spmd.lor.value")
-						// Ensure the result matches the phi's expected mask format.
-						phiType := b.spmdVaryingBoolPhiType(phi.ssa)
-						if selected.Type() != phiType {
-							selected = b.spmdMatchMaskFormat(selected, llvm.Undef(phiType))
-						}
-					} else {
-						thenValue := b.getValue(phi.ssa.Edges[override.thenEdgeIdx], getPos(phi.ssa))
-						elseValue := b.getValue(phi.ssa.Edges[override.elseEdgeIdx], getPos(phi.ssa))
-						thenValue, elseValue = b.spmdBroadcastMatch(thenValue, elseValue)
-						thenIsVec := thenValue.Type().TypeKind() == llvm.VectorTypeKind
-						elseIsVec := elseValue.Type().TypeKind() == llvm.VectorTypeKind
-						if thenIsVec || elseIsVec {
-							selected = b.spmdMaskSelect(override.info.cond, thenValue, elseValue)
-						} else {
-							scalarCond := b.spmdVectorAnyTrue(override.info.cond)
-							selected = b.CreateSelect(scalarCond, thenValue, elseValue, "")
-						}
-					}
-					phi.llvm.AddIncoming([]llvm.Value{selected}, []llvm.BasicBlock{survivingBB})
-					// Mark as resolved: nil out the phi so main-phase resolution skips it.
-					b.phis[i].llvm = llvm.Value{}
-					break
-				}
-			}
-		}
-	}
-
-	// Save the tail body's final accumulator values before restoring state.
-	// After the tail body compiles, b.locals[backEdgeValue] holds the tail's
-	// computed accumulator result. This is needed to create a merge phi in
-	// the done block (which has paths from both tail.check and tail.body).
-	if len(peeled.accumulatorPhis) > 0 {
-		peeled.tailAccResults = make(map[*ssa.Phi]llvm.Value)
-		for ssaPhi := range peeled.accumulatorPhis {
-			phiBlock := ssaPhi.Block()
-			for i, pred := range phiBlock.Preds {
-				_, isBody := b.spmdLoopState.bodyBlocks[pred.Index]
-				_, isLoop := b.spmdLoopState.loopBlocks[pred.Index]
-				isInterior := peeled.bodyBlockSet[pred.Index]
-				if isBody || isLoop || isInterior {
-					// This is the body/back-edge predecessor.
-					backEdgeVal := ssaPhi.Edges[i]
-					if result, ok := b.locals[backEdgeVal]; ok && !result.IsNil() {
-						peeled.tailAccResults[ssaPhi] = result
-					}
-					break
-				}
-			}
-		}
-	}
-
-	// Restore builder state.
-	b.locals = savedLocals
-	b.spmdValueOverride = savedOverride
-	b.spmdDecomposed = savedDecomposed
-	b.spmdContiguousPtr = savedContiguous
-	b.spmdShiftedPtr = savedShifted
-	b.spmdMaskStack = savedMaskStack
-	copy(b.blockInfo, savedBlockInfo)
-
-	// Restore varying if conditions overwritten by tail-phase spmdDetectVaryingIf.
-	for idx, cond := range savedVaryingIfConds {
-		if info, ok := b.spmdVaryingIfs[idx]; ok {
-			info.cond = cond
-		}
-	}
-	for idx, cond := range savedMaskTransitionConds {
-		if tr, ok := b.spmdMaskTransitions[idx]; ok {
-			tr.cond = cond
-		}
-	}
-	// Restore then-exit redirects overwritten by tail-phase spmdDetectVaryingIf.
-	for idx, block := range savedThenExitRedirects {
-		b.spmdThenExitRedirects[idx] = block
-	}
-
-	// Restore to main phase.
-	peeled.phase = spmdLoopPhaseMain
-}
-
 // spmdEmitInterleavedStore handles the last store (remainder == stride-1) in a
 // stride-S interleaved store group. It collects values already saved for
 // remainders 0..S-2 from spmdInterleavedValues, shuffles them into S output
@@ -6080,55 +5428,6 @@ func (b *builder) spmdEmitInterleavedStore(lastStore *ssa.Store, info *spmdInter
 		return // unsupported stride
 	}
 
-	// Main phase with phi-ptr: use advancing pointer instead of index-based GEP.
-	// The phi starts at the buffer base and advances by stride*N each iteration,
-	// so stores use phi (k=0) and GEP(phi, k*N) (k>0). The WASM backend folds
-	// the constant GEP offset into v128.store offset=K.
-	//
-	// Bounds safety: the main peeled loop runs while iter < alignedBound, where
-	// alignedBound = len(src) & ~(N-1). The phi starts at dst[0] and advances by
-	// stride*N bytes per iteration, so the maximum store address is
-	// alignedBound*stride bytes into dst. For well-formed code where
-	// len(dst) >= len(src)*stride, this is in-bounds. The normal IndexAddr bounds
-	// checks are suppressed for interleaved groups (IndexAddr returns undef), so
-	// the caller is responsible for ensuring dst is large enough.
-	//
-	// Back-edge safety: spmdAnalyzeInterleavedStores only detects stores in the
-	// direct body block (not interior if.then/else blocks), so bodyBlock here is
-	// always the block that branches back to the loop header.
-	if b.spmdPeeledLoops != nil {
-		if peeled, ok := b.spmdPeeledLoops[group.loop]; ok && peeled.phase == spmdLoopPhaseMain {
-			if phi, ok := peeled.dstPtrPhis[group]; ok {
-				elemType := peeled.dstElemTypes[group]
-				mask := b.spmdCurrentMask()
-				if mask.IsNil() {
-					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(N), N))
-				}
-				expandedMasks := b.spmdExpandMaskForStride(mask, stride, N)
-
-				// Capture the body block before emitting stores, in case a future
-				// change to spmdMaskedStore introduces block splits.
-				bodyBlock := b.GetInsertBlock()
-
-				// k=0: store directly to phi ptr.
-				b.spmdMaskedStore(outVecs[0], phi, expandedMasks[0])
-				// k>0: GEP(phi, k*N) — constant offset folds into v128.store offset=k*N.
-				for k := 1; k < stride; k++ {
-					offset := llvm.ConstInt(b.uintptrType, uint64(k*N), false)
-					ptr := b.CreateInBoundsGEP(elemType, phi,
-						[]llvm.Value{offset}, fmt.Sprintf("interleaved.store.ptr.%d", k))
-					b.spmdMaskedStore(outVecs[k], ptr, expandedMasks[k])
-				}
-
-				// Advance phi for next iteration: GEP(phi, stride*N).
-				advance := llvm.ConstInt(b.uintptrType, uint64(stride*N), false)
-				nextPtr := b.CreateInBoundsGEP(elemType, phi,
-					[]llvm.Value{advance}, "interleaved.dst.next")
-				phi.AddIncoming([]llvm.Value{nextPtr}, []llvm.BasicBlock{bodyBlock})
-				return
-			}
-		}
-	}
 
 	// Compute the base pointer for the output slice.
 	// decomp.scalarBase for remainder-0 addr is already iter*stride (the scalar
