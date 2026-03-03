@@ -198,12 +198,6 @@ type builder struct {
 	spmdBreakRedirects      map[int]spmdBreakRedirect          // then-block index -> break redirect info
 	spmdBreakPhiOverrides   map[*ssa.Phi]llvm.Value            // phi -> final value (for break result phis at rangeint.done)
 	spmdMergePhiOverrides   map[*ssa.Phi]spmdMergePhiOverride  // phi -> override info (for multi-predecessor merge phis)
-	spmdSwitchChains        []spmdSwitchChain                  // detected varying switch chains
-	spmdSwitchIfBlocks      map[int]int                        // ifBlock.Index -> chain index in spmdSwitchChains
-	spmdSwitchBodyBlocks    map[int]int                        // bodyBlock.Index -> chain index in spmdSwitchChains
-	spmdSwitchRemainingMask llvm.Value                         // remaining mask during switch chain compilation
-	spmdDeferredSwitchPhis  []spmdDeferredSwitchPhi            // switch.done phis deferred until all case masks are ready
-	spmdErasedSwitchPhis    map[llvm.Value]bool                // LLVM phi values that were erased during deferred switch phi resolution
 	spmdCondChains          map[int]*spmdCondChain             // outerIfBlock.Index -> chain
 	spmdCondChainInner      map[int]*spmdCondChain             // innerBlock.Index -> chain (lookup)
 	spmdPeeledLoops         map[*spmdActiveLoop]*spmdPeeledLoop // peeled loop state (nil if not peeled)
@@ -1510,10 +1504,6 @@ func (b *builder) createFunction() {
 		b.spmdBreakRedirects = make(map[int]spmdBreakRedirect)
 		b.spmdBreakPhiOverrides = make(map[*ssa.Phi]llvm.Value)
 		b.spmdMergePhiOverrides = make(map[*ssa.Phi]spmdMergePhiOverride)
-		b.spmdSwitchChains = nil
-		b.spmdSwitchIfBlocks = make(map[int]int)
-		b.spmdSwitchBodyBlocks = make(map[int]int)
-
 		// SPMD: pre-detect varying ifs before compiling blocks.
 		// This is necessary so that phis at merge blocks can be converted to
 		// selects when they're compiled. Without this, phis would be compiled
@@ -1752,52 +1742,6 @@ func (b *builder) createFunction() {
 		}
 		if b.fn.Name() == "init" && len(block.Instrs) == 0 {
 			b.CreateRetVoid()
-		}
-	}
-
-	// SPMD: resolve deferred switch phis BEFORE loop peeling tail emission.
-	// emitSPMDTailBody re-processes body blocks including switch comparisons,
-	// which overwrites chain.cases[i].caseMask. Deferred phi resolution must
-	// read the main-phase caseMask values, so it runs first.
-	//
-	// spmdErasedSwitchPhis tracks which LLVM phi VALUES (by pointer) have been
-	// resolved and erased, including both main-phase and tail-phase phis.
-	// Using the LLVM value as key (not the SSA phi) allows correct handling:
-	// the tail body creates separate LLVM phi placeholders for the same SSA phi,
-	// so SSA-keyed tracking would incorrectly skip tail-phase resolution.
-	// emitSPMDTailBody also records its erasures here so NeedsStackObjects
-	// tracking can skip freed phi values.
-	b.spmdErasedSwitchPhis = make(map[llvm.Value]bool, len(b.spmdDeferredSwitchPhis))
-	for _, dsp := range b.spmdDeferredSwitchPhis {
-		// Place the cascaded select at the position of the deferred phi placeholder.
-		// LLVM instructions that use this phi were emitted during block traversal
-		// and are positioned after the phi in the same block, so placing the select
-		// at the phi location ensures it dominates all uses. Placing it before the
-		// block terminator would cause domination violations.
-		b.SetInsertPointBefore(dsp.llvm)
-		selectVal, ok := b.spmdCreateSwitchMergeSelect(dsp.phi, dsp.chainIdx)
-		if ok {
-			// Normalize selectVal to match the placeholder phi's type.
-			// spmdCreateSwitchMergeSelect may produce <N x iW> (WASM mask format)
-			// when the phi is Varying[bool] (<N x i1>), because case values from
-			// BinOp comparisons are wrapped to WASM format inside the cascaded
-			// select. The placeholder was created with getLLVMType (which returns
-			// <N x i1> for bool), so we must truncate back before ReplaceAllUsesWith
-			// to prevent downstream instructions (e.g. reduce.Any → anytrue.v4i1)
-			// from having their operand silently changed to <N x iW> by LLVM.
-			phiLLVMType := dsp.llvm.Type()
-			if selectVal.Type() != phiLLVMType {
-				if phiLLVMType.TypeKind() == llvm.VectorTypeKind &&
-					selectVal.Type().TypeKind() == llvm.VectorTypeKind &&
-					phiLLVMType.ElementType() == b.ctx.Int1Type() {
-					selectVal = b.CreateTrunc(selectVal, phiLLVMType, "spmd.bool.trunc")
-				}
-			}
-			dsp.llvm.ReplaceAllUsesWith(selectVal)
-			dsp.llvm.EraseFromParentAsInstruction()
-			// Update locals cache so subsequent getValue calls return the select.
-			b.locals[dsp.phi] = selectVal
-			b.spmdErasedSwitchPhis[dsp.llvm] = true
 		}
 	}
 
@@ -2100,76 +2044,6 @@ func (b *builder) createFunction() {
 			continue
 		}
 
-		// SPMD: skip deferred switch phis entirely — they'll be resolved below.
-		isDeferredSwitch := false
-		for _, dsp := range b.spmdDeferredSwitchPhis {
-			if dsp.phi == phi.ssa {
-				isDeferredSwitch = true
-				break
-			}
-		}
-		if isDeferredSwitch {
-			continue
-		}
-
-		// SPMD: handle collapsed switch.done blocks. When go/ssa eliminates
-		// switch.done (merging it into the loop block), all switch body/comparison
-		// predecessors become direct predecessors of the loop block in SSA. But in
-		// LLVM, after varying switch linearization, only the LAST body block
-		// branches to the loop block. Skip edges from other switch chain members.
-		// Note: isDeferredSwitch is always false here (we continue'd above for those).
-		if chainIdx := b.spmdIsSwitchDoneBlock(phi.ssa.Block().Index); chainIdx >= 0 {
-			chain := &b.spmdSwitchChains[chainIdx]
-			// Determine the "last block" in the linearized chain — the one that
-			// actually branches to doneBlock in LLVM.
-			lastBodyIdx := -1
-			if chain.defaultBody >= 0 {
-				lastBodyIdx = chain.defaultBody
-			} else if len(chain.cases) > 0 {
-				lastBodyIdx = chain.cases[len(chain.cases)-1].bodyBlock
-			}
-
-			// Build a set of switch chain member block indices.
-			chainMembers := make(map[int]bool)
-			for _, c := range chain.cases {
-				chainMembers[c.ifBlock] = true
-				chainMembers[c.bodyBlock] = true
-			}
-			if chain.defaultBody >= 0 {
-				chainMembers[chain.defaultBody] = true
-			}
-
-			// Check whether this phi actually has any chain member predecessors.
-			// If the collapsed doneBlock has chain members among its SSA preds, we
-			// must filter them. If not (e.g., a non-related phi at the same block),
-			// fall through to normal processing.
-			hasChainPred := false
-			for _, pred := range phi.ssa.Block().Preds {
-				if chainMembers[pred.Index] {
-					hasChainPred = true
-					break
-				}
-			}
-
-			if hasChainPred {
-				block := phi.ssa.Block()
-				for i, edge := range phi.ssa.Edges {
-					pred := block.Preds[i]
-					if chainMembers[pred.Index] && pred.Index != lastBodyIdx {
-						continue // Skip: this block doesn't branch to doneBlock in LLVM
-					}
-					val := b.getValue(edge, getPos(phi.ssa))
-					val = b.spmdRangeIndexInitOverride(phi.ssa, i, val)
-					llvmBlock := b.blockInfo[pred.Index].exit
-					if llvmBlock.IsNil() {
-						llvmBlock = b.blockInfo[pred.Index].entry
-					}
-					phi.llvm.AddIncoming([]llvm.Value{val}, []llvm.BasicBlock{llvmBlock})
-				}
-				continue // Skip normal edge processing for this phi
-			}
-		}
-
 		// SPMD: skip phis in peeled done blocks — they're wired manually below.
 		// After loop peeling, the done block's LLVM predecessors are
 		// [tailCheckBlock, tailBodyExitBlock], not the original SSA predecessors.
@@ -2375,14 +2249,10 @@ func (b *builder) createFunction() {
 	}
 
 	if b.NeedsStackObjects {
-		// Track phi nodes. Skip erased deferred switch phis (their LLVM values
-		// were freed by EraseFromParentAsInstruction and must not be accessed).
-		// Also skip phis whose llvm field was zeroed during tail-phase resolution.
+		// Track phi nodes. Skip phis whose llvm field was zeroed during
+		// tail-phase resolution.
 		for _, phi := range b.phis {
 			if phi.llvm.IsNil() {
-				continue
-			}
-			if b.spmdErasedSwitchPhis[phi.llvm] {
 				continue
 			}
 			insertPoint := llvm.NextInstruction(phi.llvm)
@@ -2572,12 +2442,6 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 				}
 			}
 		}
-		// SPMD: check for switch chain If before other varying-if handling.
-		if chainIdx, ok := b.spmdSwitchIfBlocks[block.Index]; ok {
-			b.spmdCompileSwitchIf(block, cond, chainIdx)
-			b.CreateBr(blockThen) // linearize: always branch to body
-			break
-		}
 		// SPMD: check for condition chain (&&/||) head or inner block.
 		if chain, ok := b.spmdCondChains[block.Index]; ok {
 			// Chain head: start combining conditions.
@@ -2687,36 +2551,6 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			b.CreateCondBr(cond, blockThen, blockElse)
 		}
 	case *ssa.Jump:
-		// SPMD: check for switch body block Jump (redirect to next comparison or done).
-		// Must be checked BEFORE loop peeling redirects, because switch body blocks
-		// may jump to rangeindex.loop (which triggers the tail-exit redirect), but
-		// they need to be redirected to the next switch case comparison instead.
-		if chainIdx, ok := b.spmdSwitchBodyBlocks[instr.Block().Index]; ok {
-			b.spmdPopMask() // pop the case mask pushed at body entry
-			chain := &b.spmdSwitchChains[chainIdx]
-			target := b.spmdSwitchBodyJumpTarget(instr.Block(), chain)
-
-			// In tail phase, if the switch's doneBlock is a loop block (common when
-			// there's no explicit switch.done — body blocks jump directly to the loop),
-			// the last case body's target would be the main-phase loop block (not in
-			// bodyBlockSet). Redirect to tailExitBlock instead.
-			if b.spmdPeeledLoops != nil && b.spmdLoopState != nil {
-				if loop, ok := b.spmdLoopState.loopBlocks[chain.doneBlock]; ok {
-					if peeled, ok := b.spmdPeeledLoops[loop]; ok && peeled.phase == spmdLoopPhaseTail {
-						// Only redirect if this is the target that would branch to the loop block.
-						// Check if target matches the loop block's blockInfo entry.
-						if target == b.blockInfo[chain.doneBlock].entry {
-							peeled.tailBodyExitBlock = b.GetInsertBlock()
-							b.CreateBr(peeled.tailExitBlock)
-							break
-						}
-					}
-				}
-			}
-
-			b.CreateBr(target)
-			break
-		}
 		// SPMD loop peeling: tail body Jump to loop block → redirect to tail exit.
 		// During tail phase emission, jumps that would normally go back to the loop
 		// block (the loop-back edge) must be redirected to tailExitBlock instead,
@@ -4248,73 +4082,6 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			return b.createMapIteratorNext(rangeVal, llvmRangeVal, it), nil
 		}
 	case *ssa.Phi:
-		// SPMD: check for switch merge phi. In DomPreorder, switch.done may be
-		// visited before the switch.next comparison blocks, so case masks may not
-		// yet be computed. Create a placeholder phi and defer the cascaded select.
-		//
-		// When go/ssa eliminates a switch.done block (because it has no phis and
-		// would just Jump), it merges switch.done into the successor (e.g., the
-		// loop block). All case bodies then jump directly to that successor, making
-		// it the "collapsed" switch.done. Phis at such a block may be iteration
-		// counter phis — NOT merge phis — and must not be deferred. Only defer a
-		// phi when it has at least one edge from a case body that carries a
-		// potentially different value (isMergePhi).
-		if chainIdx := b.spmdIsSwitchDoneBlock(expr.Block().Index); chainIdx >= 0 {
-			chain := &b.spmdSwitchChains[chainIdx]
-			chainMembers := make(map[int]bool)
-			for _, c := range chain.cases {
-				chainMembers[c.bodyBlock] = true
-			}
-			if chain.defaultBody >= 0 {
-				chainMembers[chain.defaultBody] = true
-			}
-			hasSwitchEdge := false
-			for i := range expr.Edges {
-				if chainMembers[expr.Block().Preds[i].Index] {
-					hasSwitchEdge = true
-					break
-				}
-			}
-			isMergePhi := false
-			if hasSwitchEdge {
-				// A merge phi has at least two distinct values from case body edges,
-				// or at least one case body edge with a different value than the others.
-				var firstEdgeVal ssa.Value
-				for i, edge := range expr.Edges {
-					if !chainMembers[expr.Block().Preds[i].Index] {
-						continue
-					}
-					if firstEdgeVal == nil {
-						firstEdgeVal = edge
-					} else if edge != firstEdgeVal {
-						isMergePhi = true
-						break
-					}
-				}
-			}
-			if isMergePhi {
-				phiType := b.getLLVMType(expr.Type())
-				// SPMD: the go/ssa phi type reflects the declared Go variable type
-				// (e.g., int → i32), not the runtime varying type. Vectorize it so
-				// the placeholder phi has the correct type from the start, preventing
-				// type mismatches in downstream icmp/trunc instructions that use it.
-				laneCount := b.spmdSwitchLaneCount(chainIdx)
-				if laneCount > 0 && phiType.TypeKind() != llvm.VectorTypeKind {
-					phiType = llvm.VectorType(phiType, laneCount)
-				}
-				phi := b.CreatePHI(phiType, "switch.merge.deferred")
-				b.phis = append(b.phis, phiNode{expr, phi})
-				b.spmdDeferredSwitchPhis = append(b.spmdDeferredSwitchPhis, spmdDeferredSwitchPhi{
-					phi:      expr,
-					llvm:     phi,
-					chainIdx: chainIdx,
-				})
-				return phi, nil
-			}
-			// Not a merge phi (e.g., iteration counter at collapsed switch.done).
-			// Fall through to normal phi handling; the phi resolution loop will
-			// skip edges from switch chain members that don't branch here in LLVM.
-		}
 		// SPMD: check for break result phi.
 		if b.spmdForLoops != nil {
 			for _, loop := range b.spmdForLoops {

@@ -678,11 +678,11 @@ func (b *builder) spmdLoopHasAccumulatorPhis(loop *spmdActiveLoop) bool {
 }
 
 // spmdLoopBodyHasVaryingControlFlow returns true if any block dominated by
-// the loop body contains varying control flow (varying if/else, compound
-// boolean chains, or varying switch). Checks spmdVaryingIfs and
-// spmdSwitchIfBlocks which cover all varying control flow patterns
-// (including cases where spmdMaskTransitions is incomplete, such as LOR
-// chains skipping then/else transitions and loop headers skipping merge pops).
+// the loop body contains varying control flow (varying if/else or compound
+// boolean chains). Checks spmdVaryingIfs which covers all varying control flow
+// patterns (including cases where spmdMaskTransitions is incomplete, such as
+// LOR chains skipping then/else transitions and loop headers skipping merge
+// pops).
 func (b *builder) spmdLoopBodyHasVaryingControlFlow(loop *spmdActiveLoop) bool {
 	for idx, l := range b.spmdLoopState.bodyBlocks {
 		if l != loop {
@@ -695,11 +695,6 @@ func (b *builder) spmdLoopBodyHasVaryingControlFlow(loop *spmdActiveLoop) bool {
 			}
 			// Varying if/else (includes && and || chain outer blocks).
 			if _, ok := b.spmdVaryingIfs[block.Index]; ok {
-				return true
-			}
-			// Varying switch comparison blocks (switch head may be the
-			// body block itself when go/ssa merges the first comparison).
-			if _, ok := b.spmdSwitchIfBlocks[block.Index]; ok {
 				return true
 			}
 		}
@@ -1402,32 +1397,6 @@ type spmdVaryingIf struct {
 	isValueLOR bool
 }
 
-// spmdSwitchCase holds per-case mask info within a switch chain.
-type spmdSwitchCase struct {
-	ifBlock   int        // block index of the switch.next If instruction
-	bodyBlock int        // block index of the switch.body
-	caseMask  llvm.Value // computed at compile time: remainingMask & condition
-}
-
-// spmdSwitchChain holds a detected varying switch chain.
-type spmdSwitchChain struct {
-	cases       []spmdSwitchCase
-	defaultBody int       // block index of default case body (-1 if none)
-	doneBlock   int       // block index of switch.done merge
-	tagValue    ssa.Value // the switch tag SSA value (for reference)
-}
-
-// spmdDeferredSwitchPhi tracks a phi at switch.done that needs deferred resolution.
-// In DomPreorder, switch.done can be visited before the switch.next comparison blocks,
-// so case masks may not yet be computed when the phi is first encountered. The phi is
-// created as a normal LLVM phi during createExpr, and the cascaded select is built
-// after all blocks have been processed (when all case masks are available).
-type spmdDeferredSwitchPhi struct {
-	phi      *ssa.Phi   // SSA phi at switch.done
-	llvm     llvm.Value // LLVM phi (placeholder — will be replaced)
-	chainIdx int        // index into spmdSwitchChains
-}
-
 // spmdCondChain describes a chain of short-circuit boolean conditions (&&/||)
 // detected from cond.true/cond.false SSA patterns. Instead of treating each
 // block's If as a separate varying if, the chain is collapsed into a single
@@ -1938,11 +1907,6 @@ func (b *builder) spmdPopulateCondChains() {
 // spmdMergeSelects map. This must be done before compiling blocks so that
 // phis at merge blocks can be converted to selects.
 func (b *builder) preDetectVaryingIfs() {
-	// Detect varying switch chains first, so that the individual varying-if
-	// detection below can skip switch.next blocks (preventing map collisions
-	// in spmdMergeSelects where all cases share the same switch.done merge).
-	b.spmdPopulateSwitchChains()
-
 	// Populate condition chains from go/ssa metadata.
 	b.spmdPopulateCondChains()
 
@@ -1958,11 +1922,6 @@ func (b *builder) preDetectVaryingIfs() {
 		}
 		ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If)
 		if !ok {
-			continue
-		}
-
-		// Skip if this block is part of a switch chain (will be handled separately).
-		if _, isSwitch := b.spmdSwitchIfBlocks[block.Index]; isSwitch {
 			continue
 		}
 
@@ -1985,39 +1944,6 @@ func (b *builder) preDetectVaryingIfs() {
 			if info, ok := b.spmdVaryingIfs[block.Index]; ok {
 				b.spmdAnalyzeCoalescedStores(info)
 			}
-		}
-	}
-}
-
-// spmdPopulateSwitchChains converts the go/ssa SPMDSwitchChain metadata into
-// the internal spmdSwitchChain format and populates spmdSwitchIfBlocks and
-// spmdSwitchBodyBlocks maps.
-func (b *builder) spmdPopulateSwitchChains() {
-	for _, ssaChain := range b.fn.SPMDSwitchChains {
-		chain := spmdSwitchChain{
-			defaultBody: -1,
-			doneBlock:   ssaChain.DoneBlock.Index,
-			tagValue:    ssaChain.TagValue,
-		}
-		for _, ifInstr := range ssaChain.Cases {
-			ifBlock := ifInstr.Block()
-			chain.cases = append(chain.cases, spmdSwitchCase{
-				ifBlock:   ifBlock.Index,
-				bodyBlock: ifBlock.Succs[0].Index,
-				caseMask:  llvm.Value{},
-			})
-		}
-		if ssaChain.DefaultBlock != nil {
-			chain.defaultBody = ssaChain.DefaultBlock.Index
-		}
-		chainIdx := len(b.spmdSwitchChains)
-		b.spmdSwitchChains = append(b.spmdSwitchChains, chain)
-		for i := range chain.cases {
-			b.spmdSwitchIfBlocks[chain.cases[i].ifBlock] = chainIdx
-			b.spmdSwitchBodyBlocks[chain.cases[i].bodyBlock] = chainIdx
-		}
-		if chain.defaultBody != -1 {
-			b.spmdSwitchBodyBlocks[chain.defaultBody] = chainIdx
 		}
 	}
 }
@@ -5555,281 +5481,6 @@ func (b *builder) spmdIsVaryingBreak(ifBlock *ssa.BasicBlock) (*spmdForLoopInfo,
 	return nil, false
 }
 
-// spmdCompileSwitchIf compiles a switch.next If instruction. This is the
-// compilation-time handler (called from the *ssa.If case) that computes the
-// case mask via sequential narrowing and registers mask transitions.
-//
-// Algorithm (ISPC approach):
-//
-//	remainingMask = currentMask (for first case) or b.spmdSwitchRemainingMask (subsequent)
-//	caseMask = remainingMask & cond
-//	remainingMask = remainingMask & ~cond
-//
-// For the last case, also handles the default body by pushing the remaining mask.
-func (b *builder) spmdCompileSwitchIf(block *ssa.BasicBlock, cond llvm.Value, chainIdx int) {
-	chain := &b.spmdSwitchChains[chainIdx]
-
-	// Find which case index this block is.
-	caseIdx := -1
-	for i := range chain.cases {
-		if chain.cases[i].ifBlock == block.Index {
-			caseIdx = i
-			break
-		}
-	}
-	if caseIdx == -1 {
-		return
-	}
-
-	// Get the remaining mask.
-	var remainingMask llvm.Value
-	if caseIdx == 0 {
-		// First case: use current mask from stack.
-		remainingMask = b.spmdCurrentMask()
-		if remainingMask.IsNil() {
-			// No mask on stack — use all-ones.
-			remainingMask = llvm.ConstAllOnes(cond.Type())
-		}
-	} else {
-		// Subsequent case: use the remaining mask from previous case.
-		remainingMask = b.spmdSwitchRemainingMask
-	}
-
-	// Ensure cond matches the mask type. On WASM the mask stack uses <N x i8/i16/i32>
-	// but the comparison result is <N x i1>. Wrap the condition to the mask format.
-	if cond.Type().TypeKind() == llvm.VectorTypeKind &&
-		remainingMask.Type().TypeKind() == llvm.VectorTypeKind &&
-		cond.Type().ElementType() != remainingMask.Type().ElementType() {
-		laneCount := cond.Type().VectorSize()
-		cond = b.spmdWrapMask(cond, laneCount)
-	}
-
-	// Compute case mask: remainingMask & cond.
-	caseMask := b.CreateAnd(remainingMask, cond, "switch.case.mask")
-	chain.cases[caseIdx].caseMask = caseMask
-
-	// Update remaining mask: remainingMask & ~cond.
-	notCond := b.CreateNot(cond, "")
-	b.spmdSwitchRemainingMask = b.CreateAnd(remainingMask, notCond, "switch.remaining")
-
-	// Register mask transition for the body block (push caseMask directly).
-	// spmdMaskTransitions is always initialized by createFunction when SPMD is active.
-	bodyBlockIdx := chain.cases[caseIdx].bodyBlock
-	b.spmdMaskTransitions[bodyBlockIdx] = &spmdMaskTransition{kind: "pushDirect", cond: caseMask}
-
-	// For the last case, also handle the default body (if any).
-	if caseIdx == len(chain.cases)-1 && chain.defaultBody != -1 {
-		defaultMask := b.spmdSwitchRemainingMask
-		b.spmdMaskTransitions[chain.defaultBody] = &spmdMaskTransition{kind: "pushDirect", cond: defaultMask}
-	}
-}
-
-// spmdSwitchBodyJumpTarget determines the target block for a Jump instruction
-// at the end of a switch case body. Returns the next switch.next comparison block,
-// the default body, or switch.done, depending on the case position in the chain.
-func (b *builder) spmdSwitchBodyJumpTarget(block *ssa.BasicBlock, chain *spmdSwitchChain) llvm.BasicBlock {
-	// Find which case this body belongs to.
-	for i, c := range chain.cases {
-		if c.bodyBlock == block.Index {
-			// This body is for case i. Next target:
-			if i+1 < len(chain.cases) {
-				// Next case comparison block.
-				nextIfIdx := chain.cases[i+1].ifBlock
-				return b.blockInfo[nextIfIdx].entry
-			}
-			// Last case: go to default body or switch.done.
-			if chain.defaultBody != -1 {
-				return b.blockInfo[chain.defaultBody].entry
-			}
-			return b.blockInfo[chain.doneBlock].entry
-		}
-	}
-
-	// Default body: go to switch.done.
-	if chain.defaultBody == block.Index {
-		return b.blockInfo[chain.doneBlock].entry
-	}
-
-	// Fallback: should not happen for well-formed switch chains.
-	// All body blocks must be either a case body or the default body.
-	return b.blockInfo[chain.doneBlock].entry
-}
-
-// spmdIsSwitchDoneBlock returns the chain index if blockIdx is a switch.done merge
-// block for a detected varying switch chain, or -1 if not.
-func (b *builder) spmdIsSwitchDoneBlock(blockIdx int) int {
-	for i := range b.spmdSwitchChains {
-		if b.spmdSwitchChains[i].doneBlock == blockIdx {
-			return i
-		}
-	}
-	return -1
-}
-
-// spmdSwitchLaneCount returns the SPMD lane count for a switch chain by finding
-// the active SPMD loop whose body block dominates the switch. Returns 0 if not
-// inside any SPMD loop.
-//
-// The switch.done block is not directly registered in bodyBlocks or loopBlocks —
-// those maps only hold the entry block of each SPMD loop. To find the enclosing
-// loop, we check whether any loop's body block dominates one of the switch's
-// comparison (ifBlock) or case body blocks.
-func (b *builder) spmdSwitchLaneCount(chainIdx int) int {
-	if b.spmdLoopState == nil {
-		return 0
-	}
-	chain := &b.spmdSwitchChains[chainIdx]
-
-	// Collect candidate blocks from the switch chain to test for domination.
-	// Use ifBlocks (the switch.next comparison blocks) and case body blocks.
-	// Precondition: a valid switch chain always has at least one case or default body.
-	var candidates []*ssa.BasicBlock
-	for _, c := range chain.cases {
-		if c.ifBlock >= 0 && c.ifBlock < len(b.fn.Blocks) {
-			candidates = append(candidates, b.fn.Blocks[c.ifBlock])
-		}
-		if c.bodyBlock >= 0 && c.bodyBlock < len(b.fn.Blocks) {
-			candidates = append(candidates, b.fn.Blocks[c.bodyBlock])
-		}
-	}
-	if chain.defaultBody >= 0 && chain.defaultBody < len(b.fn.Blocks) {
-		candidates = append(candidates, b.fn.Blocks[chain.defaultBody])
-	}
-
-	// Find a loop whose body block dominates any candidate block.
-	for bodyIdx, loop := range b.spmdLoopState.bodyBlocks {
-		bodyBlock := b.fn.Blocks[bodyIdx]
-		for _, candidate := range candidates {
-			if bodyBlock.Dominates(candidate) {
-				return loop.laneCount
-			}
-		}
-	}
-	return 0
-}
-
-// spmdCreateSwitchMergeSelect creates the cascaded select instructions for a
-// phi at switch.done. This merges values from all case bodies using the case
-// masks computed during switch compilation.
-//
-// Algorithm:
-//
-//	result = defaultValue (or zero if no default)
-//	for each case i (first to last):
-//	  result = select(caseMask[i], caseValue[i], result)
-func (b *builder) spmdCreateSwitchMergeSelect(phi *ssa.Phi, chainIdx int) (llvm.Value, bool) {
-	chain := &b.spmdSwitchChains[chainIdx]
-
-	// Map each phi edge to its source: case body, default body, or "entry".
-	var entryEdgeIdx = -1
-	var defaultEdgeIdx = -1
-	caseEdges := make(map[int]int) // caseIdx -> edgeIdx
-
-	for i, pred := range phi.Block().Preds {
-		if chain.defaultBody != -1 && pred.Index == chain.defaultBody {
-			defaultEdgeIdx = i
-		} else {
-			found := false
-			for ci, c := range chain.cases {
-				if pred.Index == c.bodyBlock {
-					caseEdges[ci] = i
-					found = true
-					break
-				}
-			}
-			if !found {
-				// Check if pred is reachable from a case body (multi-block case bodies).
-				for ci, c := range chain.cases {
-					bodyBlock := b.fn.Blocks[c.bodyBlock]
-					if b.spmdIsReachableFrom(bodyBlock, pred, phi.Block()) {
-						caseEdges[ci] = i
-						found = true
-						break
-					}
-				}
-			}
-			if !found {
-				entryEdgeIdx = i // This is the pre-switch edge.
-			}
-		}
-	}
-
-	// Build cascaded select. Start with the entry/default value.
-	var result llvm.Value
-	phiType := b.getLLVMType(phi.Type())
-
-	// SPMD: the go/ssa phi type comes from the declared Go variable (e.g., int),
-	// not the runtime varying type. Vectorize it so downstream icmp/trunc get the
-	// correct vector type instead of a scalar.
-	laneCount := b.spmdSwitchLaneCount(chainIdx)
-	if laneCount > 0 && phiType.TypeKind() != llvm.VectorTypeKind {
-		phiType = llvm.VectorType(phiType, laneCount)
-	}
-
-	if defaultEdgeIdx >= 0 {
-		result = b.getValue(phi.Edges[defaultEdgeIdx], getPos(phi))
-	} else if entryEdgeIdx >= 0 {
-		result = b.getValue(phi.Edges[entryEdgeIdx], getPos(phi))
-	} else {
-		result = llvm.ConstNull(phiType)
-	}
-
-	// Ensure the initial result is a vector when we are in an SPMD loop.
-	// getValue may return a scalar constant (e.g., i32 0) when the phi type
-	// is not wrapped in SPMDType.
-	if laneCount > 0 && result.Type().TypeKind() != llvm.VectorTypeKind {
-		result = b.splatScalar(result, phiType)
-	}
-
-	// Apply cascaded selects from first case to last.
-	for ci := 0; ci < len(chain.cases); ci++ {
-		edgeIdx, ok := caseEdges[ci]
-		if !ok {
-			continue // Case body doesn't contribute to this phi.
-		}
-		caseVal := b.getValue(phi.Edges[edgeIdx], getPos(phi))
-		caseMask := chain.cases[ci].caseMask
-		if caseMask.IsNil() {
-			continue
-		}
-
-		// Ensure case value is vectorized for SPMD context.
-		if laneCount > 0 && caseVal.Type().TypeKind() != llvm.VectorTypeKind {
-			caseVal = b.splatScalar(caseVal, phiType)
-		}
-
-		// Broadcast match if needed.
-		caseVal, result = b.spmdBroadcastMatch(caseVal, result)
-
-		// On WASM, bool vectors may come as <N x i1> (raw comparison, Varying[bool])
-		// while other values use <N x iW> (WASM mask format). Normalize both operands
-		// to the same type before spmdMaskSelect, which uses bitwise ops that require
-		// matching element types. If either is <N x i1> and the other is <N x iW>,
-		// wrap the i1 one to match.
-		if b.spmdIsWASM() &&
-			caseVal.Type().TypeKind() == llvm.VectorTypeKind &&
-			result.Type().TypeKind() == llvm.VectorTypeKind &&
-			caseVal.Type() != result.Type() {
-			lc := caseVal.Type().VectorSize()
-			if caseVal.Type().ElementType() == b.ctx.Int1Type() {
-				caseVal = b.spmdWrapMask(caseVal, lc)
-			} else if result.Type().ElementType() == b.ctx.Int1Type() {
-				result = b.spmdWrapMask(result, lc)
-			}
-		}
-
-		if caseVal.Type().TypeKind() == llvm.VectorTypeKind || result.Type().TypeKind() == llvm.VectorTypeKind {
-			result = b.spmdMaskSelect(caseMask, caseVal, result)
-		} else {
-			// Scalar: reduce mask to scalar.
-			scalarCond := b.spmdVectorAnyTrue(caseMask)
-			result = b.CreateSelect(scalarCond, caseVal, result, "")
-		}
-	}
-
-	return result, true
-}
-
 // spmdVectorIndex handles *ssa.Index when the index is a vector type (varying).
 // Dispatches to string or array handlers based on the collection type.
 func (b *builder) spmdVectorIndex(expr *ssa.Index, collection, index llvm.Value) (llvm.Value, error) {
@@ -6510,14 +6161,6 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 	// they branch to tailExitBlock. This captures the actual LLVM block (which
 	// may be a load-merge block etc., not the originally created tail body block).
 
-	// Resolve tail-phase deferred switch phis before restoring b.locals.
-	// emitSPMDTailBody processes switch body blocks and creates new LLVM phi
-	// placeholders (via createExpr → deferred phi path) in the tail blocks.
-	// Those phis must be resolved NOW, while b.locals contains tail-phase values
-	// and chain.cases[i].caseMask holds tail-phase masks. After state is
-	// restored, b.locals reverts to main-phase values and the case body
-	// instructions would no longer dominate the tail switch.done block.
-	//
 	// Identify tail-phase phis by checking if their parent LLVM block is one of
 	// the tail blocks created for this peeled loop.
 	tailBlockSet := make(map[llvm.BasicBlock]bool, len(peeled.tailBlockInfo))
@@ -6528,41 +6171,6 @@ func (b *builder) emitSPMDTailBody(peeled *spmdPeeledLoop) {
 	}
 	if !peeled.tailCheckBlock.IsNil() {
 		tailBlockSet[peeled.tailCheckBlock] = true
-	}
-	for _, dsp := range b.spmdDeferredSwitchPhis {
-		if dsp.llvm.IsNil() {
-			continue
-		}
-		// Skip phis already resolved (and erased) by the main-phase resolution
-		// loop. Calling InstructionParent on an erased LLVM value is a
-		// use-after-free crash because the underlying C memory is freed.
-		if b.spmdErasedSwitchPhis[dsp.llvm] {
-			continue
-		}
-		parentBB := dsp.llvm.InstructionParent()
-		if !tailBlockSet[parentBB] {
-			continue // Main-phase phi; handled by the main resolution loop.
-		}
-		b.SetInsertPointBefore(dsp.llvm)
-		selectVal, ok := b.spmdCreateSwitchMergeSelect(dsp.phi, dsp.chainIdx)
-		if ok {
-			// Normalize selectVal to match the placeholder phi's type.
-			// See the identical block in createFunction for the full rationale.
-			phiLLVMType := dsp.llvm.Type()
-			if selectVal.Type() != phiLLVMType {
-				if phiLLVMType.TypeKind() == llvm.VectorTypeKind &&
-					selectVal.Type().TypeKind() == llvm.VectorTypeKind &&
-					phiLLVMType.ElementType() == b.ctx.Int1Type() {
-					selectVal = b.CreateTrunc(selectVal, phiLLVMType, "spmd.bool.trunc")
-				}
-			}
-			dsp.llvm.ReplaceAllUsesWith(selectVal)
-			dsp.llvm.EraseFromParentAsInstruction()
-			b.locals[dsp.phi] = selectVal
-			// Record in b.spmdErasedSwitchPhis so the NeedsStackObjects loop
-			// in createFunction doesn't attempt to access the freed LLVM value.
-			b.spmdErasedSwitchPhis[dsp.llvm] = true
-		}
 	}
 
 	// Resolve tail-phase merge phi overrides (LOR value expressions and
