@@ -198,8 +198,6 @@ type builder struct {
 	spmdBreakRedirects      map[int]spmdBreakRedirect          // then-block index -> break redirect info
 	spmdBreakPhiOverrides   map[*ssa.Phi]llvm.Value            // phi -> final value (for break result phis at rangeint.done)
 	spmdMergePhiOverrides   map[*ssa.Phi]spmdMergePhiOverride  // phi -> override info (for multi-predecessor merge phis)
-	spmdCondChains          map[int]*spmdCondChain             // outerIfBlock.Index -> chain
-	spmdCondChainInner      map[int]*spmdCondChain             // innerBlock.Index -> chain (lookup)
 	spmdPeeledLoops         map[*spmdActiveLoop]*spmdPeeledLoop // peeled loop state (nil if not peeled)
 }
 
@@ -2078,16 +2076,7 @@ func (b *builder) createFunction() {
 			// SPMD: handle merge phi overrides (multi-pred and deferred 2-edge cases).
 			if override, ok := b.spmdMergePhiOverrides[phi.ssa]; ok {
 				// Check if this edge should be skipped (redirected away after linearization).
-				shouldSkip := (i == override.skipEdgeIdx)
-				if !shouldSkip && len(override.skipEdgeIdxs) > 0 {
-					for _, idx := range override.skipEdgeIdxs {
-						if i == idx {
-							shouldSkip = true
-							break
-						}
-					}
-				}
-				if shouldSkip {
+				if i == override.skipEdgeIdx {
 					continue
 				}
 				if i == override.thenEdgeIdx || i == override.elseEdgeIdx {
@@ -2441,74 +2430,6 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 					}
 				}
 			}
-		}
-		// SPMD: check for condition chain (&&/||) head or inner block.
-		if chain, ok := b.spmdCondChains[block.Index]; ok {
-			// Chain head: start combining conditions.
-			chain.combinedCond = cond
-			// Linearize: branch to the first inner block.
-			// For && (LAND): inner is Succs[0] (cond.true)
-			// For || (LOR): inner is Succs[1] (cond.false)
-			if chain.op == token.LAND {
-				b.CreateBr(blockThen) // Succs[0] = cond.true
-			} else {
-				b.CreateBr(blockElse) // Succs[1] = cond.false
-			}
-			break
-		}
-		if chain, ok := b.spmdCondChainInner[block.Index]; ok {
-			// Inner block: combine condition with running chain.
-			// Normalize mask formats: on WASM, comparisons produce <N x i1> but
-			// values from bool phis may be in mask format <N x iW>. Both operands
-			// must match for bitwise AND/OR.
-			lhs := chain.combinedCond
-			rhs := cond
-			if lhs.Type() != rhs.Type() {
-				rhs = b.spmdMatchMaskFormat(rhs, lhs)
-				if lhs.Type() != rhs.Type() {
-					lhs = b.spmdMatchMaskFormat(chain.combinedCond, rhs)
-				}
-			}
-			if chain.op == token.LAND {
-				chain.combinedCond = b.CreateAnd(lhs, rhs, "spmd.chain.and")
-			} else {
-				chain.combinedCond = b.CreateOr(lhs, rhs, "spmd.chain.or")
-			}
-			// Check if this is the last inner block in the chain.
-			isLast := chain.innerBlocks[len(chain.innerBlocks)-1] == block.Index
-			if isLast {
-				// Last block: use combined condition for the full varying if.
-				// Call spmdDetectVaryingIf on the OUTER block with combined cond.
-				outerBlock := b.fn.Blocks[chain.outerIfBlock]
-				b.spmdDetectVaryingIf(outerBlock, chain.combinedCond)
-			}
-			// Linearize: branch to next in chain or to then-body.
-			// For && (LAND): always Succs[0] (next cond.true, or if.then for last)
-			// For || (LOR), non-last: Succs[1] (next cond.false)
-			// For || (LOR), last:
-			//   - isValueLOR (VALUE expression A||B||C): Succs[1] (elseTarget) — must evaluate C
-			//   - control-flow OR (if A||B||C): Succs[0] (shared true target = body)
-			if chain.op == token.LAND {
-				b.CreateBr(blockThen) // Succs[0]
-			} else {
-				if isLast {
-					outerBlock := b.fn.Blocks[chain.outerIfBlock]
-					isValueLOR := false
-					if outerInfo, ok := b.spmdVaryingIfs[outerBlock.Index]; ok {
-						isValueLOR = outerInfo.isValueLOR
-					}
-					if isValueLOR {
-						// VALUE LOR: fall through to elseTarget to evaluate the final operand C.
-						// All lanes must evaluate C; the OR result is computed at the merge.
-						b.CreateBr(blockElse) // Succs[1] = elseTarget (e.g., binop.rhs)
-					} else {
-						b.CreateBr(blockThen) // Succs[0] = shared true target (if-then body)
-					}
-				} else {
-					b.CreateBr(blockElse) // Succs[1] = next cond.false
-				}
-			}
-			break
 		}
 		// SPMD: check for varying break pattern before general linearization.
 		if b.spmdFuncIsBody && cond.Type().TypeKind() == llvm.VectorTypeKind {
