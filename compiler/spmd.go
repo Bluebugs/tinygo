@@ -16,6 +16,7 @@ import (
 
 	"github.com/tinygo-org/tinygo/loader"
 	"golang.org/x/tools/go/ssa"
+	spmdtypes "golang.org/x/tools/go/types/spmd"
 	"tinygo.org/x/go-llvm"
 )
 
@@ -466,6 +467,18 @@ func (b *builder) spmdWASMNarrowAndPack(val llvm.Value, targetElemBits uint64) l
 func (c *compilerContext) createSPMDConst(expr *ssa.Const, spmdType *types.SPMDType, pos token.Pos) llvm.Value {
 	vecType := c.getLLVMType(spmdType)
 	if expr.Value == nil {
+		return llvm.ConstNull(vecType)
+	}
+
+	// Varying[mask] element type (MaskType) has no scalar constant form.
+	// Generate all-ones (true) or all-zeros (false) mask vector directly.
+	if spmdtypes.IsMask(spmdType.Elem()) {
+		if expr.Value.Kind() != constant.Bool {
+			panic(fmt.Sprintf("createSPMDConst: Varying[mask] constant has unexpected kind %v", expr.Value.Kind()))
+		}
+		if constant.BoolVal(expr.Value) {
+			return llvm.ConstAllOnes(vecType)
+		}
 		return llvm.ConstNull(vecType)
 	}
 
@@ -6985,4 +6998,104 @@ func (b *builder) spmdExpandMaskForStride(mask llvm.Value, stride, N int) []llvm
 			fmt.Sprintf("interleaved.mask.k%d", k))
 	}
 	return out
+}
+
+// createSPMDSelect emits LLVM IR for an SPMDSelect instruction.
+// SPMDSelect yields X where Mask is active, Y where inactive, per SIMD lane.
+// This is the predicated replacement for Phi at varying merge points.
+//
+// The mask is in platform-native Varying[mask] format (e.g., <4 x i32> on WASM).
+// spmdBroadcastMatch aligns x and y; spmdMaskSelect handles mask-vs-data
+// width mismatches internally (falls back to trunc+CreateSelect on WASM
+// when bitwise select conditions are not met).
+func (b *builder) createSPMDSelect(instr *ssa.SPMDSelect) llvm.Value {
+	mask := b.getValue(instr.Mask, token.NoPos)
+	x := b.getValue(instr.X, token.NoPos)
+	y := b.getValue(instr.Y, token.NoPos)
+
+	// Broadcast scalar operands to vector when needed (e.g., uniform constants).
+	x, y = b.spmdBroadcastMatch(x, y)
+
+	return b.spmdMaskSelect(mask, x, y)
+}
+
+// createSPMDLoad emits LLVM IR for an SPMDLoad instruction.
+// SPMDLoad loads from Addr only for lanes where Mask is active.
+// Inactive lanes receive a zero value. It is the predicated replacement
+// for UnOp{MUL} (pointer dereference) in varying paths.
+//
+// For scalar addresses (uniform pointer), the load is speculative (executed
+// unconditionally) and inactive-lane results are zeroed via mask-select.
+// For vector addresses (varying pointers), a masked gather is used.
+func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
+	addr := b.getValue(instr.Addr, instr.Pos())
+	mask := b.getValue(instr.Mask, instr.Pos())
+
+	// Determine the result type from the SSA result type.
+	resultType := b.getLLVMType(instr.Type())
+
+	laneCount := instr.Lanes
+
+	// If the address is a vector (varying pointers), emit a masked gather.
+	// Lane count is derived from addr's vector size; instr.Lanes must agree
+	// (enforced by the predication pass).
+	if addr.Type().TypeKind() == llvm.VectorTypeKind {
+		return b.spmdMaskedGather(resultType, addr, mask)
+	}
+
+	// Scalar address: load speculatively, then broadcast and mask.
+	// Safety: the predication pass only generates SPMDLoad inside blocks that
+	// were statically reachable in the pre-predication CFG, so the pointer was
+	// valid for all lanes in that block. This assumes flat (non-nested) if
+	// linearization; nested ifs require mask threading to remain safe.
+	loaded := b.CreateLoad(resultType, addr, "spmd.load")
+
+	// If the result is scalar, broadcast to a vector then mask-select.
+	if resultType.TypeKind() != llvm.VectorTypeKind {
+		vecType := llvm.VectorType(resultType, laneCount)
+		splatted := b.splatScalar(loaded, vecType)
+		zero := llvm.ConstNull(vecType)
+		return b.spmdMaskSelect(mask, splatted, zero)
+	}
+
+	// Result is already a vector (loaded a vector from memory).
+	zero := llvm.ConstNull(resultType)
+	return b.spmdMaskSelect(mask, loaded, zero)
+}
+
+// createSPMDStore emits LLVM IR for an SPMDStore instruction.
+// SPMDStore stores Val to Addr only for lanes where Mask is active.
+// It is the predicated replacement for Store in varying paths.
+//
+// For scalar addresses (uniform pointer), a masked store is emitted; spmdMaskedStore
+// handles mask unwrapping internally. For vector addresses (varying pointers),
+// a masked scatter is used; spmdMaskedScatter handles mask unwrapping internally.
+func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
+	addr := b.getValue(instr.Addr, instr.Pos())
+	val := b.getValue(instr.Val, instr.Pos())
+	mask := b.getValue(instr.Mask, instr.Pos())
+
+	// If the address is a vector (varying pointers), emit a masked scatter.
+	// spmdMaskedScatter handles mask format unwrapping internally.
+	if addr.Type().TypeKind() == llvm.VectorTypeKind {
+		b.spmdMaskedScatter(val, addr, mask)
+		return
+	}
+
+	// Scalar address: use a masked store. spmdMaskedStore handles mask
+	// format unwrapping (WASM <N x i32> → <N x i1>) internally.
+	b.spmdMaskedStore(val, addr, mask)
+}
+
+// createSPMDIndex emits LLVM IR for an SPMDIndex instruction.
+// SPMDIndex produces consecutive lane indices [0, 1, ..., Lanes-1]
+// in the loop's natural element type. It is the predicated replacement
+// for lanes.Index() calls inside SPMD loops.
+//
+// The result is a constant vector <0, 1, 2, ..., Lanes-1>.
+func (b *builder) createSPMDIndex(instr *ssa.SPMDIndex) llvm.Value {
+	lanes := instr.Lanes
+	elemType := b.getLLVMType(instr.ElemType)
+	// Reuse the existing spmdLaneOffsetConst helper for consistency.
+	return b.spmdLaneOffsetConst(lanes, elemType)
 }

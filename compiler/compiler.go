@@ -20,6 +20,7 @@ import (
 	"github.com/tinygo-org/tinygo/src/tinygo"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/types/typeutil"
+	spmdtypes "golang.org/x/tools/go/types/spmd"
 	"tinygo.org/x/go-llvm"
 )
 
@@ -525,6 +526,14 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 			return llvm.VectorType(elemType, laneCount)
 		}
 		return c.getLLVMType(typ.Elem())
+	case *spmdtypes.MaskType:
+		// MaskType is the element type of Varying[mask]. Its LLVM representation
+		// matches the platform mask element type: i32 on WASM (for 4-lane masks),
+		// i1 elsewhere. The lane count is determined by the enclosing SPMDType context.
+		if c.spmdIsWASM() {
+			return c.ctx.Int32Type()
+		}
+		return c.ctx.Int1Type()
 	default:
 		panic("unknown type: " + goType.String())
 	}
@@ -2860,6 +2869,8 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		after := b.insertBasicBlock("rundefers.after")
 		b.SetInsertPointAtEnd(after)
 		b.afterDefersBlock = append(b.afterDefersBlock, after)
+	case *ssa.SPMDStore:
+		b.createSPMDStore(instr)
 	case *ssa.Send:
 		b.createChanSend(instr)
 	case *ssa.Store:
@@ -3519,13 +3530,19 @@ func (b *builder) getValue(expr ssa.Value, pos token.Pos) llvm.Value {
 			}
 		}
 		val := b.createConst(expr, pos)
-		// SPMD: Varying[bool] constants are created with type <16 x i1> (128/1=16 lanes)
-		// by createSPMDConst, but inside a 4-lane or 8-lane loop the expected mask
-		// format is <4 x i32> or <8 x i16>. Convert to the active loop's mask format.
+		// SPMD: Varying[bool] and Varying[mask] constants are created with a default
+		// type based on their element width (e.g., <16 x i1> for bool, <4 x i32> for mask),
+		// but inside a different-lane-count loop the expected mask format may differ.
+		// Convert to the active loop's mask format.
 		if b.spmdLoopState != nil {
 			if spmdType, ok := expr.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
 				elem := spmdType.Elem().Underlying()
-				if basic, ok := elem.(*types.Basic); ok && basic.Info()&types.IsBoolean != 0 {
+				isBool := func() bool {
+					basic, ok := elem.(*types.Basic)
+					return ok && basic.Info()&types.IsBoolean != 0
+				}
+				isMask := spmdtypes.IsMask(elem)
+				if isBool() || isMask {
 					if activeLoop := b.spmdFindActiveLoopForBlock(b.currentBlock); activeLoop != nil {
 						maskElem := b.spmdMaskElemType(activeLoop.laneCount)
 						targetType := llvm.VectorType(maskElem, activeLoop.laneCount)
@@ -4524,6 +4541,12 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		return b.createTypeAssert(expr), nil
 	case *ssa.UnOp:
 		return b.createUnOp(expr)
+	case *ssa.SPMDSelect:
+		return b.createSPMDSelect(expr), nil
+	case *ssa.SPMDLoad:
+		return b.createSPMDLoad(expr), nil
+	case *ssa.SPMDIndex:
+		return b.createSPMDIndex(expr), nil
 	default:
 		return llvm.Value{}, b.makeError(expr.Pos(), "todo: unknown expression: "+expr.String())
 	}
@@ -4956,6 +4979,22 @@ func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Va
 		default:
 			return llvm.Value{}, b.makeError(pos, "unknown: binop on struct: "+op.String())
 		}
+	case *spmdtypes.MaskType:
+		// Varying[mask] is represented as <N x i32> on WASM or <N x i1> elsewhere.
+		// Bitwise AND/AND_NOT/XOR/OR operate directly on vector integer values.
+		switch op {
+		case token.AND: // &
+			return b.CreateAnd(x, y, ""), nil
+		case token.AND_NOT: // &^
+			notY := b.CreateNot(y, "")
+			return b.CreateAnd(x, notY, ""), nil
+		case token.OR: // |
+			return b.CreateOr(x, y, ""), nil
+		case token.XOR: // ^
+			return b.CreateXor(x, y, ""), nil
+		default:
+			return llvm.Value{}, b.makeError(pos, "unsupported binop on MaskType: "+op.String())
+		}
 	default:
 		return llvm.Value{}, b.makeError(pos, "todo: binop type: "+typ.String())
 	}
@@ -5122,6 +5161,31 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 	// lane-wise LLVM conversions (SExt, ZExt, FPExt, etc.) are produced.
 	if spmdFrom, ok := typeFrom.(*types.SPMDType); ok {
 		if spmdTo, ok := typeTo.(*types.SPMDType); ok {
+			// SPMD-to-SPMD: handle Varying[bool] ↔ Varying[mask] conversions specially.
+			// Both bool and mask share the same LLVM representation (wrapped mask vector
+			// on WASM, <N x i1> elsewhere). If the value is already the correct type,
+			// return it directly; otherwise perform the appropriate sext/trunc.
+			fromIsBoolOrMask := func(e types.Type) bool {
+				if spmdtypes.IsMask(e) {
+					return true
+				}
+				if basic, ok := e.Underlying().(*types.Basic); ok {
+					return basic.Info()&types.IsBoolean != 0
+				}
+				return false
+			}
+			if fromIsBoolOrMask(spmdFrom.Elem()) && fromIsBoolOrMask(spmdTo.Elem()) {
+				// Both represent boolean/mask vectors. If already the same LLVM type
+				// (common case on WASM where both are <N x i32>), return directly.
+				targetType := b.getLLVMType(typeTo)
+				if value.Type() == targetType {
+					return value, nil
+				}
+				// Types differ (e.g., <16 x i1> bool → <4 x i32> mask). Use spmdConvertMaskFormat.
+				if value.Type().TypeKind() == llvm.VectorTypeKind && targetType.TypeKind() == llvm.VectorTypeKind {
+					return b.spmdConvertMaskFormat(value, targetType), nil
+				}
+			}
 			// SPMD-to-SPMD: recurse with element types; vector-widening
 			// guard handles LLVM type consistency on re-entry.
 			return b.createConvert(spmdFrom.Elem(), spmdTo.Elem(), value, pos)
