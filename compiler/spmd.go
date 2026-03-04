@@ -453,12 +453,12 @@ func (b *builder) spmdWASMNarrowAndPack(val llvm.Value, targetElemBits uint64) l
 	result := llvm.ConstNull(scalarType)
 	for lane := 0; lane < laneCount; lane++ {
 		laneIdx := llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false)
-		elem := b.CreateExtractElement(val, laneIdx, "")  // iWide
-		elem = b.CreateAnd(elem, elemMask, "")            // mask to targetElemBits
-		elem = b.CreateZExt(elem, scalarType, "")         // zero-extend to iTotal
+		elem := b.CreateExtractElement(val, laneIdx, "") // iWide
+		elem = b.CreateAnd(elem, elemMask, "")           // mask to targetElemBits
+		elem = b.CreateZExt(elem, scalarType, "")        // zero-extend to iTotal
 		shift := llvm.ConstInt(scalarType, uint64(lane)*targetElemBits, false)
-		elem = b.CreateShl(elem, shift, "")               // shift to lane position
-		result = b.CreateOr(result, elem, "")             // accumulate
+		elem = b.CreateShl(elem, shift, "")   // shift to lane position
+		result = b.CreateOr(result, elem, "") // accumulate
 	}
 	return result
 }
@@ -521,12 +521,12 @@ type spmdLoopState struct {
 
 // spmdActiveLoop holds state for one SPMD loop during compilation.
 type spmdActiveLoop struct {
-	info       *SPMDLoopInfo
+	info        *SPMDLoopInfo
 	ssaLoopInfo *ssa.SPMDLoopInfo // x-tools-spmd loop info (non-nil when isPeeled == true)
-	iterPhi    *ssa.Phi   // the "rangeint.iter" phi in body block (nil for rangeindex)
-	laneCount  int        // e.g. 4 for int32 on WASM SIMD128
-	boundValue ssa.Value  // N in "range N"
-	incrBinOp  *ssa.BinOp // the ADD in the loop block
+	iterPhi     *ssa.Phi          // the "rangeint.iter" phi in body block (nil for rangeindex)
+	laneCount   int               // e.g. 4 for int32 on WASM SIMD128
+	boundValue  ssa.Value         // N in "range N"
+	incrBinOp   *ssa.BinOp        // the ADD in the loop block
 
 	// Range-over-slice specific fields (isRangeIndex == true):
 	isRangeIndex  bool      // true for rangeindex pattern (range-over-slice)
@@ -548,7 +548,6 @@ type spmdActiveLoop struct {
 	tailMask      llvm.Value // per-lane bounds check
 	scalarIterVal llvm.Value // scalar LLVM value (before override to lane indices)
 }
-
 
 // spmdDecomposedIndex tracks a base+offset decomposed SPMD index value.
 // Used for byte-lane loops (laneCount > 4) where the full materialized vector
@@ -1152,12 +1151,12 @@ func (b *builder) spmdParentMask() llvm.Value {
 
 // spmdVaryingIf holds analysis results for a varying (vector) if/else construct.
 type spmdVaryingIf struct {
-	cond              llvm.Value // vector condition: <N x i1> on non-WASM, <N x i32> on WASM
-	ifBlockIndex      int        // block with the If instruction
-	thenEntryIndex    int        // Succs[0] of if-block
-	elseEntryIndex    int        // Succs[1] of if-block (or merge for if-without-else)
-	mergeIndex        int        // common successor (merge point)
-	hasElse           bool       // true if then/else are distinct from merge
+	cond           llvm.Value // vector condition: <N x i1> on non-WASM, <N x i32> on WASM
+	ifBlockIndex   int        // block with the If instruction
+	thenEntryIndex int        // Succs[0] of if-block
+	elseEntryIndex int        // Succs[1] of if-block (or merge for if-without-else)
+	mergeIndex     int        // common successor (merge point)
+	hasElse        bool       // true if then/else are distinct from merge
 	// isValueLOR: true when thenEntry == merge, i.e. "a || b" used as a VALUE expression.
 	// go/ssa generates: if a → merge else binop.rhs; binop.rhs: cond_b; jump → merge.
 	// In SPMD: branch to binop.rhs unconditionally; result = a | b (OR of both conditions).
@@ -1185,10 +1184,10 @@ type spmdVaryingIf struct {
 // The select is always created during phi resolution (not phi creation) to avoid
 // circular dependencies when edge values reference the phi itself.
 type spmdMergePhiOverride struct {
-	skipEdgeIdx  int            // phi edge index to skip during resolution (no LLVM pred after linearization)
-	thenEdgeIdx  int            // phi edge index for the then-branch value
-	elseEdgeIdx  int            // phi edge index for the else-branch value; for 2-edge cases also the surviving LLVM pred
-	info         *spmdVaryingIf // varying-if info (holds the vector condition)
+	skipEdgeIdx int            // phi edge index to skip during resolution (no LLVM pred after linearization)
+	thenEdgeIdx int            // phi edge index for the then-branch value
+	elseEdgeIdx int            // phi edge index for the else-branch value; for 2-edge cases also the surviving LLVM pred
+	info        *spmdVaryingIf // varying-if info (holds the vector condition)
 }
 
 // spmdMaskTransition describes how the execution mask changes at a block boundary.
@@ -3769,34 +3768,6 @@ func (b *builder) spmdMaskedScatter(val, ptrs, mask llvm.Value) {
 	b.createCall(fnType, fn, []llvm.Value{val, ptrs, align, i1Mask}, "")
 }
 
-// spmdBreakResult tracks a phi at rangeint.done that receives a break value.
-type spmdBreakResult struct {
-	phi         *ssa.Phi   // the phi at rangeint.done
-	alloca      llvm.Value // alloca for accumulated break result
-	breakEdge   int        // index into phi.Edges for the break edge
-	breakVal    ssa.Value  // SSA value on break edge
-	defaultVal  ssa.Value  // SSA value on non-break edge (entry or if.done)
-	defaultEdge int        // index of the default edge
-}
-
-// spmdForLoopInfo tracks a regular for-range loop inside an SPMD function body.
-type spmdForLoopInfo struct {
-	loopBlockIndex  int               // rangeint.loop block index (or bodyBlockIndex for merged pattern)
-	bodyBlockIndex  int               // rangeint.body block index
-	doneBlockIndex  int               // rangeint.done block index
-	breakMaskAlloca llvm.Value        // alloca for <N x i1> break mask (persists across iterations)
-	laneCount       int               // SIMD lane count
-	breakResults    []spmdBreakResult // phis at done block with break values
-	earlyExitBlocks []llvm.BasicBlock // blocks that jump to done on all-lanes-broken
-}
-
-// spmdBreakRedirect tracks a varying if statement where the then-branch breaks from a loop.
-type spmdBreakRedirect struct {
-	loop   *spmdForLoopInfo
-	cond   llvm.Value      // the varying condition
-	target llvm.BasicBlock // where to redirect (else/continuation block)
-}
-
 // spmdAnalyzeContiguousIndex checks if an SSA index value is a linear
 // expression of a known SPMD loop iterator: base + iter_phi, where base
 // is a scalar (uniform) expression. Returns the loop and scalar base offset.
@@ -4658,331 +4629,6 @@ func (b *builder) spmdDecomposedIndexAddr(expr *ssa.IndexAddr, decomp *spmdDecom
 	return ptrVec, nil
 }
 
-// detectSPMDForLoops scans for regular for-range loops (rangeint pattern) in an
-// SPMD function body. These loops need break mask tracking when they contain
-// varying if statements with break.
-func (b *builder) detectSPMDForLoops() map[int]*spmdForLoopInfo {
-	if !b.spmdFuncIsBody {
-		return nil
-	}
-
-	result := make(map[int]*spmdForLoopInfo)
-
-	// Scan all blocks for rangeint.body blocks (regular for loops in SPMD function bodies).
-	for _, block := range b.fn.Blocks {
-		if block.Comment != "rangeint.body" {
-			continue
-		}
-
-		// Find the rangeint.loop predecessor.
-		var loopBlock *ssa.BasicBlock
-		for _, pred := range block.Preds {
-			if pred.Comment == "rangeint.loop" {
-				loopBlock = pred
-				break
-			}
-		}
-		if loopBlock == nil {
-			// Merged body+loop pattern: rangeint.body IS the loop header.
-			// Check for rangeint.iter phi and a path to rangeint.done.
-			var iterPhi *ssa.Phi
-			for _, instr := range block.Instrs {
-				if phi, ok := instr.(*ssa.Phi); ok && phi.Comment == "rangeint.iter" {
-					iterPhi = phi
-					break
-				}
-			}
-			if iterPhi == nil {
-				continue // No iter phi, not a rangeint pattern
-			}
-
-			// Find rangeint.done among all blocks.
-			var doneBlock *ssa.BasicBlock
-			for _, blk := range b.fn.Blocks {
-				if blk.Comment == "rangeint.done" {
-					// Verify this done block is reachable from our body block
-					// (within 2 hops — through if.then or if.done)
-					for _, succ := range block.Succs {
-						for _, succ2 := range succ.Succs {
-							if succ2 == blk {
-								doneBlock = blk
-								break
-							}
-						}
-						if succ == blk {
-							doneBlock = blk
-						}
-						if doneBlock != nil {
-							break
-						}
-					}
-					if doneBlock != nil {
-						break
-					}
-				}
-			}
-			if doneBlock == nil {
-				continue
-			}
-
-			// Verify the done block is actually connected to this body block
-			// by checking backward: done block's predecessors must include paths from our body.
-			connected := false
-			for _, pred := range doneBlock.Preds {
-				if pred == block {
-					connected = true
-					break
-				}
-				// Also check 1-hop successors (through if.then or if.done).
-				for _, succ := range block.Succs {
-					if pred == succ {
-						connected = true
-						break
-					}
-				}
-				if connected {
-					break
-				}
-			}
-			if !connected {
-				continue
-			}
-
-			// Check it's not inside an SPMD go-for loop.
-			insideSPMDGoFor := false
-			for _, instr := range block.Instrs {
-				if pos := instr.Pos(); pos.IsValid() {
-					if b.isInSPMDLoop(pos) != nil {
-						insideSPMDGoFor = true
-						break
-					}
-				}
-			}
-			if insideSPMDGoFor {
-				continue
-			}
-
-			elemType := b.getLLVMType(iterPhi.Type())
-			laneCount := b.spmdLaneCount(elemType)
-			maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
-
-			// Create break mask alloca at function entry.
-			savedBlock := b.GetInsertBlock()
-			entryBlock := b.llvmFn.EntryBasicBlock()
-			if !entryBlock.IsNil() {
-				firstInstr := entryBlock.FirstInstruction()
-				if !firstInstr.IsNil() {
-					b.SetInsertPointBefore(firstInstr)
-				} else {
-					b.SetInsertPointAtEnd(entryBlock)
-				}
-			}
-			breakMaskAlloca := b.CreateAlloca(maskType, "spmd.break.mask")
-			if !savedBlock.IsNil() {
-				b.SetInsertPointAtEnd(savedBlock)
-			}
-
-			info := &spmdForLoopInfo{
-				loopBlockIndex:  block.Index, // merged: same as body
-				bodyBlockIndex:  block.Index,
-				doneBlockIndex:  doneBlock.Index,
-				breakMaskAlloca: breakMaskAlloca,
-				laneCount:       laneCount,
-			}
-
-			// Scan phis at done block to find break results.
-			// This needs to be done later after all allocas are created.
-			result[block.Index] = info
-			continue
-		}
-
-		// Check if this is inside an SPMD go-for loop. If it is, skip it —
-		// SPMD go-for loops are handled by analyzeSPMDLoops(), not here.
-		// We only handle regular for loops in SPMD function bodies.
-		insideSPMDGoFor := false
-		for _, instr := range block.Instrs {
-			if pos := instr.Pos(); pos.IsValid() {
-				if b.isInSPMDLoop(pos) != nil {
-					insideSPMDGoFor = true
-					break
-				}
-			}
-		}
-		if insideSPMDGoFor {
-			continue
-		}
-
-		// Find the rangeint.done block: it's the other successor of loopBlock.
-		var doneBlock *ssa.BasicBlock
-		for _, succ := range loopBlock.Succs {
-			if succ != block {
-				doneBlock = succ
-				break
-			}
-		}
-		if doneBlock == nil {
-			continue
-		}
-
-		// Determine lane count from the loop's iteration variable type.
-		// Find the iter phi in the body block.
-		var iterPhi *ssa.Phi
-		for _, instr := range block.Instrs {
-			if phi, ok := instr.(*ssa.Phi); ok && phi.Comment == "rangeint.iter" {
-				iterPhi = phi
-				break
-			}
-		}
-		if iterPhi == nil {
-			continue
-		}
-
-		elemType := b.getLLVMType(iterPhi.Type())
-		laneCount := b.spmdLaneCount(elemType)
-
-		// Create alloca for the break mask at the function entry block.
-		// We'll initialize it to all-false later in createFunction().
-		maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
-
-		// Save current insert point, create alloca at function entry.
-		savedBlock := b.GetInsertBlock()
-		entryBlock := b.llvmFn.EntryBasicBlock()
-		if !entryBlock.IsNil() {
-			// Insert at the beginning of the entry block.
-			firstInstr := entryBlock.FirstInstruction()
-			if !firstInstr.IsNil() {
-				b.SetInsertPointBefore(firstInstr)
-			} else {
-				b.SetInsertPointAtEnd(entryBlock)
-			}
-		}
-
-		breakMaskAlloca := b.CreateAlloca(maskType, "spmd.break.mask")
-
-		// Restore insert point.
-		if !savedBlock.IsNil() {
-			b.SetInsertPointAtEnd(savedBlock)
-		}
-
-		info := &spmdForLoopInfo{
-			loopBlockIndex:  loopBlock.Index,
-			bodyBlockIndex:  block.Index,
-			doneBlockIndex:  doneBlock.Index,
-			breakMaskAlloca: breakMaskAlloca,
-			laneCount:       laneCount,
-		}
-
-		result[block.Index] = info
-	}
-
-	// Second pass: populate breakResults for all detected loops.
-	for _, loop := range result {
-		doneBlock := b.fn.Blocks[loop.doneBlockIndex]
-
-		// Scan phis at the done block.
-		for _, instr := range doneBlock.Instrs {
-			phi, ok := instr.(*ssa.Phi)
-			if !ok {
-				break // phis are always first
-			}
-
-			// Find break edge (from a then-block that jumps to done).
-			// Also find a default edge (from body or entry).
-			var breakEdge, defaultEdge int = -1, -1
-			var breakVal, defaultVal ssa.Value
-
-			for edgeIdx, pred := range doneBlock.Preds {
-				// Check if this predecessor jumps directly to the done block
-				// (a break pattern — the then-block of "if cond { break }").
-				// Skip the body block itself and non-jump blocks.
-				if pred.Index == loop.bodyBlockIndex {
-					// This is the loop body's exit edge (not a break).
-					defaultEdge = edgeIdx
-					defaultVal = phi.Edges[edgeIdx]
-					continue
-				}
-				// Check that the predecessor has a single successor (Jump → done).
-				if len(pred.Succs) == 1 && pred.Succs[0].Index == loop.doneBlockIndex {
-					breakEdge = edgeIdx
-					breakVal = phi.Edges[edgeIdx]
-				} else if defaultEdge < 0 {
-					// Entry or other non-break predecessor.
-					defaultEdge = edgeIdx
-					defaultVal = phi.Edges[edgeIdx]
-				}
-			}
-
-			// If we found a break edge, create a result alloca for this phi.
-			if breakEdge >= 0 && defaultEdge >= 0 {
-				phiType := b.getLLVMType(phi.Type())
-
-				// Save insert point, create alloca at function entry.
-				savedBlock := b.GetInsertBlock()
-				entryBlock := b.llvmFn.EntryBasicBlock()
-				if !entryBlock.IsNil() {
-					firstInstr := entryBlock.FirstInstruction()
-					if !firstInstr.IsNil() {
-						b.SetInsertPointBefore(firstInstr)
-					} else {
-						b.SetInsertPointAtEnd(entryBlock)
-					}
-				}
-
-				alloca := b.CreateAlloca(phiType, "spmd.break.result")
-
-				// Restore insert point.
-				if !savedBlock.IsNil() {
-					b.SetInsertPointAtEnd(savedBlock)
-				}
-
-				loop.breakResults = append(loop.breakResults, spmdBreakResult{
-					phi:         phi,
-					alloca:      alloca,
-					breakEdge:   breakEdge,
-					breakVal:    breakVal,
-					defaultVal:  defaultVal,
-					defaultEdge: defaultEdge,
-				})
-			}
-		}
-	}
-
-	return result
-}
-
-// spmdIsVaryingBreak checks if a varying if's then-successor jumps directly to a loop exit.
-// Returns (loopInfo, true) if this is a varying-break pattern.
-func (b *builder) spmdIsVaryingBreak(ifBlock *ssa.BasicBlock) (*spmdForLoopInfo, bool) {
-	if b.spmdForLoops == nil {
-		return nil, false
-	}
-
-	// Check if the then-branch (Succs[0]) has a single Jump instruction.
-	thenBlock := ifBlock.Succs[0]
-	if len(thenBlock.Instrs) == 0 {
-		return nil, false
-	}
-
-	lastInstr := thenBlock.Instrs[len(thenBlock.Instrs)-1]
-	if _, ok := lastInstr.(*ssa.Jump); !ok {
-		return nil, false
-	}
-
-	// Check if the Jump targets a loop done block.
-	if len(thenBlock.Succs) != 1 {
-		return nil, false
-	}
-
-	jumpTarget := thenBlock.Succs[0]
-	for _, loop := range b.spmdForLoops {
-		if jumpTarget.Index == loop.doneBlockIndex {
-			return loop, true
-		}
-	}
-
-	return nil, false
-}
-
 // spmdVectorIndex handles *ssa.Index when the index is a vector type (varying).
 // Dispatches to string or array handlers based on the collection type.
 func (b *builder) spmdVectorIndex(expr *ssa.Index, collection, index llvm.Value) (llvm.Value, error) {
@@ -5432,7 +5078,6 @@ func (b *builder) spmdEmitInterleavedStore(lastStore *ssa.Store, info *spmdInter
 		return // unsupported stride
 	}
 
-
 	// Compute the base pointer for the output slice.
 	// decomp.scalarBase for remainder-0 addr is already iter*stride (the scalar
 	// part of the decomposed index). GEP from the slice data pointer at that offset.
@@ -5528,8 +5173,8 @@ func (b *builder) spmdInterleaveStride2(val0, val1 llvm.Value, N int) [2]llvm.Va
 	loMask := make([]uint64, N)
 	hiMask := make([]uint64, N)
 	for j := 0; j < N/2; j++ {
-		loMask[2*j] = uint64(j)         // val0[j]
-		loMask[2*j+1] = uint64(N + j)   // val1[j]
+		loMask[2*j] = uint64(j)       // val0[j]
+		loMask[2*j+1] = uint64(N + j) // val1[j]
 	}
 	for j := 0; j < N/2; j++ {
 		hiMask[2*j] = uint64(N/2 + j)       // val0[N/2+j]
@@ -5578,7 +5223,7 @@ func (b *builder) spmdInterleaveStride3(val0, val1, val2 llvm.Value, N int) [3]l
 				mask2[j] = uint64(j) // keep from step1
 			case 2:
 				// val2[triplet]: not present in step1; use placeholder, then override in step2.
-				mask01[j] = 0 // placeholder (will be replaced)
+				mask01[j] = 0                  // placeholder (will be replaced)
 				mask2[j] = uint64(N + triplet) // second input in step2 = val2 → indices N..2N-1
 			}
 		}

@@ -2117,152 +2117,6 @@ func TestSPMDFuncBodyDetection(t *testing.T) {
 	})
 }
 
-func TestSPMDForLoopBreakMask(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-
-	t.Run("detectSPMDForLoops_returns_nil_when_not_func_body", func(t *testing.T) {
-		b := &builder{compilerContext: c}
-		b.spmdFuncIsBody = false
-
-		result := b.detectSPMDForLoops()
-		if result != nil {
-			t.Error("expected nil when spmdFuncIsBody=false")
-		}
-	})
-
-	t.Run("spmdIsVaryingBreak_returns_false_when_no_loops", func(t *testing.T) {
-		b := &builder{compilerContext: c}
-		b.spmdForLoops = nil
-
-		// spmdIsVaryingBreak requires a real SSA block, but we can't easily
-		// construct one for unit testing. This test verifies the nil guard.
-		// Integration testing will cover the actual break detection logic.
-		loopInfo, isBreak := b.spmdIsVaryingBreak(nil)
-		if loopInfo != nil || isBreak {
-			t.Error("expected false when spmdForLoops=nil")
-		}
-	})
-
-	t.Run("spmdForLoopInfo_alloca_created_with_correct_type", func(t *testing.T) {
-		// Verify that the alloca has the correct vector type <N x i1>.
-		laneCount := 4
-		maskType := llvm.VectorType(c.ctx.Int1Type(), laneCount)
-
-		// Create a test function to hold the alloca.
-		fn := llvm.AddFunction(c.mod, "test_break_mask", llvm.FunctionType(c.ctx.VoidType(), nil, false))
-		bb := llvm.AddBasicBlock(fn, "entry")
-		b := &builder{compilerContext: c}
-		b.Builder = c.ctx.NewBuilder()
-		b.SetInsertPointAtEnd(bb)
-		b.llvmFn = fn
-
-		alloca := b.CreateAlloca(maskType, "spmd.break.mask")
-
-		// Verify the alloca type.
-		allocaType := alloca.Type()
-		if allocaType.TypeKind() != llvm.PointerTypeKind {
-			t.Errorf("expected pointer type, got %v", allocaType.TypeKind())
-		}
-
-		// Initialize to all-false and store.
-		zeroMask := llvm.ConstNull(maskType)
-		b.CreateStore(zeroMask, alloca)
-
-		// Load and verify the mask type.
-		loaded := b.CreateLoad(maskType, alloca, "break.mask")
-		if loaded.Type().TypeKind() != llvm.VectorTypeKind {
-			t.Errorf("expected vector type, got %v", loaded.Type().TypeKind())
-		}
-		if loaded.Type().VectorSize() != laneCount {
-			t.Errorf("expected lane count %d, got %d", laneCount, loaded.Type().VectorSize())
-		}
-	})
-
-	t.Run("break_mask_accumulation", func(t *testing.T) {
-		// Test that OR-accumulation works correctly.
-		laneCount := 4
-		maskType := llvm.VectorType(c.ctx.Int1Type(), laneCount)
-
-		fn := llvm.AddFunction(c.mod, "test_accumulation", llvm.FunctionType(c.ctx.VoidType(), nil, false))
-		bb := llvm.AddBasicBlock(fn, "entry")
-		b := &builder{compilerContext: c}
-		b.Builder = c.ctx.NewBuilder()
-		b.SetInsertPointAtEnd(bb)
-
-		// Create alloca and initialize to zero.
-		alloca := b.CreateAlloca(maskType, "spmd.break.mask")
-		zeroMask := llvm.ConstNull(maskType)
-		b.CreateStore(zeroMask, alloca)
-
-		// Simulate first break: lanes [true, false, false, false]
-		firstMask := llvm.ConstVector([]llvm.Value{
-			llvm.ConstInt(c.ctx.Int1Type(), 1, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-		}, false)
-
-		currentBreak := b.CreateLoad(maskType, alloca, "break.mask.cur")
-		newBreak := b.CreateOr(currentBreak, firstMask, "break.mask.new")
-		b.CreateStore(newBreak, alloca)
-
-		// Simulate second break: lanes [false, false, true, false]
-		secondMask := llvm.ConstVector([]llvm.Value{
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 1, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-		}, false)
-
-		currentBreak = b.CreateLoad(maskType, alloca, "break.mask.cur")
-		newBreak = b.CreateOr(currentBreak, secondMask, "break.mask.new")
-		b.CreateStore(newBreak, alloca)
-
-		// Verify the final mask has both lanes set (manual verification via IR inspection).
-		// In actual usage, the final mask would be [true, false, true, false].
-		finalMask := b.CreateLoad(maskType, alloca, "break.mask.final")
-		if finalMask.Type().TypeKind() != llvm.VectorTypeKind {
-			t.Error("expected vector type for accumulated break mask")
-		}
-	})
-
-	t.Run("active_mask_computation", func(t *testing.T) {
-		// Test that activeMask = entryMask & ~breakMask works correctly.
-		laneCount := 4
-		maskType := llvm.VectorType(c.ctx.Int1Type(), laneCount)
-
-		fn := llvm.AddFunction(c.mod, "test_active_mask", llvm.FunctionType(c.ctx.VoidType(), nil, false))
-		bb := llvm.AddBasicBlock(fn, "entry")
-		b := &builder{compilerContext: c}
-		b.Builder = c.ctx.NewBuilder()
-		b.SetInsertPointAtEnd(bb)
-
-		// Entry mask: all lanes active.
-		entryMask := llvm.ConstAllOnes(maskType)
-
-		// Break mask: lanes [true, false, false, true] have broken.
-		breakMask := llvm.ConstVector([]llvm.Value{
-			llvm.ConstInt(c.ctx.Int1Type(), 1, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 1, false),
-		}, false)
-
-		// Compute active mask.
-		notBreak := b.CreateNot(breakMask, "not.break")
-		activeMask := b.CreateAnd(entryMask, notBreak, "spmd.active.mask")
-
-		// Expected: [false, true, true, false]
-		if activeMask.Type().TypeKind() != llvm.VectorTypeKind {
-			t.Error("expected vector type for active mask")
-		}
-		if activeMask.Type().VectorSize() != laneCount {
-			t.Errorf("expected lane count %d, got %d", laneCount, activeMask.Type().VectorSize())
-		}
-	})
-}
-
 func TestSPMDBreakMaskInstructions(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
@@ -3890,15 +3744,15 @@ func TestSPMDDecomposedBinOpMul(t *testing.T) {
 	laneCount := 16
 
 	tests := []struct {
-		name       string
-		constC     int64
-		base       uint64
-		shouldFit  bool // whether (N-1)*c <= 255
+		name      string
+		constC    int64
+		base      uint64
+		shouldFit bool // whether (N-1)*c <= 255
 	}{
 		{name: "c=2 stride-2", constC: 2, base: 16, shouldFit: true},
 		{name: "c=16 boundary", constC: 16, base: 0, shouldFit: true},
-		{name: "c=17 max boundary", constC: 17, base: 0, shouldFit: true},     // 15*17=255
-		{name: "c=18 overflow", constC: 18, base: 0, shouldFit: false},         // 15*18=270 > 255
+		{name: "c=17 max boundary", constC: 17, base: 0, shouldFit: true}, // 15*17=255
+		{name: "c=18 overflow", constC: 18, base: 0, shouldFit: false},    // 15*18=270 > 255
 		{name: "c=3 non-power-of-two", constC: 3, base: 32, shouldFit: true},
 	}
 
