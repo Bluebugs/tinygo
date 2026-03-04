@@ -5318,6 +5318,50 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// target-specific width. instr.Lanes may use host int sizes.
 	laneCount := mask.Type().VectorSize()
 
+	// Contiguous access: use vector load instead of scalar load+broadcast.
+	// Two sources of contiguity info:
+	//   1. SSA-level: instr.Contiguous (set by spmdMaskMemOps in go/ssa)
+	//   2. TinyGo-level: spmdContiguousPtr map (populated during IndexAddr compilation)
+	// Both agree for go-for loops. The SSA field provides visibility in SSA dumps
+	// and serves as a safety net for future backends. The map provides the LLVM
+	// values (scalarPtr, sliceCap) needed for actual codegen.
+	if b.spmdContiguousPtr != nil {
+		if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
+			ssaElemType := instr.Addr.Type().Underlying().(*types.Pointer).Elem()
+			elemType := b.getLLVMType(ssaElemType)
+
+			// Narrow load path (WASM byte/bool elements).
+			if narrowBits := b.spmdNarrowLoadElemBits(ssaElemType, laneCount); narrowBits > 0 {
+				return b.spmdMaskedLoadNarrow(narrowBits, ci.scalarPtr, laneCount, mask)
+			}
+			// Bool load fix: load as <N x i8>, truncate to <N x i1>.
+			isBoolLoad := elemType == b.ctx.Int1Type()
+			if isBoolLoad {
+				elemType = b.ctx.Int8Type()
+			}
+			// WASM sub-128-bit widening.
+			if b.spmdIsWASM() {
+				vecBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8 * uint64(laneCount)
+				if vecBits < 128 {
+					elemType = b.spmdMaskElemType(laneCount)
+				}
+			}
+			vecType := llvm.VectorType(elemType, laneCount)
+			// Cap-based optimization: full load + select when safe.
+			var result llvm.Value
+			if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
+				result = b.spmdFullLoadWithSelect(vecType, ci, mask)
+				b.currentBlockInfo.exit = b.GetInsertBlock()
+			} else {
+				result = b.spmdMaskedLoad(vecType, ci.scalarPtr, mask)
+			}
+			if isBoolLoad {
+				result = b.CreateTrunc(result, llvm.VectorType(b.ctx.Int1Type(), laneCount), "")
+			}
+			return result
+		}
+	}
+
 	// If the address is a vector (varying pointers), emit a masked gather.
 	if addr.Type().TypeKind() == llvm.VectorTypeKind {
 		return b.spmdMaskedGather(resultType, addr, mask)
@@ -5366,6 +5410,37 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 	if val.Type().TypeKind() != llvm.VectorTypeKind {
 		// Scalar value: splat to vector.
 		val = b.splatScalar(val, llvm.VectorType(val.Type(), laneCount))
+	}
+
+	// Contiguous access: use vector store instead of scatter.
+	// See createSPMDLoad for contiguity info sources (SSA-level + TinyGo-level).
+	if b.spmdContiguousPtr != nil {
+		if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
+			// Bool store fix.
+			if val.Type().TypeKind() == llvm.VectorTypeKind &&
+				val.Type().ElementType() == b.ctx.Int1Type() {
+				val = b.CreateZExt(val, llvm.VectorType(b.ctx.Int8Type(), laneCount), "")
+			}
+			// Narrowing detection.
+			var narrowBits uint64
+			if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
+				narrowBits = b.spmdNarrowStoreElemBits(val, addrPtrType.Elem())
+			}
+			if narrowBits == 0 {
+				if spmdVal, ok := instr.Val.Type().(*types.SPMDType); ok {
+					narrowBits = b.spmdNarrowStoreElemBits(val, spmdVal.Elem())
+				}
+			}
+			if narrowBits > 0 {
+				b.spmdMaskedStoreNarrow(val, narrowBits, ci.scalarPtr, mask)
+			} else if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
+				b.spmdFullStoreWithBlend(val, ci, mask)
+				b.currentBlockInfo.exit = b.GetInsertBlock()
+			} else {
+				b.spmdMaskedStore(val, ci.scalarPtr, mask)
+			}
+			return
+		}
 	}
 
 	// If the address is a vector (varying pointers), emit a masked scatter.

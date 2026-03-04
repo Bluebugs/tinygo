@@ -1444,30 +1444,33 @@ func (b *builder) createFunction() {
 		b.spmdFuncIsBody = true
 	}
 
-	// SPMD: initialize varying if/else maps and Phase 2.8 mask tracking maps.
+	// SPMD: initialize maps and analysis for the active SPMD context.
+	// For go-for loop context: full infrastructure (varying if detection,
+	// mask transitions, contiguous/shifted/coalesced/interleaved maps).
+	// For func body context: minimal infrastructure (contiguous/shifted
+	// maps only — SSA predication already linearized varying control flow
+	// and converted vectorizable loads/stores to SPMDLoad/SPMDStore).
 	if b.spmdLoopState != nil || b.spmdFuncIsBody {
-		b.spmdVaryingIfs = make(map[int]*spmdVaryingIf)
-		b.spmdThenExitRedirects = make(map[int]llvm.BasicBlock)
-		b.spmdMergeSelects = make(map[int]*spmdVaryingIf)
-		b.spmdMaskTransitions = make(map[int]*spmdMaskTransition)
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
 		b.spmdShiftedPtr = make(map[ssa.Value]*spmdShiftedLoadInfo)
-		b.spmdCoalescedStores = make(map[*ssa.Store]*spmdCoalescedStore)
-		b.spmdInterleavedStores = make(map[*ssa.Store]*spmdInterleavedStoreInfo)
-		b.spmdInterleavedAddrs = make(map[*ssa.IndexAddr]*spmdInterleavedStoreInfo)
-		b.spmdInterleavedValues = make(map[*spmdInterleavedStoreGroup][]llvm.Value)
 		b.spmdMergePhiOverrides = make(map[*ssa.Phi]spmdMergePhiOverride)
-		// SPMD: pre-detect varying ifs before compiling blocks.
-		// This is necessary so that phis at merge blocks can be converted to
-		// selects when they're compiled. Without this, phis would be compiled
-		// before spmdMergeSelects is populated.
-		b.preDetectVaryingIfs()
 
-		// SPMD: pre-detect interleaved stride-S stores for shufflevector emission.
 		if b.spmdLoopState != nil {
+			b.spmdVaryingIfs = make(map[int]*spmdVaryingIf)
+			b.spmdThenExitRedirects = make(map[int]llvm.BasicBlock)
+			b.spmdMergeSelects = make(map[int]*spmdVaryingIf)
+			b.spmdMaskTransitions = make(map[int]*spmdMaskTransition)
+			b.spmdCoalescedStores = make(map[*ssa.Store]*spmdCoalescedStore)
+			b.spmdInterleavedStores = make(map[*ssa.Store]*spmdInterleavedStoreInfo)
+			b.spmdInterleavedAddrs = make(map[*ssa.IndexAddr]*spmdInterleavedStoreInfo)
+			b.spmdInterleavedValues = make(map[*spmdInterleavedStoreGroup][]llvm.Value)
+
+			// Pre-detect varying ifs before compiling blocks. Only needed for
+			// go-for loop context where TinyGo handles varying If linearization.
+			// For func body context, SSA predication already linearized all varying Ifs.
+			b.preDetectVaryingIfs()
 			b.spmdAnalyzeInterleavedStores()
 		}
-
 	}
 
 	// Fill blocks with instructions.
@@ -1514,15 +1517,10 @@ func (b *builder) createFunction() {
 			// part of the SPMD region. Unlike loop-based SPMD, spmdValueOverride is
 			// never cleared between blocks because there are no loop-specific SSA
 			// values (no iter phi) to scope — all overrides are function-wide.
+			// No mask stack: SSA predication already linearized varying control flow
+			// and all masks are explicit on SPMDLoad/SPMDStore/CallCommon.SPMDMask.
 			if b.spmdValueOverride == nil {
 				b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
-			}
-			// Seed the mask stack with the entry mask on the first block so that
-			// spmdCurrentMask() returns a valid mask throughout the function body.
-			// The len==0 guard fires only once: mask transitions (pushThen/swapElse/pop)
-			// never fully drain the stack below the entry-mask base element.
-			if len(b.spmdMaskStack) == 0 && !b.spmdEntryMask.IsNil() {
-				b.spmdMaskStack = []llvm.Value{b.spmdEntryMask}
 			}
 		}
 
