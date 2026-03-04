@@ -1341,7 +1341,15 @@ func (b *builder) createFunctionStart(intrinsic bool) {
 	llvmParamIndex := 0
 
 	// SPMD: extract entry mask if this is an SPMD function.
-	if maskType := b.spmdMaskType(b.fn); maskType != (llvm.Type{}) && !b.info.exported {
+	if b.fn.SPMDMask != nil && !b.info.exported {
+		// SSA-level mask parameter — map it to the first LLVM parameter.
+		mask := b.llvmFn.Param(llvmParamIndex)
+		mask.SetName("spmd.mask")
+		b.spmdEntryMask = mask
+		b.locals[b.fn.SPMDMask] = mask
+		llvmParamIndex++
+	} else if maskType := b.spmdMaskType(b.fn); maskType != (llvm.Type{}) && !b.info.exported {
+		// Fallback for go-for loop context (no SSA-level mask).
 		mask := b.llvmFn.Param(llvmParamIndex)
 		mask.SetName("spmd.mask")
 		b.spmdEntryMask = mask
@@ -2460,15 +2468,19 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 	}
 
 	// SPMD: insert execution mask as first argument for non-exported SPMD function calls.
-	// Use spmdMaskType (not isSPMDFunction) to match the mask-insertion logic in
-	// getFunction/createFunctionStart/getLLVMFunctionType — all of which only add a
-	// mask parameter when the function has varying PARAMETERS (not just results).
-	if fn := instr.StaticCallee(); fn != nil && b.spmdMaskType(fn) != (llvm.Type{}) {
-		info := b.getFunctionInfo(fn)
-		if !info.exported {
-			mask := b.spmdCallMask(fn)
-			if !mask.IsNil() {
-				params = append([]llvm.Value{mask}, params...)
+	if fn := instr.StaticCallee(); fn != nil {
+		if instr.SPMDMask != nil {
+			// SSA-level mask — use directly via getValue.
+			mask := b.getValue(instr.SPMDMask, getPos(instr))
+			params = append([]llvm.Value{mask}, params...)
+		} else if b.spmdMaskType(fn) != (llvm.Type{}) {
+			// Fallback for go-for loop context (no SSA-level mask).
+			info := b.getFunctionInfo(fn)
+			if !info.exported {
+				mask := b.spmdCallMask(fn)
+				if !mask.IsNil() {
+					params = append([]llvm.Value{mask}, params...)
+				}
 			}
 		}
 	}
