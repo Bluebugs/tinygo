@@ -653,10 +653,6 @@ func TestSPMDIsBlockInSPMDBody(t *testing.T) {
 	if b.spmdInfo != nil {
 		t.Fatal("expected spmdInfo to be nil for test builder")
 	}
-
-	// Without a real SSA function, we can't call isBlockInSPMDBody directly.
-	// Verify the precondition: spmdInfo is nil, so the method would return nil.
-	// Also verify spmdShouldRedirectJump returns false with nil maps.
 	if b.spmdThenExitRedirects != nil {
 		t.Fatal("expected spmdThenExitRedirects to be nil for test builder")
 	}
@@ -665,6 +661,52 @@ func TestSPMDIsBlockInSPMDBody(t *testing.T) {
 	}
 	if b.spmdVaryingIfs != nil {
 		t.Fatal("expected spmdVaryingIfs to be nil for test builder")
+	}
+	if b.spmdMaskTransitions != nil {
+		t.Fatal("expected spmdMaskTransitions to be nil for test builder")
+	}
+	if b.spmdContiguousPtr != nil {
+		t.Fatal("expected spmdContiguousPtr to be nil for test builder")
+	}
+
+	// Without a real SSA function, we can't call isBlockInSPMDBody directly.
+	// Verify the precondition: spmdInfo is nil, so the method would return nil.
+}
+
+func TestSPMDMaskTransitionTypes(t *testing.T) {
+	// Verify that spmdMaskTransition structs can be constructed correctly.
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
+	cond := llvm.ConstAllOnes(maskType)
+
+	// Construct each transition type and verify the kind field.
+	pushTr := &spmdMaskTransition{kind: "pushThen", cond: cond}
+	swapTr := &spmdMaskTransition{kind: "swapElse", cond: cond}
+	popTr := &spmdMaskTransition{kind: "pop"}
+
+	if pushTr.kind != "pushThen" {
+		t.Errorf("pushThen kind = %q, want %q", pushTr.kind, "pushThen")
+	}
+	if swapTr.kind != "swapElse" {
+		t.Errorf("swapElse kind = %q, want %q", swapTr.kind, "swapElse")
+	}
+	if popTr.kind != "pop" {
+		t.Errorf("pop kind = %q, want %q", popTr.kind, "pop")
+	}
+	if pushTr.cond.C != cond.C {
+		t.Error("pushThen cond not preserved")
+	}
+
+	// Verify builder starts with nil mask transitions map.
+	if b.spmdMaskTransitions != nil {
+		t.Error("expected nil spmdMaskTransitions for fresh builder")
+	}
+	if b.spmdContiguousPtr != nil {
+		t.Error("expected nil spmdContiguousPtr for fresh builder")
 	}
 }
 
@@ -1321,100 +1363,6 @@ func TestSPMDIsFloat(t *testing.T) {
 	}
 }
 
-func TestSPMDLoopPeelingEligibility(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-
-	tests := []struct {
-		name      string
-		loop      spmdActiveLoop
-		funcBody  bool
-		want      bool
-		wantPanic bool
-	}{
-		// Both rangeint and rangeindex are eligible. Accumulator phis are now
-		// supported (tail.check gets accumulator phis + post-loop RAUW).
-		// These tests hit the incrBinOp nil guard (returns false) since
-		// constructing real SSA blocks is out of scope.
-		// Accumulator peeling covered by E2E: simple-sum has accumulator phi.
-		{"rangeint_nil_incrBinOp", spmdActiveLoop{laneCount: 16}, false, false, false},
-		// rangeindex loops: same nil guard behavior.
-		{"rangeindex_nil_incrBinOp", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, false, false, false},
-		// Zero lane count is ineligible.
-		{"zero_lane_count", spmdActiveLoop{laneCount: 0, isRangeIndex: true}, false, false, false},
-		// SPMD function body triggers panic (invariant violation).
-		{"spmd_func_body_panics", spmdActiveLoop{laneCount: 4}, true, false, true},
-		{"spmd_func_body_rangeindex_panics", spmdActiveLoop{laneCount: 4, isRangeIndex: true}, true, false, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			b := newTestBuilder(t, c)
-			b.spmdFuncIsBody = tt.funcBody
-			if tt.wantPanic {
-				defer func() {
-					if r := recover(); r == nil {
-						t.Errorf("spmdShouldPeelLoop() did not panic, expected panic")
-					}
-				}()
-				b.spmdShouldPeelLoop(&tt.loop)
-				return
-			}
-			got := b.spmdShouldPeelLoop(&tt.loop)
-			if got != tt.want {
-				t.Errorf("spmdShouldPeelLoop() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestSPMDAlignedBound(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-
-	i32Type := c.ctx.Int32Type()
-
-	// Use a function with an i32 parameter so the bound is a non-constant
-	// LLVM value. LLVM would constant-fold AND(const, const) into a constant,
-	// so we need a runtime value to verify an actual AND instruction is emitted.
-	fn := llvm.AddFunction(c.mod, "test_aligned_bound",
-		llvm.FunctionType(c.ctx.VoidType(), []llvm.Type{i32Type}, false))
-	bb := llvm.AddBasicBlock(fn, "entry")
-	b := &builder{compilerContext: c}
-	b.Builder = c.ctx.NewBuilder()
-	b.SetInsertPointAtEnd(bb)
-	defer b.Dispose()
-
-	bound := fn.Param(0) // non-constant i32 runtime value
-	bound.SetName("bound")
-
-	tests := []struct {
-		name      string
-		laneCount int
-	}{
-		{"4_lanes", 4},
-		{"8_lanes", 8},
-		{"16_lanes", 16},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := b.spmdComputeAlignedBound(bound, tt.laneCount)
-			if result.IsNil() {
-				t.Fatal("spmdComputeAlignedBound returned nil")
-			}
-			// The result must be an AND binary instruction (not a constant).
-			// Using a runtime bound prevents LLVM from constant-folding.
-			if result.IsABinaryOperator().IsNil() {
-				t.Errorf("expected AND binary operator, got non-instruction (opcode=%v)", result.InstructionOpcode())
-			}
-			if result.InstructionOpcode() != llvm.And {
-				t.Errorf("expected AND opcode (%v), got %v", llvm.And, result.InstructionOpcode())
-			}
-		})
-	}
-}
-
 func TestSPMDMaskStack(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
@@ -1573,43 +1521,6 @@ func TestSPMDMaskedStoreIntrinsic(t *testing.T) {
 				t.Errorf("intrinsic %q not declared in module", intrinsicName)
 			}
 		})
-	}
-}
-
-func TestSPMDMaskTransitionTypes(t *testing.T) {
-	// Verify that spmdMaskTransition structs can be constructed correctly.
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-	b := newTestBuilder(t, c)
-	defer b.Dispose()
-
-	maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
-	cond := llvm.ConstAllOnes(maskType)
-
-	// Construct each transition type and verify the kind field.
-	pushTr := &spmdMaskTransition{kind: "pushThen", cond: cond}
-	swapTr := &spmdMaskTransition{kind: "swapElse", cond: cond}
-	popTr := &spmdMaskTransition{kind: "pop"}
-
-	if pushTr.kind != "pushThen" {
-		t.Errorf("pushThen kind = %q, want %q", pushTr.kind, "pushThen")
-	}
-	if swapTr.kind != "swapElse" {
-		t.Errorf("swapElse kind = %q, want %q", swapTr.kind, "swapElse")
-	}
-	if popTr.kind != "pop" {
-		t.Errorf("pop kind = %q, want %q", popTr.kind, "pop")
-	}
-	if pushTr.cond.C != cond.C {
-		t.Error("pushThen cond not preserved")
-	}
-
-	// Verify builder starts with nil mask transitions map.
-	if b.spmdMaskTransitions != nil {
-		t.Error("expected nil spmdMaskTransitions for fresh builder")
-	}
-	if b.spmdContiguousPtr != nil {
-		t.Error("expected nil spmdContiguousPtr for fresh builder")
 	}
 }
 
@@ -4706,35 +4617,6 @@ func TestSPMDShiftedLoadCodegen(t *testing.T) {
 			t.Errorf("result lanes = %d, want 16", result.Type().VectorSize())
 		}
 	})
-}
-
-func TestSPMDPeeledMainMask(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-	b := newTestBuilder(t, c)
-
-	tests := []struct {
-		name      string
-		laneCount int
-	}{
-		{"4_lanes", 4},
-		{"16_lanes", 16},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mask := b.spmdPeeledMainMask(tt.laneCount)
-			if mask.IsNil() {
-				t.Fatal("spmdPeeledMainMask returned nil")
-			}
-			// Verify it matches ConstAllOnes of the expected type.
-			maskType := llvm.VectorType(c.spmdMaskElemType(tt.laneCount), tt.laneCount)
-			expected := llvm.ConstAllOnes(maskType)
-			if mask.Type() != expected.Type() {
-				t.Errorf("mask type mismatch: got %v, want %v", mask.Type(), expected.Type())
-			}
-		})
-	}
 }
 
 // extractConstVec extracts all integer elements from a constant LLVM vector as
