@@ -653,61 +653,12 @@ func TestSPMDIsBlockInSPMDBody(t *testing.T) {
 	if b.spmdInfo != nil {
 		t.Fatal("expected spmdInfo to be nil for test builder")
 	}
-	if b.spmdThenExitRedirects != nil {
-		t.Fatal("expected spmdThenExitRedirects to be nil for test builder")
-	}
-	if b.spmdMergeSelects != nil {
-		t.Fatal("expected spmdMergeSelects to be nil for test builder")
-	}
-	if b.spmdVaryingIfs != nil {
-		t.Fatal("expected spmdVaryingIfs to be nil for test builder")
-	}
-	if b.spmdMaskTransitions != nil {
-		t.Fatal("expected spmdMaskTransitions to be nil for test builder")
-	}
 	if b.spmdContiguousPtr != nil {
 		t.Fatal("expected spmdContiguousPtr to be nil for test builder")
 	}
 
 	// Without a real SSA function, we can't call isBlockInSPMDBody directly.
 	// Verify the precondition: spmdInfo is nil, so the method would return nil.
-}
-
-func TestSPMDMaskTransitionTypes(t *testing.T) {
-	// Verify that spmdMaskTransition structs can be constructed correctly.
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-	b := newTestBuilder(t, c)
-	defer b.Dispose()
-
-	maskType := llvm.VectorType(c.ctx.Int1Type(), 4)
-	cond := llvm.ConstAllOnes(maskType)
-
-	// Construct each transition type and verify the kind field.
-	pushTr := &spmdMaskTransition{kind: "pushThen", cond: cond}
-	swapTr := &spmdMaskTransition{kind: "swapElse", cond: cond}
-	popTr := &spmdMaskTransition{kind: "pop"}
-
-	if pushTr.kind != "pushThen" {
-		t.Errorf("pushThen kind = %q, want %q", pushTr.kind, "pushThen")
-	}
-	if swapTr.kind != "swapElse" {
-		t.Errorf("swapElse kind = %q, want %q", swapTr.kind, "swapElse")
-	}
-	if popTr.kind != "pop" {
-		t.Errorf("pop kind = %q, want %q", popTr.kind, "pop")
-	}
-	if pushTr.cond.C != cond.C {
-		t.Error("pushThen cond not preserved")
-	}
-
-	// Verify builder starts with nil mask transitions map.
-	if b.spmdMaskTransitions != nil {
-		t.Error("expected nil spmdMaskTransitions for fresh builder")
-	}
-	if b.spmdContiguousPtr != nil {
-		t.Error("expected nil spmdContiguousPtr for fresh builder")
-	}
 }
 
 func TestSPMDBroadcastMatchForSelect(t *testing.T) {
@@ -4107,57 +4058,6 @@ func TestSPMDIndexMaxValueConst(t *testing.T) {
 	}
 }
 
-func TestSPMDSameStoreAddr(t *testing.T) {
-	// Test that spmdSameStoreAddr correctly identifies matching store destinations.
-
-	// Case 1: nil values should not match.
-	if spmdSameStoreAddr(nil, nil) {
-		t.Error("nil values should not match")
-	}
-
-	// Case 2: same SSA value pointer should match.
-	v := ssa.NewConst(constant.MakeInt64(1), types.Typ[types.Int])
-	if !spmdSameStoreAddr(v, v) {
-		t.Error("same SSA value should match itself")
-	}
-
-	// Case 3: different SSA values (not IndexAddr) should not match.
-	v2 := ssa.NewConst(constant.MakeInt64(1), types.Typ[types.Int])
-	if spmdSameStoreAddr(v, v2) {
-		t.Error("different SSA values without IndexAddr should not match")
-	}
-
-	// Case 4: one nil, one non-nil should not match.
-	if spmdSameStoreAddr(v, nil) {
-		t.Error("non-nil vs nil should not match")
-	}
-	if spmdSameStoreAddr(nil, v) {
-		t.Error("nil vs non-nil should not match")
-	}
-
-	// Case 5: two distinct IndexAddr nodes with same base and index should match.
-	base := ssa.NewConst(constant.MakeInt64(0), types.Typ[types.Int])
-	idx := ssa.NewConst(constant.MakeInt64(1), types.Typ[types.Int])
-	idxA := &ssa.IndexAddr{X: base, Index: idx}
-	idxB := &ssa.IndexAddr{X: base, Index: idx}
-	if !spmdSameStoreAddr(idxA, idxB) {
-		t.Error("IndexAddr with same base+index should match")
-	}
-
-	// Case 6: IndexAddr nodes with different indices should not match.
-	idx2 := ssa.NewConst(constant.MakeInt64(2), types.Typ[types.Int])
-	idxC := &ssa.IndexAddr{X: base, Index: idx2}
-	if spmdSameStoreAddr(idxA, idxC) {
-		t.Error("IndexAddr with different index should not match")
-	}
-
-	// Case 7: IndexAddr nodes with different bases should not match.
-	base2 := ssa.NewConst(constant.MakeInt64(0), types.Typ[types.Int])
-	idxD := &ssa.IndexAddr{X: base2, Index: idx}
-	if spmdSameStoreAddr(idxA, idxD) {
-		t.Error("IndexAddr with different base should not match")
-	}
-}
 
 func TestSPMDStoreCoalescing(t *testing.T) {
 	c := newTestCompilerContext(t)

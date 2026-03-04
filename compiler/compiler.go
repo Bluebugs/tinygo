@@ -181,20 +181,14 @@ type builder struct {
 	spmdLoopState         *spmdLoopState                               // SPMD loop analysis results (nil if no SPMD)
 	spmdValueOverride     map[ssa.Value]llvm.Value                     // SPMD value substitutions (e.g., iter phi -> lane indices)
 	spmdDecomposed        map[ssa.Value]*spmdDecomposedIndex           // decomposed index values (scalar base + <N x i8> offset) for wide lanes
-	spmdVaryingIfs        map[int]*spmdVaryingIf                       // if-block index -> varying if info
-	spmdThenExitRedirects map[int]llvm.BasicBlock                      // then-exit block index -> else-entry LLVM block
-	spmdMergeSelects      map[int]*spmdVaryingIf                       // merge block index -> varying if info
-	spmdEntryMask         llvm.Value                                   // SPMD function entry mask (zero if not SPMD function)
-	spmdMaskStack         []llvm.Value                                 // execution mask stack for nested varying if/else
-	spmdMaskTransitions   map[int]*spmdMaskTransition                  // block index -> mask transition to apply
-	spmdContiguousPtr     map[ssa.Value]*spmdContiguousInfo            // IndexAddr SSA value -> contiguous access info
-	spmdShiftedPtr        map[ssa.Value]*spmdShiftedLoadInfo           // IndexAddr SSA value -> shifted load info (load+shuffle)
-	spmdCoalescedStores   map[*ssa.Store]*spmdCoalescedStore           // store → coalescing info (then/else pairs)
+	spmdEntryMask     llvm.Value          // SPMD function entry mask (zero if not SPMD function)
+	spmdMaskStack     []llvm.Value        // execution mask stack for base loop mask (index clamping)
+	spmdContiguousPtr map[ssa.Value]*spmdContiguousInfo // IndexAddr SSA value -> contiguous access info
+	spmdShiftedPtr    map[ssa.Value]*spmdShiftedLoadInfo // IndexAddr SSA value -> shifted load info (load+shuffle)
 	spmdInterleavedStores map[*ssa.Store]*spmdInterleavedStoreInfo     // store → interleaved group info
 	spmdInterleavedAddrs  map[*ssa.IndexAddr]*spmdInterleavedStoreInfo // IndexAddr → interleaved group info
 	spmdInterleavedValues map[*spmdInterleavedStoreGroup][]llvm.Value  // group → collected values (filled during codegen)
-	spmdFuncIsBody        bool                                         // true if entire function body is an SPMD region (varying params, no go-for loops)
-	spmdMergePhiOverrides map[*ssa.Phi]spmdMergePhiOverride            // phi -> override info (for multi-predecessor merge phis)
+	spmdFuncIsBody bool // true if entire function body is an SPMD region (varying params, no go-for loops)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1444,31 +1438,19 @@ func (b *builder) createFunction() {
 		b.spmdFuncIsBody = true
 	}
 
-	// SPMD: initialize maps and analysis for the active SPMD context.
-	// For go-for loop context: full infrastructure (varying if detection,
-	// mask transitions, contiguous/shifted/coalesced/interleaved maps).
-	// For func body context: minimal infrastructure (contiguous/shifted
-	// maps only — SSA predication already linearized varying control flow
-	// and converted vectorizable loads/stores to SPMDLoad/SPMDStore).
+	// SPMD: initialize maps for the active SPMD context.
+	// SSA-level predication (x-tools-spmd) has already linearized all varying
+	// if/else control flow before TinyGo sees the SSA. TinyGo only needs
+	// contiguous/shifted pointer maps and interleaved store analysis.
 	if b.spmdLoopState != nil || b.spmdFuncIsBody {
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
 		b.spmdShiftedPtr = make(map[ssa.Value]*spmdShiftedLoadInfo)
-		b.spmdMergePhiOverrides = make(map[*ssa.Phi]spmdMergePhiOverride)
 
 		if b.spmdLoopState != nil {
-			b.spmdVaryingIfs = make(map[int]*spmdVaryingIf)
-			b.spmdThenExitRedirects = make(map[int]llvm.BasicBlock)
-			b.spmdMergeSelects = make(map[int]*spmdVaryingIf)
-			b.spmdMaskTransitions = make(map[int]*spmdMaskTransition)
-			b.spmdCoalescedStores = make(map[*ssa.Store]*spmdCoalescedStore)
 			b.spmdInterleavedStores = make(map[*ssa.Store]*spmdInterleavedStoreInfo)
 			b.spmdInterleavedAddrs = make(map[*ssa.IndexAddr]*spmdInterleavedStoreInfo)
 			b.spmdInterleavedValues = make(map[*spmdInterleavedStoreGroup][]llvm.Value)
 
-			// Pre-detect varying ifs before compiling blocks. Only needed for
-			// go-for loop context where TinyGo handles varying If linearization.
-			// For func body context, SSA predication already linearized all varying Ifs.
-			b.preDetectVaryingIfs()
 			b.spmdAnalyzeInterleavedStores()
 		}
 	}
@@ -1524,61 +1506,6 @@ func (b *builder) createFunction() {
 			}
 		}
 
-		// SPMD: apply mask transitions at block boundaries.
-		if b.spmdMaskTransitions != nil {
-			if tr, ok := b.spmdMaskTransitions[block.Index]; ok {
-				switch tr.kind {
-				case "pushThen":
-					parentMask := b.spmdCurrentMask()
-					if !parentMask.IsNil() {
-						// tr.cond may be <N x i1> (comparison) while parentMask is <N x iW> (WASM).
-						cond := tr.cond
-						if cond.IsNil() {
-							panic(fmt.Sprintf("SPMD pushThen: tr.cond is nil for block %d (%s)", block.Index, block.Comment))
-						}
-						cond = b.spmdMatchMaskFormat(cond, parentMask)
-						if cond.Type() != parentMask.Type() {
-							// Type mismatch: both are vectors but different element widths.
-							// This can happen when a condition comes from a mixed-width context
-							// (e.g., zext'd byte comparisons in 4-lane loop). Convert via trunc
-							// if cond is wider than parentMask, or sext if narrower.
-							condElem := cond.Type().ElementType()
-							maskElem := parentMask.Type().ElementType()
-							lc := cond.Type().VectorSize()
-							if condElem.IntTypeWidth() > maskElem.IntTypeWidth() {
-								cond = b.CreateTrunc(cond, parentMask.Type(), "")
-							} else if condElem.IntTypeWidth() < maskElem.IntTypeWidth() {
-								cond = b.CreateSExt(cond, parentMask.Type(), "")
-							} else if condElem != maskElem {
-								// Same width but different type — bitcast.
-								cond = b.CreateBitCast(cond, parentMask.Type(), "")
-							} else {
-								panic(fmt.Sprintf("SPMD pushThen: unresolvable type mismatch: cond elemW=%d maskElemW=%d laneCount=%d block=%d (%s)",
-									condElem.IntTypeWidth(), maskElem.IntTypeWidth(), lc, block.Index, block.Comment))
-							}
-						}
-						thenMask := b.CreateAnd(parentMask, cond, "spmd.then.mask")
-						b.spmdPushMask(thenMask)
-					}
-				case "swapElse":
-					// Pop the then-mask, peek at parent, push else-mask.
-					b.spmdPopMask()
-					parentMask := b.spmdCurrentMask()
-					if !parentMask.IsNil() {
-						// tr.cond may be <N x i1> while parentMask is <N x iW>. Match first.
-						cond := b.spmdMatchMaskFormat(tr.cond, parentMask)
-						notCond := b.CreateNot(cond, "")
-						elseMask := b.CreateAnd(parentMask, notCond, "spmd.else.mask")
-						b.spmdPushMask(elseMask)
-					}
-				case "pop":
-					b.spmdPopMask()
-				case "pushDirect":
-					// Push the pre-computed mask directly (for switch case bodies).
-					b.spmdPushMask(tr.cond)
-				}
-			}
-		}
 
 		for _, instr := range block.Instrs {
 			if instr, ok := instr.(*ssa.DebugRef); ok {
@@ -1651,75 +1578,6 @@ func (b *builder) createFunction() {
 	for _, phi := range b.phis {
 		block := phi.ssa.Block()
 		for i, edge := range phi.ssa.Edges {
-			// SPMD: handle merge phi overrides (multi-pred and deferred 2-edge cases).
-			if override, ok := b.spmdMergePhiOverrides[phi.ssa]; ok {
-				// Check if this edge should be skipped (redirected away after linearization).
-				if i == override.skipEdgeIdx {
-					continue
-				}
-				if i == override.thenEdgeIdx || i == override.elseEdgeIdx {
-					// Create select in the surviving block, just before its terminator.
-					// We can't put it in the merge block (phi's block) because the then/else
-					// values are defined in blocks that come after the merge in the CFG,
-					// and LLVM requires instructions to dominate all their uses.
-					// Re-read the exit block at resolution time: createRuntimeAssert may have
-					// inserted bounds-check blocks after the override was registered, changing
-					// blockInfo[...].exit from the value captured at registration time.
-					var survivingBB llvm.BasicBlock
-					if override.info.hasElse {
-						survivingBB = b.blockInfo[block.Preds[override.elseEdgeIdx].Index].exit
-					} else {
-						survivingBB = b.blockInfo[block.Preds[override.thenEdgeIdx].Index].exit
-					}
-					term := survivingBB.LastInstruction()
-					if !term.IsNil() {
-						b.SetInsertPointBefore(term)
-					} else {
-						b.SetInsertPointAtEnd(survivingBB)
-					}
-
-					var selected llvm.Value
-					if override.info.isValueLOR {
-						// "a || b" VALUE expression: result = a | b (bitwise OR of both conditions).
-						// elseEdgeIdx carries the RHS condition (cond_b from binop.rhs).
-						rhsVal := b.getValue(phi.ssa.Edges[override.elseEdgeIdx], getPos(phi.ssa))
-						lhsCond := override.info.cond
-						rhsCond := rhsVal
-						if lhsCond.Type() != rhsCond.Type() {
-							// Normalize to same mask format: convert <N x i1> → <N x iW>.
-							rhsCond = b.spmdMatchMaskFormat(rhsVal, lhsCond)
-							if lhsCond.Type() != rhsCond.Type() {
-								lhsCond = b.spmdMatchMaskFormat(override.info.cond, rhsVal)
-							}
-						}
-						selected = b.CreateOr(lhsCond, rhsCond, "spmd.lor.value")
-						// Ensure the OR result matches the phi's expected mask format
-						// (e.g., <16 x i8> when both operands were raw <16 x i1>).
-						if selected.Type() != phi.llvm.Type() {
-							selected = b.spmdMatchMaskFormat(selected, phi.llvm)
-						}
-					} else {
-						// Standard case: create select for the then/else pair.
-						thenValue := b.getValue(phi.ssa.Edges[override.thenEdgeIdx], getPos(phi.ssa))
-						elseValue := b.getValue(phi.ssa.Edges[override.elseEdgeIdx], getPos(phi.ssa))
-						thenValue, elseValue = b.spmdBroadcastMatch(thenValue, elseValue)
-
-						// Use masked select (handles WASM i32 masks).
-						thenIsVec := thenValue.Type().TypeKind() == llvm.VectorTypeKind
-						elseIsVec := elseValue.Type().TypeKind() == llvm.VectorTypeKind
-						if thenIsVec || elseIsVec {
-							selected = b.spmdMaskSelect(override.info.cond, thenValue, elseValue)
-						} else {
-							scalarCond := b.spmdVectorAnyTrue(override.info.cond)
-							selected = b.CreateSelect(scalarCond, thenValue, elseValue, "")
-						}
-					}
-
-					phi.llvm.AddIncoming([]llvm.Value{selected}, []llvm.BasicBlock{survivingBB})
-					continue
-				}
-			}
-
 			llvmVal := b.getValue(edge, getPos(phi.ssa))
 			llvmVal = b.spmdRangeIndexInitOverride(phi.ssa, i, llvmVal)
 			// SPMD: reconcile Varying[bool] mask format mismatches. A phi may
@@ -1851,34 +1709,11 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		block := instr.Block()
 		blockThen := b.blockInfo[block.Succs[0].Index].entry
 		blockElse := b.blockInfo[block.Succs[1].Index].entry
-		// SPMD: linearize varying if/else (vector condition).
-		if (b.spmdLoopState != nil || b.spmdFuncIsBody) && cond.Type().TypeKind() == llvm.VectorTypeKind {
-			b.spmdDetectVaryingIf(block, cond)
-			// For "a || b" VALUE expressions (isValueLOR): thenEntry == merge.
-			// Branch to elseEntry (binop.rhs) so all lanes evaluate b.
-			// spmdCreateMergeSelect will compute the OR result at the merge point.
-			if info, ok := b.spmdVaryingIfs[block.Index]; ok && info.isValueLOR {
-				b.CreateBr(blockElse)
-			} else {
-				b.CreateBr(blockThen)
-			}
-		} else {
-			b.CreateCondBr(cond, blockThen, blockElse)
-		}
+		b.CreateCondBr(cond, blockThen, blockElse)
 	case *ssa.Jump:
-		if target, ok := b.spmdShouldRedirectJump(instr.Block()); ok {
-			b.CreateBr(target)
-		} else {
-			// SPMD: pop mask stack before jumping to a loop-header merge.
-			// This handles varying if/else inside loops where the merge is the
-			// loop header — the pop can't be at the merge block entry.
-			if b.spmdShouldPopBeforeJump(instr.Block()) {
-				b.spmdPopMask()
-			}
-			succIdx := instr.Block().Succs[0].Index
-			blockJump := b.blockInfo[succIdx].entry
-			b.CreateBr(blockJump)
-		}
+		succIdx := instr.Block().Succs[0].Index
+		blockJump := b.blockInfo[succIdx].entry
+		b.CreateBr(blockJump)
 	case *ssa.MapUpdate:
 		m := b.getValue(instr.Map, getPos(instr))
 		key := b.getValue(instr.Key, getPos(instr))
@@ -1920,92 +1755,6 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 	case *ssa.Send:
 		b.createChanSend(instr)
 	case *ssa.Store:
-		// SPMD: check for coalesced store (matching stores in then/else branches).
-		if b.spmdCoalescedStores != nil {
-			if coal, ok := b.spmdCoalescedStores[instr]; ok {
-				if instr == coal.thenStore {
-					// Then-store: skip emission. The else-store will emit the coalesced store.
-					return
-				}
-				if instr == coal.elseStore {
-					// Else-store: emit select(cond, thenVal, elseVal) + single store.
-					// coal.ifInfo.cond is populated during *ssa.If compilation
-					// (before this store in DomPreorder), so it is normally valid here.
-					// Guard against edge cases (e.g., LOR chain ordering) where
-					// the condition may not yet be set.
-					cond := coal.ifInfo.cond
-					if cond.IsNil() {
-						break // Fall through to normal store handling.
-					}
-
-					thenVal := b.getValue(coal.thenStore.Val, getPos(instr))
-					elseVal := b.getValue(coal.elseStore.Val, getPos(instr))
-
-					// Broadcast scalars to vectors if needed.
-					thenVal, elseVal = b.spmdBroadcastMatch(thenVal, elseVal)
-
-					// If both values are still scalar (uniform constants), splat
-					// them to vectors matching the condition's lane count.
-					// Invariant: cond is always a vector (varying-if condition).
-					if thenVal.Type().TypeKind() != llvm.VectorTypeKind &&
-						elseVal.Type().TypeKind() != llvm.VectorTypeKind &&
-						cond.Type().TypeKind() == llvm.VectorTypeKind {
-						laneCount := cond.Type().VectorSize()
-						vecType := llvm.VectorType(thenVal.Type(), laneCount)
-						thenVal = b.splatScalar(thenVal, vecType)
-						elseVal = b.splatScalar(elseVal, vecType)
-					}
-
-					// Select using the varying if condition.
-					selected := b.spmdMaskSelect(cond, thenVal, elseVal)
-
-					// Use parent mask (before the varying if pushed its mask).
-					parentMask := b.spmdParentMask()
-					if parentMask.IsNil() {
-						// Fallback: if no parent mask, use all-ones.
-						laneCount := selected.Type().VectorSize()
-						parentMask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount))
-					}
-
-					// Emit single store with parent mask.
-					llvmAddr := b.getValue(instr.Addr, getPos(instr))
-					if b.spmdContiguousPtr != nil {
-						if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
-							// Determine if narrowing is needed on WASM.
-							// Use the destination pointer element type first (go/ssa uses scalar
-							// types for range values, not SPMDType), then fall back to SPMDType.
-							var narrowBits uint64
-							if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
-								narrowBits = b.spmdNarrowStoreElemBits(selected, addrPtrType.Elem())
-							}
-							if narrowBits == 0 {
-								if spmdVal, ok := coal.elseStore.Val.Type().(*types.SPMDType); ok {
-									narrowBits = b.spmdNarrowStoreElemBits(selected, spmdVal.Elem())
-								}
-							}
-							if narrowBits > 0 {
-								b.spmdMaskedStoreNarrow(selected, narrowBits, ci.scalarPtr, parentMask)
-							} else if !b.spmdIsConstAllOnesMask(parentMask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
-								// Cap-based optimization: use load-blend-store when safe.
-								b.spmdFullStoreWithBlend(selected, ci, parentMask)
-								b.currentBlockInfo.exit = b.GetInsertBlock()
-							} else {
-								b.spmdMaskedStore(selected, ci.scalarPtr, parentMask)
-							}
-							return
-						}
-					}
-					if llvmAddr.Type().TypeKind() == llvm.VectorTypeKind {
-						b.spmdMaskedScatter(selected, llvmAddr, parentMask)
-						return
-					}
-					// Fallback: plain store (non-SPMD address).
-					b.CreateStore(selected, llvmAddr)
-					return
-				}
-			}
-		}
-
 		// SPMD: interleaved stride-S store handling.
 		// First S-1 remainders save their values; last remainder emits interleaved stores.
 		if b.spmdInterleavedStores != nil {
@@ -3290,12 +3039,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			return b.createMapIteratorNext(rangeVal, llvmRangeVal, it), nil
 		}
 	case *ssa.Phi:
-		if val, ok := b.spmdCreateMergeSelect(expr); ok {
-			return val, nil
-		}
-		// SPMD: for Varying[bool] phis, use the active loop's mask format (e.g., <16 x i8>)
-		// instead of getLLVMType's <16 x i1>. Delegates to spmdVaryingBoolPhiType.
-		phiType := b.spmdVaryingBoolPhiType(expr)
+		phiType := b.getLLVMType(expr.Type())
 		phi := b.CreatePHI(phiType, "")
 		b.phis = append(b.phis, phiNode{expr, phi})
 		return phi, nil
