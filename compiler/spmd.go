@@ -618,8 +618,12 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 
 		// Deduplicate: map SSA loop info pointer to TinyGo loop info via position.
 		// The mainIterPhi is in MainBodyBlock; find the corresponding TinyGo SPMDLoopInfo.
+		// Use the ORIGINAL body block (pre-peeling) for position-based
+		// SPMDLoopInfo lookup, since the peeled MainBodyBlock contains cloned
+		// instructions that may lack source positions.
 		var loopInfo *SPMDLoopInfo
-		for _, instr := range ssaLoop.MainBodyBlock.Instrs {
+		lookupBlock := ssaLoop.BodyBlock // original body block (unreachable after peeling)
+		for _, instr := range lookupBlock.Instrs {
 			if pos := instr.(interface{ Pos() token.Pos }).Pos(); pos != token.NoPos {
 				loopInfo = b.isInSPMDLoop(pos)
 				if loopInfo != nil {
