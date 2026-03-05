@@ -188,6 +188,10 @@ type builder struct {
 	spmdInterleavedAddrs  map[*ssa.IndexAddr]*spmdInterleavedStoreInfo  // IndexAddr → interleaved group info
 	spmdInterleavedValues map[*spmdInterleavedStoreGroup][]llvm.Value   // group → collected values (filled during codegen)
 	spmdFuncIsBody        bool                                          // true if entire function body is an SPMD region (varying params, no go-for loops)
+	// spmdBreakMaskBackEdges maps a loop-block index to the SSA back-edge value of the
+	// spmd.break.mask phi for that loop. Used for early-exit in SPMD function bodies.
+	// Non-nil only when fn.SPMDRegularBreaks is populated and spmdFuncIsBody is true.
+	spmdBreakMaskBackEdges map[int]ssa.Value
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1437,6 +1441,30 @@ func (b *builder) createFunction() {
 		b.spmdFuncIsBody = true
 	}
 
+	// SPMD: for function bodies with varying breaks in regular for-loops, build
+	// a map from loop-block index to the break mask back-edge SSA value.
+	// predicateVaryingBreaks in x-tools-spmd populates fn.SPMDRegularBreaks
+	// with (bodyBlock → breakMaskPhi). We need the back-edge value (the
+	// "new_break_mask" computed each iteration) to emit the early-exit check
+	// in the *ssa.If handler (all-lanes-broken → jump to done).
+	if b.spmdFuncIsBody && len(b.fn.SPMDRegularBreaks) > 0 {
+		b.spmdBreakMaskBackEdges = make(map[int]ssa.Value)
+		for loopBlock, breakMaskPhi := range b.fn.SPMDRegularBreaks {
+			// Find the back-edge value: the phi edge that is NOT a Const zero.
+			// The entry edge carries the initial zero Const; the back-edge carries
+			// the "new_break_mask" OR result computed in the loop body.
+			// x-tools-spmd keys SPMDRegularBreaks by loopBlock (the block containing
+			// the loop counter If), so the index matches instr.Block().Index in the
+			// *ssa.If handler.
+			for _, edge := range breakMaskPhi.Edges {
+				if _, isConst := edge.(*ssa.Const); !isConst {
+					b.spmdBreakMaskBackEdges[loopBlock.Index] = edge
+					break
+				}
+			}
+		}
+	}
+
 	// SPMD: initialize maps for the active SPMD context.
 	// SSA-level predication (x-tools-spmd) has already linearized all varying
 	// if/else control flow before TinyGo sees the SSA. TinyGo only needs
@@ -1711,6 +1739,37 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		block := instr.Block()
 		blockThen := b.blockInfo[block.Succs[0].Index].entry
 		blockElse := b.blockInfo[block.Succs[1].Index].entry
+		// SPMD early-exit: if this loop's body had a varying break, check whether
+		// all SIMD lanes have broken before executing the normal loop-back condition.
+		// When all lanes are broken we can jump directly to the loop's done block
+		// (blockElse for the standard counter-check If), skipping further iterations.
+		// This restores the early-exit optimisation removed when the mask stack was
+		// eliminated; the break mask phi is now emitted by predicateVaryingBreaks in
+		// x-tools-spmd and exposed via fn.SPMDRegularBreaks.
+		//
+		// SPMDRegularBreaks is populated by predicateVaryingBreaks (called from
+		// predicateSPMDFuncBody), which only applies to SPMD function bodies —
+		// functions with varying parameters cannot contain go-for loops, so
+		// spmdBreakMaskBackEdges is the sole source for the back-edge value.
+		var breakMaskBackEdge ssa.Value
+		if b.spmdBreakMaskBackEdges != nil {
+			breakMaskBackEdge = b.spmdBreakMaskBackEdges[block.Index]
+		}
+		if breakMaskBackEdge != nil {
+			// Emit early-exit by combining the break-mask check with the normal
+			// loop counter condition: exit when all lanes are broken OR the
+			// counter has expired. This preserves the single-predecessor invariant
+			// of blockElse (the done block) — no new LLVM basic block is inserted,
+			// so phi nodes in blockElse do not need new incoming edges.
+			//   combined = allBroken OR NOT(cond)
+			//   condBr(combined, done, body) replaces condBr(cond, body, done)
+			newBreakMask := b.getValue(breakMaskBackEdge, getPos(instr))
+			allBroken := b.spmdVectorAllTrue(newBreakMask) // i1
+			notCond := b.CreateNot(cond, "not.cond")
+			combinedExit := b.CreateOr(allBroken, notCond, "combined.exit")
+			b.CreateCondBr(combinedExit, blockElse, blockThen)
+			return
+		}
 		b.CreateCondBr(cond, blockThen, blockElse)
 	case *ssa.Jump:
 		succIdx := instr.Block().Succs[0].Index
