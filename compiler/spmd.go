@@ -1146,27 +1146,6 @@ func (b *builder) spmdMaterializeDecomposed(decomp *spmdDecomposedIndex) llvm.Va
 	return b.CreateAdd(baseVec, offsetExt, "spmd.materialized.idx")
 }
 
-// spmdPushMask pushes a new execution mask onto the stack.
-func (b *builder) spmdPushMask(mask llvm.Value) {
-	b.spmdMaskStack = append(b.spmdMaskStack, mask)
-}
-
-// spmdPopMask removes the top mask from the stack.
-func (b *builder) spmdPopMask() {
-	if len(b.spmdMaskStack) > 0 {
-		b.spmdMaskStack = b.spmdMaskStack[:len(b.spmdMaskStack)-1]
-	}
-}
-
-// spmdCurrentMask returns the top of the mask stack, or a nil Value if empty.
-func (b *builder) spmdCurrentMask() llvm.Value {
-	if len(b.spmdMaskStack) > 0 {
-		return b.spmdMaskStack[len(b.spmdMaskStack)-1]
-	}
-	return llvm.Value{}
-}
-
-
 // spmdContiguousInfo tracks an IndexAddr result that was detected as contiguous SPMD access.
 type spmdContiguousInfo struct {
 	scalarPtr   llvm.Value      // scalar GEP result (base of contiguous access)
@@ -1189,7 +1168,6 @@ type spmdShiftedLoadInfo struct {
 	loop        *spmdActiveLoop // owning SPMD loop
 }
 
-
 // spmdStridePattern represents the stride decomposition of an SSA index expression.
 // For example, i*2+1 has stride=2, remainder=1, where i is the SPMD loop iterator.
 type spmdStridePattern struct {
@@ -1204,12 +1182,12 @@ type spmdStridePattern struct {
 // base slice. These can be replaced with S shufflevector interleaves +
 // S contiguous masked stores.
 type spmdInterleavedStoreGroup struct {
-	stores    []*ssa.Store     // one store per remainder, ordered 0..S-1
-	addrs     []*ssa.IndexAddr // corresponding IndexAddr per remainder
-	stride    int              // stride value (2, 3, or 4)
-	baseSlice ssa.Value        // the common base slice (IndexAddr.X)
-	loop      *spmdActiveLoop  // owning SPMD loop
-	laneCount int              // SIMD lane count
+	stores    []ssa.Instruction // one store per remainder, ordered 0..S-1 (*ssa.Store or *ssa.SPMDStore)
+	addrs     []*ssa.IndexAddr  // corresponding IndexAddr per remainder
+	stride    int               // stride value (2, 3, or 4)
+	baseSlice ssa.Value         // the common base slice (IndexAddr.X)
+	loop      *spmdActiveLoop   // owning SPMD loop
+	laneCount int               // SIMD lane count
 }
 
 // spmdInterleavedStoreInfo links a single store or IndexAddr to its
@@ -1337,6 +1315,19 @@ func ssaConstInt64(v ssa.Value) (int64, bool) {
 	return val, ok
 }
 
+// spmdStoreVal extracts the Val (value being stored) from either a *ssa.Store
+// or a *ssa.SPMDStore instruction. Panics if instr is neither type.
+func spmdStoreVal(instr ssa.Instruction) ssa.Value {
+	switch s := instr.(type) {
+	case *ssa.Store:
+		return s.Val
+	case *ssa.SPMDStore:
+		return s.Val
+	default:
+		panic(fmt.Sprintf("spmdStoreVal: unexpected instruction type %T", instr))
+	}
+}
+
 // spmdAnalyzeInterleavedStores scans all SPMD body blocks and groups stores whose
 // target index follows an iter*S+R pattern (stride S in [2,4], remainder R in
 // [0..S-1]) into spmdInterleavedStoreGroup records. Complete groups (all S
@@ -1361,8 +1352,8 @@ func (b *builder) spmdAnalyzeInterleavedStores() {
 
 	// Partial group accumulator: maps groupKey → per-remainder slot.
 	type partialGroup struct {
-		stores []*ssa.Store     // indexed by remainder; nil means not yet seen
-		addrs  []*ssa.IndexAddr // parallel to stores
+		stores []ssa.Instruction // indexed by remainder; nil means not yet seen (*ssa.Store or *ssa.SPMDStore)
+		addrs  []*ssa.IndexAddr  // parallel to stores
 		loop   *spmdActiveLoop
 	}
 
@@ -1375,11 +1366,17 @@ func (b *builder) spmdAnalyzeInterleavedStores() {
 		}
 
 		for _, instr := range block.Instrs {
-			store, ok := instr.(*ssa.Store)
-			if !ok {
+			// Match both *ssa.Store and *ssa.SPMDStore (predicated stores).
+			var storeAddr ssa.Value
+			switch s := instr.(type) {
+			case *ssa.SPMDStore:
+				storeAddr = s.Addr
+			case *ssa.Store:
+				storeAddr = s.Addr
+			default:
 				continue
 			}
-			indexAddr, ok := store.Addr.(*ssa.IndexAddr)
+			indexAddr, ok := storeAddr.(*ssa.IndexAddr)
 			if !ok {
 				continue
 			}
@@ -1401,7 +1398,7 @@ func (b *builder) spmdAnalyzeInterleavedStores() {
 			pg := partials[key]
 			if pg == nil {
 				pg = &partialGroup{
-					stores: make([]*ssa.Store, pat.stride),
+					stores: make([]ssa.Instruction, pat.stride),
 					addrs:  make([]*ssa.IndexAddr, pat.stride),
 					loop:   loop,
 				}
@@ -1411,7 +1408,7 @@ func (b *builder) spmdAnalyzeInterleavedStores() {
 			if pg.stores[rem] != nil {
 				continue // duplicate remainder in the same block — skip
 			}
-			pg.stores[rem] = store
+			pg.stores[rem] = instr
 			pg.addrs[rem] = indexAddr
 		}
 	}
@@ -1431,9 +1428,9 @@ func (b *builder) spmdAnalyzeInterleavedStores() {
 		}
 
 		// Verify all stored values have the same type.
-		baseType := pg.stores[0].Val.Type()
+		baseType := spmdStoreVal(pg.stores[0]).Type()
 		for r := 1; r < stride; r++ {
-			if !types.Identical(pg.stores[r].Val.Type(), baseType) {
+			if !types.Identical(spmdStoreVal(pg.stores[r]).Type(), baseType) {
 				complete = false
 				break
 			}
@@ -1457,7 +1454,6 @@ func (b *builder) spmdAnalyzeInterleavedStores() {
 		}
 	}
 }
-
 
 // isBlockInSPMDBody checks if a given SSA block is inside an SPMD loop body.
 // This extends beyond just rangeint.body blocks to include if.then/if.else/if.done.
@@ -1585,7 +1581,6 @@ func (b *builder) spmdWasmAllTrue(mask llvm.Value) llvm.Value {
 	}
 	return b.createCall(fnType, fn, []llvm.Value{mask}, "")
 }
-
 
 // spmdIsWASM returns true when the compiler target is a WebAssembly target.
 // On WASM, SIMD comparisons natively produce <N x i32> (all-ones/all-zeros),
@@ -1786,7 +1781,6 @@ func (b *builder) spmdIsVaryingBoolPhi(phi *ssa.Phi) bool {
 	basic, ok := elem.(*types.Basic)
 	return ok && basic.Info()&types.IsBoolean != 0
 }
-
 
 // spmdFindActiveLoopForBlock returns the active SPMD loop for the given SSA
 // block, or nil if the block is not inside any SPMD loop body. Checks the
@@ -4290,17 +4284,21 @@ func spmdIndexMaxValue(v ssa.Value) (uint64, bool) {
 	return 0, false
 }
 
-// spmdEmitInterleavedStore handles the last store (remainder == stride-1) in a
+// spmdEmitInterleavedStoreMasked handles the last store (remainder == stride-1) in a
 // stride-S interleaved store group. It collects values already saved for
 // remainders 0..S-2 from spmdInterleavedValues, shuffles them into S output
 // vectors in interleaved order, computes the base pointer into the destination
 // slice, and emits S masked stores.
-func (b *builder) spmdEmitInterleavedStore(lastStore *ssa.Store, info *spmdInterleavedStoreInfo) {
+//
+// lastVal is the SSA value being stored (from Val field of the last store).
+// lastAddr is the SSA address (from Addr field of the last store).
+// mask is the execution mask for the store; if nil/zero, all-ones is used.
+func (b *builder) spmdEmitInterleavedStoreMasked(lastVal ssa.Value, lastAddr ssa.Value, info *spmdInterleavedStoreInfo, mask llvm.Value) {
 	group := info.group
 	stride := group.stride
 	N := group.laneCount
 
-	// Collect all S values: 0..S-2 were saved earlier; S-1 comes from lastStore.
+	// Collect all S values: 0..S-2 were saved earlier; S-1 comes from lastVal.
 	vals := make([]llvm.Value, stride)
 	saved := b.spmdInterleavedValues[group]
 	for r := 0; r < stride-1; r++ {
@@ -4310,7 +4308,7 @@ func (b *builder) spmdEmitInterleavedStore(lastStore *ssa.Store, info *spmdInter
 		}
 		vals[r] = saved[r]
 	}
-	vals[stride-1] = b.getValue(lastStore.Val, getPos(lastStore))
+	vals[stride-1] = b.getValue(lastVal, token.NoPos)
 
 	// Shuffle values into S interleaved output vectors.
 	var outVecs []llvm.Value
@@ -4381,7 +4379,6 @@ func (b *builder) spmdEmitInterleavedStore(lastStore *ssa.Store, info *spmdInter
 	}
 
 	// Get the execution mask and expand it for each of the S output stores.
-	mask := b.spmdCurrentMask()
 	if mask.IsNil() {
 		mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(N), N))
 	}
@@ -4663,6 +4660,36 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 // handles mask unwrapping internally. For vector addresses (varying pointers),
 // a masked scatter is used; spmdMaskedScatter handles mask unwrapping internally.
 func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
+	// SPMD: interleaved stride-S store handling.
+	// First S-1 remainders save their values; last remainder emits interleaved stores.
+	if b.spmdInterleavedStores != nil {
+		if info, ok := b.spmdInterleavedStores[instr]; ok {
+			// Skip interleaved store in tail body phase of SSA-peeled loops — let
+			// normal scatter path handle it. The interleaved scalarBase is wrong
+			// for the tail.
+			inTail := false
+			if b.spmdLoopState != nil {
+				if loop, ok := b.spmdLoopState.bodyBlocks[b.currentBlock.Index]; ok && loop.isPeeled {
+					inTail = b.currentBlock.Index == loop.ssaLoopInfo.TailBodyBlock.Index
+				}
+			}
+			if !inTail {
+				mask := b.getValue(instr.Mask, instr.Pos())
+				if info.remainder < info.group.stride-1 {
+					vals := b.spmdInterleavedValues[info.group]
+					if vals == nil {
+						vals = make([]llvm.Value, info.group.stride)
+						b.spmdInterleavedValues[info.group] = vals
+					}
+					vals[info.remainder] = b.getValue(instr.Val, instr.Pos())
+					return
+				}
+				b.spmdEmitInterleavedStoreMasked(instr.Val, instr.Addr, info, mask)
+				return
+			}
+		}
+	}
+
 	addr := b.getValue(instr.Addr, instr.Pos())
 	val := b.getValue(instr.Val, instr.Pos())
 	mask := b.getValue(instr.Mask, instr.Pos())

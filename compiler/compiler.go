@@ -178,17 +178,16 @@ type builder struct {
 	deferBuiltinFuncs     map[ssa.Value]deferBuiltin
 	runDefersBlock        []llvm.BasicBlock
 	afterDefersBlock      []llvm.BasicBlock
-	spmdLoopState         *spmdLoopState                               // SPMD loop analysis results (nil if no SPMD)
-	spmdValueOverride     map[ssa.Value]llvm.Value                     // SPMD value substitutions (e.g., iter phi -> lane indices)
-	spmdDecomposed        map[ssa.Value]*spmdDecomposedIndex           // decomposed index values (scalar base + <N x i8> offset) for wide lanes
-	spmdEntryMask     llvm.Value          // SPMD function entry mask (zero if not SPMD function)
-	spmdMaskStack     []llvm.Value        // execution mask stack for base loop mask (index clamping)
-	spmdContiguousPtr map[ssa.Value]*spmdContiguousInfo // IndexAddr SSA value -> contiguous access info
-	spmdShiftedPtr    map[ssa.Value]*spmdShiftedLoadInfo // IndexAddr SSA value -> shifted load info (load+shuffle)
-	spmdInterleavedStores map[*ssa.Store]*spmdInterleavedStoreInfo     // store → interleaved group info
-	spmdInterleavedAddrs  map[*ssa.IndexAddr]*spmdInterleavedStoreInfo // IndexAddr → interleaved group info
-	spmdInterleavedValues map[*spmdInterleavedStoreGroup][]llvm.Value  // group → collected values (filled during codegen)
-	spmdFuncIsBody bool // true if entire function body is an SPMD region (varying params, no go-for loops)
+	spmdLoopState         *spmdLoopState                                // SPMD loop analysis results (nil if no SPMD)
+	spmdValueOverride     map[ssa.Value]llvm.Value                      // SPMD value substitutions (e.g., iter phi -> lane indices)
+	spmdDecomposed        map[ssa.Value]*spmdDecomposedIndex            // decomposed index values (scalar base + <N x i8> offset) for wide lanes
+	spmdEntryMask         llvm.Value                                    // SPMD function entry mask (zero if not SPMD function)
+	spmdContiguousPtr     map[ssa.Value]*spmdContiguousInfo             // IndexAddr SSA value -> contiguous access info
+	spmdShiftedPtr        map[ssa.Value]*spmdShiftedLoadInfo            // IndexAddr SSA value -> shifted load info (load+shuffle)
+	spmdInterleavedStores map[ssa.Instruction]*spmdInterleavedStoreInfo // store → interleaved group info (*ssa.Store or *ssa.SPMDStore)
+	spmdInterleavedAddrs  map[*ssa.IndexAddr]*spmdInterleavedStoreInfo  // IndexAddr → interleaved group info
+	spmdInterleavedValues map[*spmdInterleavedStoreGroup][]llvm.Value   // group → collected values (filled during codegen)
+	spmdFuncIsBody        bool                                          // true if entire function body is an SPMD region (varying params, no go-for loops)
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1433,7 +1432,7 @@ func (b *builder) createFunction() {
 
 	// SPMD: if no go-for loops but this is an SPMD function with entry mask,
 	// mark the entire function body as an SPMD region so that varying if/else
-	// linearization and mask stack infrastructure are active for all blocks.
+	// linearization infrastructure is active for all blocks.
 	if b.spmdLoopState == nil && !b.spmdEntryMask.IsNil() {
 		b.spmdFuncIsBody = true
 	}
@@ -1447,7 +1446,7 @@ func (b *builder) createFunction() {
 		b.spmdShiftedPtr = make(map[ssa.Value]*spmdShiftedLoadInfo)
 
 		if b.spmdLoopState != nil {
-			b.spmdInterleavedStores = make(map[*ssa.Store]*spmdInterleavedStoreInfo)
+			b.spmdInterleavedStores = make(map[ssa.Instruction]*spmdInterleavedStoreInfo)
 			b.spmdInterleavedAddrs = make(map[*ssa.IndexAddr]*spmdInterleavedStoreInfo)
 			b.spmdInterleavedValues = make(map[*spmdInterleavedStoreGroup][]llvm.Value)
 
@@ -1476,7 +1475,6 @@ func (b *builder) createFunction() {
 					// Peeled tail body: emit prologue immediately (TailIterPhi is in TailCheckBlock).
 					b.emitSPMDBodyPrologue(loop)
 					b.spmdValueOverride[loop.ssaLoopInfo.TailIterPhi] = loop.laneIndices
-					b.spmdMaskStack = []llvm.Value{loop.tailMask}
 				} else if loop.isRangeIndex {
 					b.emitSPMDBodyPrologue(loop)
 					if loop.isDecomposed {
@@ -1485,27 +1483,24 @@ func (b *builder) createFunction() {
 					} else {
 						b.spmdValueOverride[loop.bodyIterValue] = loop.laneIndices
 					}
-					b.spmdMaskStack = []llvm.Value{loop.tailMask}
 				}
 			} else if b.spmdValueOverride != nil && b.isBlockInSPMDBody(block) != nil {
 				// Keep existing overrides for if.then/if.else/if.done inside SPMD body.
 			} else {
 				b.spmdValueOverride = nil
 				b.spmdDecomposed = nil
-				b.spmdMaskStack = nil
 			}
 		} else if b.spmdFuncIsBody {
 			// SPMD function body (varying params, no go-for loops): all blocks are
 			// part of the SPMD region. Unlike loop-based SPMD, spmdValueOverride is
 			// never cleared between blocks because there are no loop-specific SSA
 			// values (no iter phi) to scope — all overrides are function-wide.
-			// No mask stack: SSA predication already linearized varying control flow
+			// SSA predication already linearized varying control flow
 			// and all masks are explicit on SPMDLoad/SPMDStore/CallCommon.SPMDMask.
 			if b.spmdValueOverride == nil {
 				b.spmdValueOverride = make(map[ssa.Value]llvm.Value)
 			}
 		}
-
 
 		for _, instr := range block.Instrs {
 			if instr, ok := instr.(*ssa.DebugRef); ok {
@@ -1547,8 +1542,6 @@ func (b *builder) createFunction() {
 					if loop, ok := b.spmdLoopState.activeLoops[phi]; ok {
 						b.emitSPMDBodyPrologue(loop)
 						b.spmdValueOverride[phi] = loop.laneIndices
-						// Initialize mask stack with the tail mask for this loop.
-						b.spmdMaskStack = []llvm.Value{loop.tailMask}
 					}
 				}
 			}
@@ -1764,95 +1757,8 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 	case *ssa.Send:
 		b.createChanSend(instr)
 	case *ssa.Store:
-		// SPMD: interleaved stride-S store handling.
-		// First S-1 remainders save their values; last remainder emits interleaved stores.
-		if b.spmdInterleavedStores != nil {
-			if info, ok := b.spmdInterleavedStores[instr]; ok {
-				// Skip interleaved store in tail body phase of SSA-peeled loops — let normal
-				// scatter path handle it. The interleaved scalarBase is wrong for the tail.
-				inTail := false
-				if b.spmdLoopState != nil {
-					if loop, ok := b.spmdLoopState.bodyBlocks[b.currentBlock.Index]; ok && loop.isPeeled {
-						inTail = b.currentBlock.Index == loop.ssaLoopInfo.TailBodyBlock.Index
-					}
-				}
-				if !inTail {
-					if info.remainder < info.group.stride-1 {
-						vals := b.spmdInterleavedValues[info.group]
-						if vals == nil {
-							vals = make([]llvm.Value, info.group.stride)
-							b.spmdInterleavedValues[info.group] = vals
-						}
-						vals[info.remainder] = b.getValue(instr.Val, getPos(instr))
-						return
-					}
-					b.spmdEmitInterleavedStore(instr, info)
-					return
-				}
-			}
-		}
-
 		llvmAddr := b.getValue(instr.Addr, getPos(instr))
 		llvmVal := b.getValue(instr.Val, getPos(instr))
-
-		// SPMD: contiguous vector store via masked.store intrinsic.
-		// When the address is a contiguous SPMD IndexAddr, store a full vector.
-		if b.spmdContiguousPtr != nil {
-			if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
-				mask := b.spmdCurrentMask()
-				if mask.IsNil() {
-					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(ci.loop.laneCount), ci.loop.laneCount))
-				}
-				// Splat scalar values to vector for masked store.
-				if llvmVal.Type().TypeKind() != llvm.VectorTypeKind {
-					vecType := llvm.VectorType(llvmVal.Type(), ci.loop.laneCount)
-					llvmVal = b.splatScalar(llvmVal, vecType)
-				}
-				// Bool store fix: llvm.masked.store.v<N>i1 packs N bits, but
-				// [N]bool memory expects 1 byte per element. Widen to <N x i8>.
-				if llvmVal.Type().TypeKind() == llvm.VectorTypeKind &&
-					llvmVal.Type().ElementType() == b.ctx.Int1Type() {
-					llvmVal = b.CreateZExt(llvmVal, llvm.VectorType(b.ctx.Int8Type(), ci.loop.laneCount), "")
-				}
-				// Determine if the value needs narrowing on WASM (e.g., <4 x i32>
-				// value from a masked bool/byte conversion stored to *bool/*uint8 memory).
-				// Use the destination's element type from instr.Addr's pointer dereference,
-				// because go/ssa uses scalar types (bool, uint8) for range iteration values
-				// even though TinyGo generates vector LLVM IR (<4 x i32>) for them.
-				// Fall back to instr.Val.Type() when it is an explicit SPMDType.
-				var narrowBits uint64
-				if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
-					narrowBits = b.spmdNarrowStoreElemBits(llvmVal, addrPtrType.Elem())
-				}
-				if narrowBits == 0 {
-					if spmdVal, ok := instr.Val.Type().(*types.SPMDType); ok {
-						narrowBits = b.spmdNarrowStoreElemBits(llvmVal, spmdVal.Elem())
-					}
-				}
-				if narrowBits > 0 {
-					// Use the narrow path: pack to scalar and load-blend-store.
-					b.spmdMaskedStoreNarrow(llvmVal, narrowBits, ci.scalarPtr, mask)
-				} else if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
-					// Cap-based optimization: use load-blend-store when safe.
-					b.spmdFullStoreWithBlend(llvmVal, ci, mask)
-					b.currentBlockInfo.exit = b.GetInsertBlock()
-				} else {
-					b.spmdMaskedStore(llvmVal, ci.scalarPtr, mask)
-				}
-				return
-			}
-		}
-
-		// SPMD: non-contiguous scatter to a vector of pointers.
-		if llvmAddr.Type().TypeKind() == llvm.VectorTypeKind {
-			laneCount := llvmAddr.Type().VectorSize()
-			mask := b.spmdCurrentMask()
-			if mask.IsNil() {
-				mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount))
-			}
-			b.spmdMaskedScatter(llvmVal, llvmAddr, mask)
-			return
-		}
 
 		b.createNilCheck(instr.Addr, llvmAddr, "store")
 		if b.targetData.TypeAllocSize(llvmVal.Type()) == 0 {
@@ -2512,7 +2418,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		}
 		// SPMD: on WASM, sign-extend <N x i1> comparison results to <N x i32>.
 		// LLVM's WASM backend folds sext(cmp) into the comparison instruction (no
-		// runtime cost), and downstream uses (bitselect mask, any_true, mask stack)
+		// runtime cost), and downstream uses (bitselect mask, any_true)
 		// work directly on <N x i32> without additional conversions.
 		// Note: UnOp NOT on Varying[bool] (token.NOT case in createUnOp) is not yet
 		// wrapped here — that is a known gap for future work.
@@ -4195,84 +4101,6 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 			return llvm.Value{}, b.makeError(unop.Pos(), "todo: unknown type for negate: "+unop.X.Type().Underlying().String())
 		}
 	case token.MUL: // *x, dereference pointer
-		// SPMD: contiguous vector load via masked.load intrinsic.
-		// When x is detected as a contiguous SPMD IndexAddr, load a full vector.
-		if b.spmdContiguousPtr != nil {
-			if ci, ok := b.spmdContiguousPtr[unop.X]; ok {
-				ssaElemType := unop.X.Type().Underlying().(*types.Pointer).Elem()
-				elemType := b.getLLVMType(ssaElemType)
-				laneCount := ci.loop.laneCount
-				// WASM narrow load: when the SSA element type occupies fewer bytes than
-				// the WASM-legal vector element (e.g., bool = 1 byte vs i32 = 4 bytes),
-				// a <N x i32> load reads N×4 bytes instead of N×1 bytes, corrupting
-				// adjacent elements. Use spmdMaskedLoadNarrow which loads exactly
-				// N×targetElemBits/8 bytes and unpacks per lane to <N x i32>.
-				if narrowBits := b.spmdNarrowLoadElemBits(ssaElemType, laneCount); narrowBits > 0 {
-					mask := b.spmdCurrentMask()
-					if mask.IsNil() {
-						mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount))
-					}
-					return b.spmdMaskedLoadNarrow(narrowBits, ci.scalarPtr, laneCount, mask), nil
-				}
-				// Bool (i1) contiguous load fix: llvm.masked.load.v<N>i1 reads
-				// N bits (bit-packed), but [N]bool in memory stores 1 byte per
-				// element. Load as <N x i8> to read the correct byte-per-element
-				// layout, then truncate to <N x i1>.
-				isBoolLoad := elemType == b.ctx.Int1Type()
-				if isBoolLoad {
-					elemType = b.ctx.Int8Type()
-				}
-				// WASM: sub-128-bit vector loads are illegal. Widen the element
-				// type so the load produces a WASM-legal 128-bit vector.
-				if b.spmdIsWASM() {
-					vecBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8 * uint64(laneCount)
-					if vecBits < 128 {
-						elemType = b.spmdMaskElemType(laneCount)
-					}
-				}
-				vecType := llvm.VectorType(elemType, laneCount)
-				mask := b.spmdCurrentMask()
-				if mask.IsNil() {
-					mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount))
-				}
-				// Cap-based optimization: use full v128.load + select when safe.
-				var result llvm.Value
-				if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
-					result = b.spmdFullLoadWithSelect(vecType, ci, mask)
-					b.currentBlockInfo.exit = b.GetInsertBlock()
-				} else {
-					result = b.spmdMaskedLoad(vecType, ci.scalarPtr, mask)
-				}
-				// Bool: loaded as <N x i8> (byte-per-element), truncate to <N x i1>.
-				if isBoolLoad {
-					result = b.CreateTrunc(result, llvm.VectorType(b.ctx.Int1Type(), laneCount), "")
-				}
-				return result, nil
-			}
-		}
-
-		// SPMD: shifted-contiguous load via narrow load + shuffle expansion.
-		// When x is detected as a shifted SPMD IndexAddr (e.g., src[i>>1]),
-		// load fewer unique elements and expand with shufflevector.
-		if b.spmdShiftedPtr != nil {
-			if info, ok := b.spmdShiftedPtr[unop.X]; ok {
-				mask := b.spmdCurrentMask()
-				return b.spmdShiftedLoad(info, mask), nil
-			}
-		}
-
-		// SPMD: non-contiguous gather from a vector of pointers.
-		if x.Type().TypeKind() == llvm.VectorTypeKind {
-			elemType := b.getLLVMType(unop.X.Type().Underlying().(*types.Pointer).Elem())
-			laneCount := x.Type().VectorSize()
-			vecType := llvm.VectorType(elemType, laneCount)
-			mask := b.spmdCurrentMask()
-			if mask.IsNil() {
-				mask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount))
-			}
-			return b.spmdMaskedGather(vecType, x, mask), nil
-		}
-
 		valueType := b.getLLVMType(unop.X.Type().Underlying().(*types.Pointer).Elem())
 		if b.targetData.TypeAllocSize(valueType) == 0 {
 			// zero-length data

@@ -1314,63 +1314,6 @@ func TestSPMDIsFloat(t *testing.T) {
 	}
 }
 
-func TestSPMDMaskStack(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-	b := newTestBuilder(t, c)
-	defer b.Dispose()
-
-	i1Type := c.ctx.Int1Type()
-	mask4Type := llvm.VectorType(i1Type, 4)
-
-	allTrue := llvm.ConstAllOnes(mask4Type)
-	allFalse := llvm.ConstNull(mask4Type)
-
-	// Empty stack returns nil.
-	mask := b.spmdCurrentMask()
-	if !mask.IsNil() {
-		t.Error("expected nil mask from empty stack")
-	}
-
-	// Pop on empty stack is a no-op (no panic).
-	b.spmdPopMask()
-	mask = b.spmdCurrentMask()
-	if !mask.IsNil() {
-		t.Error("expected nil mask after pop on empty stack")
-	}
-
-	// Push one mask and read it back.
-	b.spmdPushMask(allTrue)
-	mask = b.spmdCurrentMask()
-	if mask.IsNil() {
-		t.Fatal("expected non-nil mask after push")
-	}
-	if mask.C != allTrue.C {
-		t.Error("expected allTrue mask after push")
-	}
-
-	// Push a second mask: top changes.
-	b.spmdPushMask(allFalse)
-	mask = b.spmdCurrentMask()
-	if mask.C != allFalse.C {
-		t.Error("expected allFalse mask after second push")
-	}
-
-	// Pop second mask: back to first.
-	b.spmdPopMask()
-	mask = b.spmdCurrentMask()
-	if mask.C != allTrue.C {
-		t.Error("expected allTrue mask after pop")
-	}
-
-	// Pop first mask: stack empty again.
-	b.spmdPopMask()
-	mask = b.spmdCurrentMask()
-	if !mask.IsNil() {
-		t.Error("expected nil mask after popping all")
-	}
-}
-
 func TestSPMDMaskedLoadIntrinsic(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
@@ -1979,56 +1922,6 @@ func TestSPMDFuncBodyDetection(t *testing.T) {
 	})
 }
 
-func TestSPMDBreakMaskInstructions(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-
-	t.Run("mask_stack_with_break_mask", func(t *testing.T) {
-		// Verify that mask stack operations work correctly when break mask is active.
-		laneCount := 4
-		maskType := llvm.VectorType(c.ctx.Int1Type(), laneCount)
-
-		fn := llvm.AddFunction(c.mod, "test_mask_stack", llvm.FunctionType(c.ctx.VoidType(), nil, false))
-		bb := llvm.AddBasicBlock(fn, "entry")
-		b := &builder{compilerContext: c}
-		b.Builder = c.ctx.NewBuilder()
-		b.SetInsertPointAtEnd(bb)
-
-		// Initialize mask stack with entry mask.
-		entryMask := llvm.ConstAllOnes(maskType)
-		b.spmdMaskStack = []llvm.Value{entryMask}
-
-		// Push then-mask for varying if.
-		cond := llvm.ConstVector([]llvm.Value{
-			llvm.ConstInt(c.ctx.Int1Type(), 1, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 1, false),
-			llvm.ConstInt(c.ctx.Int1Type(), 0, false),
-		}, false)
-
-		parentMask := b.spmdCurrentMask()
-		thenMask := b.CreateAnd(parentMask, cond, "spmd.then.mask")
-		b.spmdPushMask(thenMask)
-
-		// Verify stack depth.
-		if len(b.spmdMaskStack) != 2 {
-			t.Errorf("expected stack depth 2, got %d", len(b.spmdMaskStack))
-		}
-
-		// Verify current mask is the then-mask.
-		currentMask := b.spmdCurrentMask()
-		if currentMask.C != thenMask.C {
-			t.Error("expected current mask to be the then-mask")
-		}
-
-		// Pop the then-mask.
-		b.spmdPopMask()
-		if len(b.spmdMaskStack) != 1 {
-			t.Errorf("expected stack depth 1 after pop, got %d", len(b.spmdMaskStack))
-		}
-	})
-}
-
 func TestSPMDVectorAllTrue(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
@@ -2060,37 +1953,6 @@ func TestSPMDVectorAllTrue(t *testing.T) {
 	})
 }
 
-func TestSPMDCallMaskNarrowedByVaryingIf(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-	b := newTestBuilder(t, c)
-
-	// Set up SPMD function body context.
-	// The test context is WASM, so masks use the <N x i32> format.
-	maskType := llvm.VectorType(c.spmdMaskElemType(4), 4) // <4 x i32> on WASM for 4 lanes
-	entryMask := llvm.ConstAllOnes(maskType)
-	b.spmdEntryMask = entryMask
-	b.spmdMaskStack = []llvm.Value{entryMask}
-
-	// Create a narrowed mask (simulating varying if).
-	narrowedMask := b.CreateAnd(entryMask, llvm.ConstNull(maskType), "narrowed")
-	b.spmdPushMask(narrowedMask)
-
-	// spmdCallMask should return the narrowed mask, not the entry mask.
-	// We can't call spmdCallMask directly since it needs an ssa.Function,
-	// but we can verify spmdCurrentMask returns the narrowed mask.
-	currentMask := b.spmdCurrentMask()
-	if currentMask.C != narrowedMask.C {
-		t.Error("spmdCurrentMask should return narrowed mask when inside varying-if")
-	}
-
-	// Verify stack depth.
-	if len(b.spmdMaskStack) != 2 {
-		t.Errorf("expected stack depth 2, got %d", len(b.spmdMaskStack))
-	}
-}
-
-// TestSPMDIsWASM verifies that spmdIsWASM correctly detects WASM targets.
 func TestSPMDIsWASM(t *testing.T) {
 	// The default test context is WASM.
 	c := newTestCompilerContext(t)
@@ -2987,52 +2849,6 @@ func TestSPMDSwitchDefaultMask(t *testing.T) {
 	}
 
 	// Default mask should activate lanes [0, 0, 1, 1] (lanes 2 and 3).
-}
-
-// TestSPMDSwitchPushDirectTransition verifies "pushDirect" mask transition.
-// Tests that the pushDirect transition pushes the mask directly without AND-ing with parent.
-func TestSPMDSwitchPushDirectTransition(t *testing.T) {
-	c := newTestCompilerContext(t)
-	defer c.dispose()
-	b := newTestBuilder(t, c)
-
-	i32x4 := llvm.VectorType(c.ctx.Int32Type(), 4)
-	i32 := c.ctx.Int32Type()
-
-	// Create a specific case mask.
-	caseMask := llvm.ConstVector([]llvm.Value{
-		llvm.ConstInt(i32, 0, false),
-		llvm.ConstInt(i32, 0xFFFFFFFF, false), // lane 1 active
-		llvm.ConstInt(i32, 0, false),
-		llvm.ConstInt(i32, 0, false),
-	}, false)
-
-	// Initialize mask stack with a parent mask.
-	parentMask := llvm.ConstAllOnes(i32x4)
-	b.spmdMaskStack = []llvm.Value{parentMask}
-
-	// Push caseMask directly (simulating "pushDirect" transition).
-	b.spmdPushMask(caseMask)
-
-	// Verify the mask stack now has 2 entries: parent and caseMask.
-	if len(b.spmdMaskStack) != 2 {
-		t.Errorf("mask stack length = %d, want 2", len(b.spmdMaskStack))
-	}
-
-	// Verify the top of the stack is caseMask (not parent & caseMask).
-	currentMask := b.spmdCurrentMask()
-	if currentMask != caseMask {
-		t.Error("current mask should be caseMask (not AND-ed with parent)")
-	}
-
-	// Pop and verify we're back to parent.
-	b.spmdPopMask()
-	if len(b.spmdMaskStack) != 1 {
-		t.Errorf("after pop, mask stack length = %d, want 1", len(b.spmdMaskStack))
-	}
-	if b.spmdCurrentMask() != parentMask {
-		t.Error("after pop, current mask should be parentMask")
-	}
 }
 
 func TestSPMDExtendIndex(t *testing.T) {
@@ -4057,7 +3873,6 @@ func TestSPMDIndexMaxValueConst(t *testing.T) {
 		})
 	}
 }
-
 
 func TestSPMDStoreCoalescing(t *testing.T) {
 	c := newTestCompilerContext(t)
