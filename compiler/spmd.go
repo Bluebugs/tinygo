@@ -1020,6 +1020,10 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 			boundVec := b.splatScalar(boundScalar, vecType)
 			tailMaskI1 := b.CreateICmp(llvm.IntSLT, laneIndices, boundVec, "spmd.tail.mask")
 			loop.tailMask = b.spmdWrapMask(tailMaskI1, loop.laneCount)
+			// Register SSA TailMask so getValue() can resolve it directly.
+			if loop.ssaLoopInfo != nil && loop.ssaLoopInfo.TailMask != nil {
+				b.locals[loop.ssaLoopInfo.TailMask] = loop.tailMask
+			}
 		}
 		return
 	}
@@ -1085,6 +1089,10 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 		// Compute: offset < clamp(diff) using unsigned comparison.
 		tailMaskI1 := b.CreateICmp(llvm.IntULT, varyingOffset, diffVec, "spmd.tail.mask")
 		loop.tailMask = b.spmdWrapMask(tailMaskI1, laneCount)
+		// Register SSA TailMask so getValue() can resolve it directly.
+		if loop.ssaLoopInfo != nil && loop.ssaLoopInfo.TailMask != nil {
+			b.locals[loop.ssaLoopInfo.TailMask] = loop.tailMask
+		}
 		// laneIndices not set for decomposed path (use spmdDecomposed map instead).
 		return
 	}
@@ -1119,6 +1127,10 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	// Store the results in the loop state.
 	loop.laneIndices = laneIndices
 	loop.tailMask = tailMask
+	// Register SSA TailMask so getValue() can resolve it directly.
+	if loop.ssaLoopInfo != nil && loop.ssaLoopInfo.TailMask != nil {
+		b.locals[loop.ssaLoopInfo.TailMask] = loop.tailMask
+	}
 }
 
 // spmdMaterializeDecomposed converts a decomposed index (scalar base + <N x i8> offset)
@@ -1883,12 +1895,10 @@ func (b *builder) spmdConvertMaskFormat(mask llvm.Value, targetType llvm.Type) l
 	return b.CreateSExt(i1Vec, targetType, "spmd.mask.cvt.sext")
 }
 
-// spmdCallMask returns the mask value to pass when calling an SPMD function.
-// The mask is determined by the current execution context, narrowest first:
-// - If inside a varying-if block: use the current narrowed mask (from mask stack)
-// - If inside an SPMD loop: use the loop's tail mask
-// - If inside an SPMD function: use the entry mask
-// - Otherwise: all lanes active (all-ones mask)
+// spmdCallMask returns the mask value to pass when calling an SPMD function
+// in cases where no SSA-level CallCommon.SPMDMask was set. This handles SPMD
+// function bodies (varying-param functions) where the entry mask is the active mask.
+// For go-for loop calls, SSA predication sets CallCommon.SPMDMask directly.
 func (b *builder) spmdCallMask(fn *ssa.Function) llvm.Value {
 	maskType := b.spmdMaskType(fn)
 	if maskType == (llvm.Type{}) {
@@ -1896,26 +1906,12 @@ func (b *builder) spmdCallMask(fn *ssa.Function) llvm.Value {
 		return llvm.Value{}
 	}
 
-	// Use current narrowed mask if inside varying-if context.
-	if mask := b.spmdCurrentMask(); !mask.IsNil() {
-		return mask
-	}
-
-	// Check if we're inside an SPMD loop.
-	if b.spmdLoopState != nil {
-		for _, loop := range b.spmdLoopState.activeLoops {
-			if !loop.tailMask.IsNil() {
-				return loop.tailMask
-			}
-		}
-	}
-
-	// Check if we're inside an SPMD function.
+	// Entry mask for SPMD function bodies.
 	if !b.spmdEntryMask.IsNil() {
 		return b.spmdEntryMask
 	}
 
-	// Fallback: all lanes active.
+	// All-ones fallback.
 	return llvm.ConstAllOnes(maskType)
 }
 
@@ -3763,11 +3759,13 @@ func (b *builder) spmdDecomposedIndexAddr(expr *ssa.IndexAddr, decomp *spmdDecom
 	// masked-out lanes (e.g., tail iterations where laneCount > remaining elements).
 	// This ensures both bounds checks and InBoundsGEP only see valid indices.
 	safeOffset := decomp.varyingOffset
-	mask := b.spmdCurrentMask()
-	if !mask.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
-		maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.offset.mask")
-		zeros := llvm.ConstNull(decomp.varyingOffset.Type())
-		safeOffset = b.CreateSelect(maskI1, decomp.varyingOffset, zeros, "spmd.offset.clamp")
+	if expr.SPMDMask != nil {
+		mask := b.getValue(expr.SPMDMask, getPos(expr))
+		if !b.spmdIsConstAllOnesMask(mask) {
+			maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.offset.mask")
+			zeros := llvm.ConstNull(decomp.varyingOffset.Type())
+			safeOffset = b.CreateSelect(maskI1, decomp.varyingOffset, zeros, "spmd.offset.clamp")
+		}
 	}
 
 	var bufptr llvm.Value
@@ -3893,11 +3891,14 @@ func (b *builder) spmdVectorIndex(expr *ssa.Index, collection, index llvm.Value)
 func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.Value) (llvm.Value, error) {
 	laneCount := index.Type().VectorSize()
 
-	// SPMD: clamp inactive lane indices to 0 to prevent out-of-bounds access.
-	if mask := b.spmdCurrentMask(); !mask.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
-		maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.idx.mask")
-		zeros := llvm.ConstNull(index.Type())
-		index = b.CreateSelect(maskI1, index, zeros, "spmd.idx.clamp")
+	// SPMD: clamp inactive lane indices to 0 using SSA-level mask.
+	if expr.SPMDMask != nil {
+		mask := b.getValue(expr.SPMDMask, getPos(expr))
+		if !b.spmdIsConstAllOnesMask(mask) {
+			maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.idx.mask")
+			zeros := llvm.ConstNull(index.Type())
+			index = b.CreateSelect(maskI1, index, zeros, "spmd.idx.clamp")
+		}
 	}
 
 	// Extract {ptr, len} from string.
@@ -3980,11 +3981,14 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 	laneCount := index.Type().VectorSize()
 	xType := expr.X.Type().Underlying().(*types.Array)
 
-	// SPMD: clamp inactive lane indices to 0 to prevent out-of-bounds access.
-	if mask := b.spmdCurrentMask(); !mask.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
-		maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.idx.mask")
-		zeros := llvm.ConstNull(index.Type())
-		index = b.CreateSelect(maskI1, index, zeros, "spmd.idx.clamp")
+	// SPMD: clamp inactive lane indices to 0 using SSA-level mask.
+	if expr.SPMDMask != nil {
+		mask := b.getValue(expr.SPMDMask, getPos(expr))
+		if !b.spmdIsConstAllOnesMask(mask) {
+			maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.idx.mask")
+			zeros := llvm.ConstNull(index.Type())
+			index = b.CreateSelect(maskI1, index, zeros, "spmd.idx.clamp")
+		}
 	}
 
 	// Spill array to alloca (can't index a non-constant array in registers).

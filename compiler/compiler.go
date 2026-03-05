@@ -2837,13 +2837,14 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		if index.Type().TypeKind() == llvm.VectorTypeKind {
 			laneCount := index.Type().VectorSize()
 
-			// SPMD: clamp inactive lane indices to 0 to prevent out-of-bounds access
-			// from masked-out lanes (e.g., tail iterations where laneCount > remaining elements).
-			mask := b.spmdCurrentMask()
-			if !mask.IsNil() && !b.spmdIsConstAllOnesMask(mask) {
-				maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.idx.mask")
-				zeros := llvm.ConstNull(index.Type())
-				index = b.CreateSelect(maskI1, index, zeros, "spmd.idx.clamp")
+			// SPMD: clamp inactive lane indices to 0 using SSA-level mask.
+			if expr.SPMDMask != nil {
+				mask := b.getValue(expr.SPMDMask, getPos(expr))
+				if !b.spmdIsConstAllOnesMask(mask) {
+					maskI1 := b.CreateTrunc(mask, llvm.VectorType(b.ctx.Int1Type(), laneCount), "spmd.idx.mask")
+					zeros := llvm.ConstNull(index.Type())
+					index = b.CreateSelect(maskI1, index, zeros, "spmd.idx.clamp")
+				}
 			}
 
 			// Get buffer pointer and element type.
