@@ -1585,14 +1585,23 @@ func (b *builder) createFunction() {
 			// incoming edge carries <4 x i32> (WASM-wrapped comparison from a
 			// 4-lane loop), or vice versa. Only apply when the SSA phi type is
 			// Varying[bool] to avoid converting unrelated vector type mismatches.
+			llvmBlock := b.blockInfo[block.Preds[i].Index].exit
 			if b.spmdLoopState != nil && llvmVal.Type() != phi.llvm.Type() {
 				if b.spmdIsVaryingBoolPhi(phi.ssa) &&
 					phi.llvm.Type().TypeKind() == llvm.VectorTypeKind &&
 					llvmVal.Type().TypeKind() == llvm.VectorTypeKind {
+					// Insert the mask conversion into the predecessor's exit block,
+					// before its terminator. spmdConvertMaskFormat emits instructions
+					// at the current insert point, so we must position it correctly.
+					// Without this, the conversion ends up after the predecessor's
+					// terminator (e.g., after a ret), leaving the block invalid.
+					savedBlock := b.GetInsertBlock()
+					terminator := llvmBlock.LastInstruction()
+					b.SetInsertPointBefore(terminator)
 					llvmVal = b.spmdConvertMaskFormat(llvmVal, phi.llvm.Type())
+					b.SetInsertPointAtEnd(savedBlock)
 				}
 			}
-			llvmBlock := b.blockInfo[block.Preds[i].Index].exit
 			phi.llvm.AddIncoming([]llvm.Value{llvmVal}, []llvm.BasicBlock{llvmBlock})
 		}
 
@@ -3860,13 +3869,31 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 				return false
 			}
 			if fromIsBoolOrMask(spmdFrom.Elem()) && fromIsBoolOrMask(spmdTo.Elem()) {
-				// Both represent boolean/mask vectors. If already the same LLVM type
-				// (common case on WASM where both are <N x i32>), return directly.
+				// Both represent boolean/mask vectors. The SSA type of Varying[mask]
+				// is always <4 x i32> on WASM (from getLLVMType(MaskType) = i32,
+				// 128/32=4 lanes), but for 16-lane byte loops the actual LLVM mask
+				// value is <16 x i8>. Using getLLVMType(typeTo) would convert to the
+				// wrong lane count.
+				//
+				// On WASM, if the source is already a WASM mask format integer vector
+				// (<N x iW> where iW is i8, i16, or i32), return it as-is. The lane
+				// count must match the enclosing SPMD loop context, not the hardcoded
+				// 4-lane MaskType. Converting bool→mask is a type annotation only.
+				if b.spmdIsWASM() && value.Type().TypeKind() == llvm.VectorTypeKind {
+					srcElem := value.Type().ElementType()
+					if srcElem != b.ctx.Int1Type() {
+						// Already in WASM mask format. Return as-is.
+						return value, nil
+					}
+					// Source is <N x i1>; widen to WASM format for the same lane count.
+					wasmMaskType := llvm.VectorType(b.spmdMaskElemType(value.Type().VectorSize()), value.Type().VectorSize())
+					return b.spmdConvertMaskFormat(value, wasmMaskType), nil
+				}
 				targetType := b.getLLVMType(typeTo)
 				if value.Type() == targetType {
 					return value, nil
 				}
-				// Types differ (e.g., <16 x i1> bool → <4 x i32> mask). Use spmdConvertMaskFormat.
+				// Types differ (e.g., <16 x i1> bool → <4 x i32> mask on non-WASM).
 				if value.Type().TypeKind() == llvm.VectorTypeKind && targetType.TypeKind() == llvm.VectorTypeKind {
 					return b.spmdConvertMaskFormat(value, targetType), nil
 				}

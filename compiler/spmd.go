@@ -648,9 +648,22 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			continue
 		}
 
-		// Compute lane count from iter phi type.
-		elemType := b.getLLVMType(mainIterPhi.Type())
-		laneCount := b.spmdLaneCount(elemType)
+		// Compute lane count. For rangeindex loops (range-over-slice), the
+		// iterator type is always int (i32 on WASM32) which gives 4 lanes, but
+		// the actual lane count depends on the slice element type (e.g., 16 for
+		// []byte). Use spmdRangeIndexLaneCount to get the correct width.
+		// For rangeint loops, the iter phi type is authoritative.
+		var laneCount int
+		if ssaLoop.IsRangeIndex {
+			laneCount = b.spmdRangeIndexLaneCount(ssaLoop.BoundValue, ssaLoop.MainBodyBlock, mainIncrBinOp)
+		} else {
+			elemType := b.getLLVMType(mainIterPhi.Type())
+			laneCount = b.spmdLaneCount(elemType)
+		}
+
+		// On WASM, rangeindex loops with more than 4 lanes use a decomposed
+		// (scalar base + <N x iW> offset) representation to stay within 128-bit SIMD.
+		isDecomposed := ssaLoop.IsRangeIndex && b.spmdIsWASM() && laneCount > 4
 
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
@@ -661,6 +674,8 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			incrBinOp:     mainIncrBinOp,
 			bodyIterValue: mainIterPhi,
 			isPeeled:      true,
+			isRangeIndex:  ssaLoop.IsRangeIndex,
+			isDecomposed:  isDecomposed,
 		}
 
 		// Map main body: activeLoops[phi] triggers emitSPMDBodyPrologue via phi handler.
@@ -1637,16 +1652,29 @@ func (b *builder) spmdWrapMask(cmp llvm.Value, laneCount int) llvm.Value {
 	return b.CreateSExt(cmp, maskType, "")
 }
 
-// spmdUnwrapMaskForIntrinsic truncates the WASM mask (e.g., <N x i32>, <N x i16>,
-// or <N x i8>) back to <N x i1> for LLVM masked memory intrinsics
+// spmdUnwrapMaskForIntrinsic converts the WASM mask (e.g., <N x i32>, <N x i16>,
+// or <N x i8>) to <laneCount x i1> for LLVM masked memory intrinsics
 // (masked.load, masked.store, masked.gather, masked.scatter).
 // These intrinsics require an <N x i1> mask regardless of the target.
 // On non-WASM targets the mask is already <N x i1> and this is a no-op.
+//
+// When the mask lane count differs from laneCount (e.g., a <4 x i32> mask
+// from Varying[mask] used with a 16-lane byte loop), spmdConvertMaskFormat
+// first reshapes the mask to <laneCount x i1> before any truncation.
 func (b *builder) spmdUnwrapMaskForIntrinsic(mask llvm.Value, laneCount int) llvm.Value {
 	if !b.spmdIsWASM() {
 		return mask
 	}
 	i1MaskType := llvm.VectorType(b.ctx.Int1Type(), laneCount)
+	// If mask already has the right type, return immediately.
+	if mask.Type() == i1MaskType {
+		return mask
+	}
+	// If mask lane count differs from laneCount, reshape via spmdConvertMaskFormat.
+	// Attempting CreateTrunc between vectors of different element counts is invalid.
+	if mask.Type().VectorSize() != laneCount {
+		return b.spmdConvertMaskFormat(mask, i1MaskType)
+	}
 	return b.CreateTrunc(mask, i1MaskType, "")
 }
 
@@ -4536,6 +4564,16 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// target-specific width. instr.Lanes may use host int sizes.
 	laneCount := mask.Type().VectorSize()
 
+	// Shifted-contiguous access: e.g. src[i>>1] in a 16-lane rangeindex loop.
+	// TinyGo detects the shift pattern during IndexAddr compilation and records
+	// it in spmdShiftedPtr. Use spmdShiftedLoad which performs a narrow
+	// contiguous load + shufflevector expansion rather than a full gather.
+	if b.spmdShiftedPtr != nil {
+		if info, ok := b.spmdShiftedPtr[instr.Addr]; ok {
+			return b.spmdShiftedLoad(info, mask)
+		}
+	}
+
 	// Contiguous access: use vector load instead of scalar load+broadcast.
 	// Two sources of contiguity info:
 	//   1. SSA-level: instr.Contiguous (set by spmdMaskMemOps in go/ssa)
@@ -4581,8 +4619,16 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	}
 
 	// If the address is a vector (varying pointers), emit a masked gather.
+	// spmdMaskedGather expects a vector result type, not a scalar. Build the
+	// vector type from the scalar resultType and the lane count derived from
+	// the address vector (which has the correct LLVM lane count for this target).
 	if addr.Type().TypeKind() == llvm.VectorTypeKind {
-		return b.spmdMaskedGather(resultType, addr, mask)
+		addrLaneCount := addr.Type().VectorSize()
+		vecResultType := resultType
+		if resultType.TypeKind() != llvm.VectorTypeKind {
+			vecResultType = llvm.VectorType(resultType, addrLaneCount)
+		}
+		return b.spmdMaskedGather(vecResultType, addr, mask)
 	}
 
 	// Scalar address: load speculatively, then broadcast and mask.
