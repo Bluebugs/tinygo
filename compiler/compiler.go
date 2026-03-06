@@ -2948,6 +2948,12 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		return b.parseMakeClosure(expr)
 	case *ssa.MakeInterface:
 		val := b.getValue(expr.X, getPos(expr))
+		// SPMD: convert vector to array before boxing into interface.
+		// getTypeCode maps SPMDType to [N]T array, so the packed value
+		// must be an array too.
+		if spmdType, ok := expr.X.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
+			val = b.vectorToArray(val)
+		}
 		return b.createMakeInterface(val, expr.X.Type(), expr.Pos()), nil
 	case *ssa.MakeMap:
 		return b.createMakeMap(expr)
