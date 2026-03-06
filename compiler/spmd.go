@@ -4574,6 +4574,95 @@ func (b *builder) createSPMDSelect(instr *ssa.SPMDSelect) llvm.Value {
 	return b.spmdMaskSelect(mask, x, y)
 }
 
+// spmdIsVectorizableElemType returns true if the LLVM type can be used as a
+// vector element type. LLVM vectors only support integer, floating-point, and
+// pointer element types — NOT structs or arrays. When this returns false,
+// createSPMDStore and createSPMDLoad must use per-lane scalar fallbacks instead
+// of LLVM vector intrinsics.
+func spmdIsVectorizableElemType(t llvm.Type) bool {
+	switch t.TypeKind() {
+	case llvm.IntegerTypeKind, llvm.FloatTypeKind, llvm.DoubleTypeKind, llvm.PointerTypeKind:
+		return true
+	default:
+		return false
+	}
+}
+
+// spmdConditionalStore stores a scalar value to a scalar address only if any
+// lane in the mask is active. Used for non-vectorizable types (structs,
+// interfaces, slice headers) at scalar (uniform) addresses where all active
+// lanes share the same destination.
+func (b *builder) spmdConditionalStore(val, ptr, mask llvm.Value) {
+	laneCount := mask.Type().VectorSize()
+	// Unwrap to <N x i1> so spmdVectorAnyTrue can handle both WASM and non-WASM.
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+	anyActive := b.spmdVectorAnyTrue(i1Mask)
+
+	storeBB := b.insertBasicBlock("spmd.struct.store")
+	mergeBB := b.insertBasicBlock("spmd.struct.done")
+	b.CreateCondBr(anyActive, storeBB, mergeBB)
+	b.SetInsertPointAtEnd(storeBB)
+	b.CreateStore(val, ptr)
+	b.CreateBr(mergeBB)
+	b.SetInsertPointAtEnd(mergeBB)
+}
+
+// spmdPerLaneScatterStore stores a scalar value to varying addresses (a vector
+// of pointers), one per lane, conditional on the mask. Used for non-vectorizable
+// element types (structs, interfaces) with varying pointer operands.
+func (b *builder) spmdPerLaneScatterStore(val, ptrs, mask llvm.Value, laneCount int) {
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+	for lane := 0; lane < laneCount; lane++ {
+		laneIdx := llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false)
+		maskBit := b.CreateExtractElement(i1Mask, laneIdx, "spmd.lane.mask")
+		lanePtr := b.CreateExtractElement(ptrs, laneIdx, "spmd.lane.ptr")
+
+		storeBB := b.insertBasicBlock("spmd.struct.scatter")
+		mergeBB := b.insertBasicBlock("spmd.struct.scatter.done")
+		b.CreateCondBr(maskBit, storeBB, mergeBB)
+		b.SetInsertPointAtEnd(storeBB)
+		b.CreateStore(val, lanePtr)
+		b.CreateBr(mergeBB)
+		b.SetInsertPointAtEnd(mergeBB)
+	}
+}
+
+// spmdPerLaneGather loads a scalar value from each of the varying addresses
+// (a vector of pointers), conditional on the mask. Returns an array of loaded
+// values as an LLVM array type [N x T]. Used for non-vectorizable element types
+// (structs, interfaces) with varying pointer operands.
+func (b *builder) spmdPerLaneGather(elemType llvm.Type, ptrs, mask llvm.Value, laneCount int) llvm.Value {
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+	arrType := llvm.ArrayType(elemType, laneCount)
+	result := llvm.Undef(arrType)
+	for lane := 0; lane < laneCount; lane++ {
+		laneIdx := llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false)
+		maskBit := b.CreateExtractElement(i1Mask, laneIdx, "spmd.lane.mask")
+		lanePtr := b.CreateExtractElement(ptrs, laneIdx, "spmd.lane.ptr")
+
+		// condBB is the block containing the conditional branch.
+		// The false edge goes directly from condBB to mergeBB.
+		condBB := b.GetInsertBlock()
+		loadBB := b.insertBasicBlock("spmd.struct.gather")
+		mergeBB := b.insertBasicBlock("spmd.struct.gather.done")
+		b.CreateCondBr(maskBit, loadBB, mergeBB)
+
+		b.SetInsertPointAtEnd(loadBB)
+		loaded := b.CreateLoad(elemType, lanePtr, "spmd.lane.loaded")
+		b.CreateBr(mergeBB)
+		loadExitBB := b.GetInsertBlock()
+
+		b.SetInsertPointAtEnd(mergeBB)
+		zero := llvm.ConstNull(elemType)
+		phi := b.CreatePHI(elemType, "spmd.lane.val")
+		// loadExitBB → loaded value; condBB → zero (mask bit was false).
+		phi.AddIncoming([]llvm.Value{loaded, zero}, []llvm.BasicBlock{loadExitBB, condBB})
+
+		result = b.CreateInsertValue(result, phi, lane, "")
+	}
+	return result
+}
+
 // createSPMDLoad emits LLVM IR for an SPMDLoad instruction.
 // SPMDLoad loads from Addr only for lanes where Mask is active.
 // Inactive lanes receive a zero value. It is the predicated replacement
@@ -4653,6 +4742,13 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// the address vector (which has the correct LLVM lane count for this target).
 	if addr.Type().TypeKind() == llvm.VectorTypeKind {
 		addrLaneCount := addr.Type().VectorSize()
+		// Non-vectorizable types (structs, interfaces) cannot use LLVM gather.
+		// Fall back to per-lane conditional scalar loads.
+		// Returns [N x T] array (NOT <N x T> vector). Struct values must not
+		// flow into vector operations — they are only passed through to stores.
+		if !spmdIsVectorizableElemType(resultType) {
+			return b.spmdPerLaneGather(resultType, addr, mask, addrLaneCount)
+		}
 		vecResultType := resultType
 		if resultType.TypeKind() != llvm.VectorTypeKind {
 			vecResultType = llvm.VectorType(resultType, addrLaneCount)
@@ -4666,6 +4762,13 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// valid for all lanes in that block. This assumes flat (non-nested) if
 	// linearization; nested ifs require mask threading to remain safe.
 	loaded := b.CreateLoad(resultType, addr, "spmd.load")
+
+	// Non-vectorizable types (structs, interfaces, slice headers) cannot be
+	// put in LLVM vector types. Return the scalar value directly — all active
+	// lanes share the same scalar address so the single loaded value is correct.
+	if !spmdIsVectorizableElemType(resultType) {
+		return loaded
+	}
 
 	// If the result is scalar, broadcast to a vector then mask-select.
 	if resultType.TypeKind() != llvm.VectorTypeKind {
@@ -4722,14 +4825,35 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 	val := b.getValue(instr.Val, instr.Pos())
 	mask := b.getValue(instr.Mask, instr.Pos())
 
-	// The predicated SSA pass copies Store operands directly.
-	// When the original Store was inside a varying if/else, the SSA types
-	// may still be scalar (e.g., int32, *int32). SPMDStore needs vector
-	// operands, so splat scalar values using the active loop's lane count.
 	// Derive lane count from the mask vector, which always has the correct
 	// target-specific width. instr.Lanes may use host int sizes (e.g., 8 bytes
 	// on amd64 host) rather than target sizes (4 bytes on WASM).
 	laneCount := mask.Type().VectorSize()
+
+	// Non-vectorizable types (structs, interfaces, slice headers, closures)
+	// cannot be LLVM vector elements. LLVM only supports integer, float, and
+	// pointer element types in vectors. Use per-lane scalar fallbacks instead
+	// of vector intrinsics.
+	valElemType := val.Type()
+	if valElemType.TypeKind() == llvm.VectorTypeKind {
+		valElemType = valElemType.ElementType()
+	}
+	if !spmdIsVectorizableElemType(valElemType) {
+		if addr.Type().TypeKind() == llvm.VectorTypeKind {
+			// Varying address: per-lane conditional scatter.
+			b.spmdPerLaneScatterStore(val, addr, mask, laneCount)
+		} else {
+			// Scalar address: store if any lane is active. All active lanes
+			// share the same destination, so a single conditional store suffices.
+			b.spmdConditionalStore(val, addr, mask)
+		}
+		return
+	}
+
+	// The predicated SSA pass copies Store operands directly.
+	// When the original Store was inside a varying if/else, the SSA types
+	// may still be scalar (e.g., int32, *int32). SPMDStore needs vector
+	// operands, so splat scalar values using the active loop's lane count.
 	if val.Type().TypeKind() != llvm.VectorTypeKind {
 		// Scalar value: splat to vector.
 		val = b.splatScalar(val, llvm.VectorType(val.Type(), laneCount))
