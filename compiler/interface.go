@@ -125,14 +125,13 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 	// Resolve alias types: alias types are resolved at compile time.
 	typ = types.Unalias(typ)
 
-	// SPMD: Represent lanes.Varying[T] as [laneCount]T for interface boxing.
-	// All downstream type-switch functions already handle *types.Array, so
-	// redirecting here avoids adding SPMDType cases throughout this file.
+	// SPMD: Represent lanes.Varying[T] as struct{[N]T, [N]int32} for interface boxing.
+	// The struct embeds both the value array and the per-block condition mask so
+	// callers can recover which lanes were active when the value was boxed.
 	if spmdType, ok := typ.(*types.SPMDType); ok && spmdType.IsVarying() {
 		elemLLVM := c.getLLVMType(spmdType.Elem())
 		laneCount := c.spmdEffectiveLaneCount(spmdType, elemLLVM)
-		arrayType := types.NewArray(spmdType.Elem(), int64(laneCount))
-		return c.getTypeCode(arrayType)
+		return c.getTypeCode(c.spmdBoxedVaryingGoType(spmdType, laneCount))
 	}
 
 	ms := c.program.MethodSets.MethodSet(typ)

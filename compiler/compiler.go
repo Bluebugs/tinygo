@@ -2948,11 +2948,38 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		return b.parseMakeClosure(expr)
 	case *ssa.MakeInterface:
 		val := b.getValue(expr.X, getPos(expr))
-		// SPMD: convert vector to array before boxing into interface.
-		// getTypeCode maps SPMDType to [N]T array, so the packed value
-		// must be an array too.
+		// SPMD: convert vector to struct{[N]T, [N]int32} before boxing.
+		// Embeds both the value array and the per-block condition mask.
 		if spmdType, ok := expr.X.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
-			val = b.vectorToArray(val)
+			elemLLVM := b.getLLVMType(spmdType.Elem())
+			laneCount := b.spmdEffectiveLaneCount(spmdType, elemLLVM)
+
+			// Convert value vector to array.
+			valArr := b.vectorToArray(val)
+
+			// Build mask array: per-block mask if set, all-ones otherwise.
+			maskElemType := b.spmdMaskElemType(laneCount)
+			maskArrType := llvm.ArrayType(maskElemType, laneCount)
+			var maskArr llvm.Value
+			if expr.SPMDMask != nil {
+				maskVec := b.getValue(expr.SPMDMask, getPos(expr))
+				maskArr = b.vectorToArray(maskVec)
+			} else {
+				// All-ones mask: all lanes valid.
+				maskArr = llvm.Undef(maskArrType)
+				allOnes := llvm.ConstAllOnes(maskElemType)
+				for i := 0; i < laneCount; i++ {
+					maskArr = b.CreateInsertValue(maskArr, allOnes, i, "")
+				}
+			}
+
+			// Pack struct{[N]T, [N]int32}.
+			structType := b.ctx.StructType([]llvm.Type{valArr.Type(), maskArrType}, false)
+			packed := llvm.Undef(structType)
+			packed = b.CreateInsertValue(packed, valArr, 0, "")
+			packed = b.CreateInsertValue(packed, maskArr, 1, "")
+
+			return b.createMakeInterface(packed, expr.X.Type(), expr.Pos()), nil
 		}
 		return b.createMakeInterface(val, expr.X.Type(), expr.Pos()), nil
 	case *ssa.MakeMap:
@@ -3213,6 +3240,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		return b.createSPMDLoad(expr), nil
 	case *ssa.SPMDIndex:
 		return b.createSPMDIndex(expr), nil
+	case *ssa.SPMDExtractMask:
+		return b.createSPMDExtractMask(expr), nil
 	default:
 		return llvm.Value{}, b.makeError(expr.Pos(), "todo: unknown expression: "+expr.String())
 	}

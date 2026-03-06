@@ -374,6 +374,17 @@ func (b *builder) vectorToArray(vec llvm.Value) llvm.Value {
 	return arr
 }
 
+// spmdBoxedVaryingGoType returns the Go struct type used to box a varying value
+// with its mask: struct{ Value [N]T; Mask [N]int32 }.
+func (c *compilerContext) spmdBoxedVaryingGoType(spmdType *types.SPMDType, laneCount int) *types.Struct {
+	arrayType := types.NewArray(spmdType.Elem(), int64(laneCount))
+	maskArrayType := types.NewArray(types.Typ[types.Int32], int64(laneCount))
+	return types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "Value", arrayType),
+		types.NewVar(token.NoPos, nil, "Mask", maskArrayType),
+	}, nil)
+}
+
 // spmdBroadcastMatch ensures both operands have matching types for SPMD operations.
 // If one operand is a vector and the other is a scalar, the scalar is splatted.
 // If both are vectors with different lane counts, the wider one is resized to match the narrower.
@@ -4781,19 +4792,28 @@ func (b *builder) createSPMDIndex(instr *ssa.SPMDIndex) llvm.Value {
 }
 
 // createTypeAssertSPMD handles type assertions to lanes.Varying[T].
-// The boxed representation uses [N]T array (matching getTypeCode), but the
-// SSA result type is <N x T> vector. This function compares against the array
-// type code, extracts the array value, and converts it to a vector.
+// The boxed representation uses struct{[N]T, [N]maskElem} where maskElem is
+// i32/i16/i8/i1 depending on lane count and platform. The type-code name is
+// derived from boxedGoType (which uses int32) so the canonical name is stable
+// across platforms. The LLVM struct type is built directly to match the actual
+// mask element width. The SSA result type is <N x T> vector.
 func (b *builder) createTypeAssertSPMD(itf llvm.Value, expr *ssa.TypeAssert, spmdType *types.SPMDType, vecType llvm.Type) llvm.Value {
-	// Build the array type that matches the type code used in boxing.
+	// Build the struct type that matches the type code used in boxing.
 	elemLLVM := b.getLLVMType(spmdType.Elem())
 	laneCount := b.spmdEffectiveLaneCount(spmdType, elemLLVM)
-	arrGoType := types.NewArray(spmdType.Elem(), int64(laneCount))
-	arrLLVMType := b.getLLVMType(arrGoType)
+	boxedGoType := b.spmdBoxedVaryingGoType(spmdType, laneCount)
+	// Build the LLVM struct type directly so the mask array element type matches
+	// the platform-specific mask element (i32 for 4-lane, i16 for 8-lane, i8 for
+	// 16-lane, i1 for non-WASM). getLLVMType(boxedGoType) always gives [N]i32
+	// because spmdBoxedVaryingGoType hardcodes int32 for the mask field.
+	maskElemType := b.spmdMaskElemType(laneCount)
+	maskArrLLVM := llvm.ArrayType(maskElemType, laneCount)
+	valArrLLVM := llvm.ArrayType(elemLLVM, laneCount)
+	boxedLLVMType := b.ctx.StructType([]llvm.Type{valArrLLVM, maskArrLLVM}, false)
 
-	// Compare type codes using the array type (same as boxing path in MakeInterface).
+	// Compare type codes using the struct type (same as boxing path).
 	actualTypeNum := b.CreateExtractValue(itf, 0, "interface.type")
-	name, _ := getTypeCodeName(arrGoType)
+	name, _ := getTypeCodeName(boxedGoType)
 	globalName := "reflect/types.typeid:" + name
 	assertedTypeCodeGlobal := b.mod.NamedGlobal(globalName)
 	if assertedTypeCodeGlobal.IsNil() {
@@ -4802,20 +4822,21 @@ func (b *builder) createTypeAssertSPMD(itf llvm.Value, expr *ssa.TypeAssert, spm
 	}
 	commaOk := b.createRuntimeCall("typeAssert", []llvm.Value{actualTypeNum, assertedTypeCodeGlobal}, "typecode")
 
-	// Branch on type match to avoid speculative extraction before the check.
+	// Branch on type match.
 	prevBlock := b.GetInsertBlock()
 	okBlock := b.insertBasicBlock("typeassert.spmd.ok")
 	nextBlock := b.insertBasicBlock("typeassert.spmd.next")
 	b.currentBlockInfo.exit = nextBlock
 	b.CreateCondBr(commaOk, okBlock, nextBlock)
 
-	// OK block: extract the [N]T array from the interface, then convert to <N x T> vector.
+	// OK block: extract struct, get value array (field 0), convert to vector.
 	b.SetInsertPointAtEnd(okBlock)
-	arrValue := b.extractValueFromInterface(itf, arrLLVMType)
-	valueOk := b.arrayToVector(arrValue, vecType)
+	boxedStruct := b.extractValueFromInterface(itf, boxedLLVMType)
+	valArr := b.CreateExtractValue(boxedStruct, 0, "typeassert.spmd.valarr")
+	valueOk := b.arrayToVector(valArr, vecType)
 	b.CreateBr(nextBlock)
 
-	// Merge block: phi between zero-vector (failed assert) and extracted vector (ok).
+	// Merge block.
 	b.SetInsertPointAtEnd(nextBlock)
 	phi := b.CreatePHI(vecType, "typeassert.spmd.value")
 	phi.AddIncoming([]llvm.Value{llvm.ConstNull(vecType), valueOk}, []llvm.BasicBlock{prevBlock, okBlock})
@@ -4828,4 +4849,46 @@ func (b *builder) createTypeAssertSPMD(itf llvm.Value, expr *ssa.TypeAssert, spm
 	}
 	b.createRuntimeCall("interfaceTypeAssert", []llvm.Value{commaOk}, "")
 	return phi
+}
+
+// createSPMDExtractMask extracts the embedded lane mask from a boxed
+// Varying[T] interface value. The interface holds struct{[N]T, [N]maskElem}
+// where maskElem is i32/i16/i8/i1 depending on lane count and platform;
+// this extracts field 1 (mask array) and converts to a mask vector.
+func (b *builder) createSPMDExtractMask(instr *ssa.SPMDExtractMask) llvm.Value {
+	itf := b.getValue(instr.X, token.NoPos)
+	laneCount := instr.Lanes
+
+	maskElemType := b.spmdMaskElemType(laneCount)
+	maskVecType := llvm.VectorType(maskElemType, laneCount)
+
+	// Build mask array type using the platform-specific element type.
+	maskArrType := llvm.ArrayType(maskElemType, laneCount)
+
+	// Find the SPMDType from a sibling TypeAssert on the same interface.
+	var boxedLLVMType llvm.Type
+	if refs := instr.X.Referrers(); refs != nil {
+		for _, ref := range *refs {
+			if ta, ok := ref.(*ssa.TypeAssert); ok {
+				if spmdType, ok2 := ta.AssertedType.(*types.SPMDType); ok2 {
+					// Build the LLVM struct type directly so the mask array element
+					// type matches the platform-specific mask element width, not the
+					// int32 hardcoded in spmdBoxedVaryingGoType.
+					elemLLVM := b.getLLVMType(spmdType.Elem())
+					valArrLLVM := llvm.ArrayType(elemLLVM, laneCount)
+					boxedLLVMType = b.ctx.StructType([]llvm.Type{valArrLLVM, maskArrType}, false)
+					break
+				}
+			}
+		}
+	}
+	if boxedLLVMType.IsNil() {
+		// Fallback: cannot determine struct type. Return all-ones mask.
+		return llvm.ConstAllOnes(maskVecType)
+	}
+
+	// Extract the struct from the interface, then extract mask array (field 1).
+	boxedStruct := b.extractValueFromInterface(itf, boxedLLVMType)
+	maskArr := b.CreateExtractValue(boxedStruct, 1, "spmd.extract.maskarr")
+	return b.arrayToVector(maskArr, maskVecType)
 }
