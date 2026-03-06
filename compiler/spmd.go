@@ -4779,3 +4779,53 @@ func (b *builder) createSPMDIndex(instr *ssa.SPMDIndex) llvm.Value {
 	// Reuse the existing spmdLaneOffsetConst helper for consistency.
 	return b.spmdLaneOffsetConst(lanes, elemType)
 }
+
+// createTypeAssertSPMD handles type assertions to lanes.Varying[T].
+// The boxed representation uses [N]T array (matching getTypeCode), but the
+// SSA result type is <N x T> vector. This function compares against the array
+// type code, extracts the array value, and converts it to a vector.
+func (b *builder) createTypeAssertSPMD(itf llvm.Value, expr *ssa.TypeAssert, spmdType *types.SPMDType, vecType llvm.Type) llvm.Value {
+	// Build the array type that matches the type code used in boxing.
+	elemLLVM := b.getLLVMType(spmdType.Elem())
+	laneCount := b.spmdEffectiveLaneCount(spmdType, elemLLVM)
+	arrGoType := types.NewArray(spmdType.Elem(), int64(laneCount))
+	arrLLVMType := b.getLLVMType(arrGoType)
+
+	// Compare type codes using the array type (same as boxing path in MakeInterface).
+	actualTypeNum := b.CreateExtractValue(itf, 0, "interface.type")
+	name, _ := getTypeCodeName(arrGoType)
+	globalName := "reflect/types.typeid:" + name
+	assertedTypeCodeGlobal := b.mod.NamedGlobal(globalName)
+	if assertedTypeCodeGlobal.IsNil() {
+		assertedTypeCodeGlobal = llvm.AddGlobal(b.mod, b.ctx.Int8Type(), globalName)
+		assertedTypeCodeGlobal.SetGlobalConstant(true)
+	}
+	commaOk := b.createRuntimeCall("typeAssert", []llvm.Value{actualTypeNum, assertedTypeCodeGlobal}, "typecode")
+
+	// Branch on type match to avoid speculative extraction before the check.
+	prevBlock := b.GetInsertBlock()
+	okBlock := b.insertBasicBlock("typeassert.spmd.ok")
+	nextBlock := b.insertBasicBlock("typeassert.spmd.next")
+	b.currentBlockInfo.exit = nextBlock
+	b.CreateCondBr(commaOk, okBlock, nextBlock)
+
+	// OK block: extract the [N]T array from the interface, then convert to <N x T> vector.
+	b.SetInsertPointAtEnd(okBlock)
+	arrValue := b.extractValueFromInterface(itf, arrLLVMType)
+	valueOk := b.arrayToVector(arrValue, vecType)
+	b.CreateBr(nextBlock)
+
+	// Merge block: phi between zero-vector (failed assert) and extracted vector (ok).
+	b.SetInsertPointAtEnd(nextBlock)
+	phi := b.CreatePHI(vecType, "typeassert.spmd.value")
+	phi.AddIncoming([]llvm.Value{llvm.ConstNull(vecType), valueOk}, []llvm.BasicBlock{prevBlock, okBlock})
+
+	if expr.CommaOk {
+		tuple := b.ctx.ConstStruct([]llvm.Value{llvm.Undef(vecType), llvm.Undef(b.ctx.Int1Type())}, false)
+		tuple = b.CreateInsertValue(tuple, phi, 0, "")
+		tuple = b.CreateInsertValue(tuple, commaOk, 1, "")
+		return tuple
+	}
+	b.createRuntimeCall("interfaceTypeAssert", []llvm.Value{commaOk}, "")
+	return phi
+}

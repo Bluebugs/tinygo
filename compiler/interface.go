@@ -703,6 +703,13 @@ func (b *builder) createTypeAssert(expr *ssa.TypeAssert) llvm.Value {
 	itf := b.getValue(expr.X, getPos(expr))
 	assertedType := b.getLLVMType(expr.AssertedType)
 
+	// SPMD: type assertion to lanes.Varying[T].
+	// The type code is [N]T (array), but the SSA result type is <N x T> (vector).
+	// Compare against the array type code, then convert the extracted array to vector.
+	if spmdType, ok := expr.AssertedType.(*types.SPMDType); ok && spmdType.IsVarying() {
+		return b.createTypeAssertSPMD(itf, expr, spmdType, assertedType)
+	}
+
 	actualTypeNum := b.CreateExtractValue(itf, 0, "interface.type")
 	commaOk := llvm.Value{}
 
