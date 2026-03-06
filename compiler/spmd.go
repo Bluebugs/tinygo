@@ -378,7 +378,24 @@ func (b *builder) vectorToArray(vec llvm.Value) llvm.Value {
 // with its mask: struct{ Value [N]T; Mask [N]int32 }.
 func (c *compilerContext) spmdBoxedVaryingGoType(spmdType *types.SPMDType, laneCount int) *types.Struct {
 	arrayType := types.NewArray(spmdType.Elem(), int64(laneCount))
-	maskArrayType := types.NewArray(types.Typ[types.Int32], int64(laneCount))
+	// Mask element type must match spmdMaskElemType: WASM uses 128/laneCount bits
+	// (2→int64, 4→int32, 8→int16, 16→int8), non-WASM uses int8 (for i1).
+	var maskElemGoType types.Type
+	if c.spmdIsWASM() {
+		switch 128 / laneCount {
+		case 64:
+			maskElemGoType = types.Typ[types.Int64]
+		case 32:
+			maskElemGoType = types.Typ[types.Int32]
+		case 16:
+			maskElemGoType = types.Typ[types.Int16]
+		default:
+			maskElemGoType = types.Typ[types.Int8]
+		}
+	} else {
+		maskElemGoType = types.Typ[types.Int8]
+	}
+	maskArrayType := types.NewArray(maskElemGoType, int64(laneCount))
 	return types.NewStruct([]*types.Var{
 		types.NewVar(token.NoPos, nil, "Value", arrayType),
 		types.NewVar(token.NoPos, nil, "Mask", maskArrayType),

@@ -2951,8 +2951,11 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		// SPMD: convert vector to struct{[N]T, [N]int32} before boxing.
 		// Embeds both the value array and the per-block condition mask.
 		if spmdType, ok := expr.X.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
-			elemLLVM := b.getLLVMType(spmdType.Elem())
-			laneCount := b.spmdEffectiveLaneCount(spmdType, elemLLVM)
+			// Derive lane count from the actual LLVM value's vector size.
+			// This handles mixed-width contexts (e.g., Varying[float64] created
+			// in a 4-lane int loop) where spmdEffectiveLaneCount would give the
+			// canonical count but the actual vector may be wider.
+			laneCount := val.Type().VectorSize()
 
 			// Convert value vector to array.
 			valArr := b.vectorToArray(val)
