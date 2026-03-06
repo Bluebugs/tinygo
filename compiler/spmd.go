@@ -357,6 +357,23 @@ func (b *builder) arrayToVector(arr llvm.Value, vecType llvm.Type) llvm.Value {
 	return vec
 }
 
+// vectorToArray converts an LLVM <N x T> vector value to an [N x T] array
+// by extracting each element and inserting it into an array. Inverse of arrayToVector.
+// Used by MakeInterface to box lanes.Varying[T] vectors as [N]T arrays for interface packing.
+func (b *builder) vectorToArray(vec llvm.Value) llvm.Value {
+	vecType := vec.Type()
+	n := vecType.VectorSize()
+	elemType := vecType.ElementType()
+	arrType := llvm.ArrayType(elemType, n)
+	arr := llvm.Undef(arrType)
+	for i := 0; i < n; i++ {
+		idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+		elem := b.CreateExtractElement(vec, idx, "")
+		arr = b.CreateInsertValue(arr, elem, i, "")
+	}
+	return arr
+}
+
 // spmdBroadcastMatch ensures both operands have matching types for SPMD operations.
 // If one operand is a vector and the other is a scalar, the scalar is splatted.
 // If both are vectors with different lane counts, the wider one is resized to match the narrower.

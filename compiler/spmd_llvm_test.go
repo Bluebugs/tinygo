@@ -5246,3 +5246,69 @@ func TestSPMDFullStoreCapTypeMismatch(t *testing.T) {
 		})
 	}
 }
+
+func TestVectorToArray(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name      string
+		elemType  llvm.Type
+		laneCount int
+		vals      []uint64
+	}{
+		{
+			name:      "4xi32",
+			elemType:  c.ctx.Int32Type(),
+			laneCount: 4,
+			vals:      []uint64{10, 20, 30, 40},
+		},
+		{
+			name:      "2xi64",
+			elemType:  c.ctx.Int64Type(),
+			laneCount: 2,
+			vals:      []uint64{100, 200},
+		},
+		{
+			name:      "8xi16",
+			elemType:  c.ctx.Int16Type(),
+			laneCount: 8,
+			vals:      []uint64{1, 2, 3, 4, 5, 6, 7, 8},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build a constant <N x T> vector to convert.
+			elts := make([]llvm.Value, tt.laneCount)
+			for i, v := range tt.vals {
+				elts[i] = llvm.ConstInt(tt.elemType, v, false)
+			}
+			vec := llvm.ConstVector(elts, false)
+			if vec.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Fatalf("input type = %v, want VectorTypeKind", vec.Type().TypeKind())
+			}
+
+			arr := b.vectorToArray(vec)
+
+			// Verify result is non-nil.
+			if arr.IsNil() {
+				t.Fatal("vectorToArray returned nil")
+			}
+			// Verify result kind is array.
+			if arr.Type().TypeKind() != llvm.ArrayTypeKind {
+				t.Errorf("result type = %v, want ArrayTypeKind", arr.Type().TypeKind())
+			}
+			// Verify array length matches input lane count.
+			if arr.Type().ArrayLength() != tt.laneCount {
+				t.Errorf("result array length = %d, want %d", arr.Type().ArrayLength(), tt.laneCount)
+			}
+			// Verify array element type matches input element type.
+			if arr.Type().ElementType().C != tt.elemType.C {
+				t.Errorf("result element type mismatch: got %v, want %v", arr.Type().ElementType(), tt.elemType)
+			}
+		})
+	}
+}
