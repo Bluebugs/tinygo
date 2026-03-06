@@ -382,6 +382,14 @@ func (b *builder) createDefer(instr *ssa.Defer) {
 		// Collect all values to be put in the struct (starting with
 		// runtime._defer fields).
 		values = []llvm.Value{callback, next}
+		// SPMD: pack execution mask for functions with varying parameters.
+		if maskType := b.spmdMaskType(callee); maskType != (llvm.Type{}) {
+			if !b.getFunctionInfo(callee).exported {
+				mask := b.spmdDeferMask(instr, callee)
+				values = append(values, mask)
+				valueTypes = append(valueTypes, mask.Type())
+			}
+		}
 		for _, param := range instr.Call.Args {
 			llvmParam := b.getValue(param, getPos(instr))
 			values = append(values, llvmParam)
@@ -410,6 +418,14 @@ func (b *builder) createDefer(instr *ssa.Defer) {
 		// runtime._defer fields, followed by all parameters including the
 		// context pointer).
 		values = []llvm.Value{callback, next}
+		// SPMD: pack execution mask for closures with varying parameters.
+		if maskType := b.spmdMaskType(fn); maskType != (llvm.Type{}) {
+			if !b.getFunctionInfo(fn).exported {
+				mask := b.spmdDeferMask(instr, fn)
+				values = append(values, mask)
+				valueTypes = append(valueTypes, mask.Type())
+			}
+		}
 		for _, param := range instr.Call.Args {
 			llvmParam := b.getValue(param, getPos(instr))
 			values = append(values, llvmParam)
@@ -621,6 +637,12 @@ func (b *builder) createRunDefers() {
 
 			// Get the real defer struct type and cast to it.
 			valueTypes := []llvm.Type{b.uintptrType, b.dataPtrType}
+			// SPMD: include mask type if function has varying parameters.
+			if maskType := b.spmdMaskType(callback); maskType != (llvm.Type{}) {
+				if !b.getFunctionInfo(callback).exported {
+					valueTypes = append(valueTypes, maskType)
+				}
+			}
 			for _, param := range getParams(callback.Signature) {
 				valueTypes = append(valueTypes, b.getLLVMType(param.Type()))
 			}
@@ -629,9 +651,9 @@ func (b *builder) createRunDefers() {
 			// Extract the params from the struct.
 			forwardParams := []llvm.Value{}
 			zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
-			for i := range getParams(callback.Signature) {
-				gep := b.CreateInBoundsGEP(deferredCallType, deferData, []llvm.Value{zero, llvm.ConstInt(b.ctx.Int32Type(), uint64(i+2), false)}, "gep")
-				forwardParam := b.CreateLoad(valueTypes[i+2], gep, "param")
+			for i := 2; i < len(valueTypes); i++ {
+				gep := b.CreateInBoundsGEP(deferredCallType, deferData, []llvm.Value{zero, llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)}, "gep")
+				forwardParam := b.CreateLoad(valueTypes[i], gep, "param")
 				forwardParams = append(forwardParams, forwardParam)
 			}
 
@@ -651,6 +673,12 @@ func (b *builder) createRunDefers() {
 			// Get the real defer struct type and cast to it.
 			fn := callback.Fn.(*ssa.Function)
 			valueTypes := []llvm.Type{b.uintptrType, b.dataPtrType}
+			// SPMD: include mask type if closure has varying parameters.
+			if maskType := b.spmdMaskType(fn); maskType != (llvm.Type{}) {
+				if !b.getFunctionInfo(fn).exported {
+					valueTypes = append(valueTypes, maskType)
+				}
+			}
 			params := fn.Signature.Params()
 			for i := 0; i < params.Len(); i++ {
 				valueTypes = append(valueTypes, b.getLLVMType(params.At(i).Type()))

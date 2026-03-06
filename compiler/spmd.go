@@ -1937,6 +1937,20 @@ func (b *builder) spmdCallMask(fn *ssa.Function) llvm.Value {
 	return llvm.ConstAllOnes(maskType)
 }
 
+// spmdDeferMask returns the execution mask to pack into a defer struct for an
+// SPMD function call. Uses the SSA-level mask from CallCommon.SPMDMask if set
+// by the predication pass, otherwise falls back to spmdCallMask.
+func (b *builder) spmdDeferMask(instr *ssa.Defer, fn *ssa.Function) llvm.Value {
+	if instr.Call.SPMDMask != nil {
+		return b.getValue(instr.Call.SPMDMask, getPos(instr))
+	}
+	mask := b.spmdCallMask(fn)
+	if mask.IsNil() {
+		return llvm.ConstAllOnes(b.spmdMaskType(fn))
+	}
+	return mask
+}
+
 // spmdVectorTypeSuffix returns the LLVM intrinsic name suffix for a vector type.
 // e.g., <4 x i32> → "v4i32", <4 x float> → "v4f32", <2 x double> → "v2f64"
 func spmdVectorTypeSuffix(vecType llvm.Type) string {
