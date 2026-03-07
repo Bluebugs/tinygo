@@ -399,7 +399,7 @@ func (c *compilerContext) spmdBoxedVaryingGoType(spmdType *types.SPMDType, laneC
 	return types.NewStruct([]*types.Var{
 		types.NewVar(token.NoPos, nil, "Value", arrayType),
 		types.NewVar(token.NoPos, nil, "Mask", maskArrayType),
-	}, nil)
+	}, []string{`spmd:"varying"`, ""})
 }
 
 // spmdBroadcastMatch ensures both operands have matching types for SPMD operations.
