@@ -3258,7 +3258,10 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 // operations such as divide.
 func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Value, pos token.Pos) (llvm.Value, error) {
 	// Broadcast scalar operand to vector for mixed SPMD operations.
-	x, y = b.spmdBroadcastMatch(x, y)
+	// For mask types, use sign-extension to preserve the all-ones/all-zeros
+	// pattern when extending element widths (e.g., <4 x i8> 0xFF → <4 x i32> 0xFFFFFFFF).
+	_, isMaskOp := typ.Underlying().(*spmdtypes.MaskType)
+	x, y = b.spmdBroadcastMatch(x, y, isMaskOp)
 	switch typ := typ.Underlying().(type) {
 	case *types.Basic:
 		if typ.Info()&types.IsInteger != 0 {
@@ -3928,6 +3931,19 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 			// Return the value as-is, with mask format conversion if needed.
 			vecType := b.getLLVMType(typeTo)
 			if value.Type() == vecType {
+				return value, nil
+			}
+			// On WASM, bool→mask conversions should preserve the value's native
+			// lane count rather than converting to the hardcoded 4-lane Varying[mask].
+			// A <16 x i1> from a 16-lane byte loop should become <16 x i8>, not <4 x i32>.
+			if b.spmdIsWASM() && spmdtypes.IsMask(spmdTo.Elem()) {
+				srcElem := value.Type().ElementType()
+				if srcElem == b.ctx.Int1Type() {
+					// Source is <N x i1>; widen to same-lane-count WASM mask.
+					wasmMaskType := llvm.VectorType(b.spmdMaskElemType(value.Type().VectorSize()), value.Type().VectorSize())
+					return b.spmdConvertMaskFormat(value, wasmMaskType), nil
+				}
+				// Already in WASM mask format (<N x i8/i16/i32>); return as-is.
 				return value, nil
 			}
 			// Mask format conversion (e.g., <4 x i32> to <4 x i32> with different mask format).

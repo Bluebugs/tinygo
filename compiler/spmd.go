@@ -406,8 +406,11 @@ func (c *compilerContext) spmdBoxedVaryingGoType(spmdType *types.SPMDType, laneC
 // If one operand is a vector and the other is a scalar, the scalar is splatted.
 // If both are vectors with different lane counts, the wider one is resized to match the narrower.
 // If both are vectors with the same lane count but different element widths (e.g., <4 x i32>
-// and <4 x i8> from a zext'd byte gather), the narrower elements are zero-extended to match.
-func (b *builder) spmdBroadcastMatch(x, y llvm.Value) (llvm.Value, llvm.Value) {
+// and <4 x i8> from a zext'd byte gather), the narrower elements are extended to match.
+// When signExtend is true (for boolean/mask values), sign-extension is used to preserve
+// the all-ones/all-zeros pattern; otherwise zero-extension is used for unsigned data.
+func (b *builder) spmdBroadcastMatch(x, y llvm.Value, signExtend ...bool) (llvm.Value, llvm.Value) {
+	useSExt := len(signExtend) > 0 && signExtend[0]
 	xIsVec := x.Type().TypeKind() == llvm.VectorTypeKind
 	yIsVec := y.Type().TypeKind() == llvm.VectorTypeKind
 	if xIsVec && !yIsVec {
@@ -415,21 +418,38 @@ func (b *builder) spmdBroadcastMatch(x, y llvm.Value) (llvm.Value, llvm.Value) {
 	} else if !xIsVec && yIsVec {
 		x = b.splatScalar(x, y.Type())
 	} else if xIsVec && yIsVec && x.Type().VectorSize() != y.Type().VectorSize() {
-		// Both vectors but different lane counts. The narrower width is authoritative
-		// (determined by the SPMD loop's effective lane count). Resize the wider one.
-		xSize := x.Type().VectorSize()
-		ySize := y.Type().VectorSize()
-		if xSize < ySize {
-			y = b.spmdResizeVector(y, xSize, x.Type().ElementType())
+		if useSExt {
+			// Mask/boolean operations: expand the narrower to the wider lane count
+			// using spmdConvertMaskFormat, which normalizes through i1 and preserves
+			// the all-ones/all-zeros pattern. This ensures 16-lane byte-loop masks
+			// are not truncated to 4 lanes when combined with a <4 x i32> active mask.
+			xSize := x.Type().VectorSize()
+			ySize := y.Type().VectorSize()
+			if xSize < ySize {
+				x = b.spmdConvertMaskFormat(x, y.Type())
+			} else {
+				y = b.spmdConvertMaskFormat(y, x.Type())
+			}
 		} else {
-			x = b.spmdResizeVector(x, ySize, y.Type().ElementType())
+			// Data operations: the narrower width is authoritative
+			// (determined by the SPMD loop's effective lane count). Resize the wider one.
+			xSize := x.Type().VectorSize()
+			ySize := y.Type().VectorSize()
+			if xSize < ySize {
+				y = b.spmdResizeVector(y, xSize, x.Type().ElementType())
+			} else {
+				x = b.spmdResizeVector(x, ySize, y.Type().ElementType())
+			}
 		}
 	}
 	// After lane-count matching, handle element-width mismatches caused by WASM
-	// zero-extension. When spmdVectorIndexArray widens sub-128-bit byte gathers
+	// extension. When spmdVectorIndexArray widens sub-128-bit byte gathers
 	// to the mask element type (e.g., <4 x i8> -> <4 x i32>), and the paired
-	// operand is still a byte-width constant (e.g., <4 x i8> splat), zero-extend
+	// operand is still a byte-width constant (e.g., <4 x i8> splat), extend
 	// the narrower operand so both sides have the same integer element width.
+	// For boolean/mask values (useSExt=true), sign-extension preserves the
+	// all-ones/all-zeros pattern (e.g., i8 0xFF → i32 0xFFFFFFFF).
+	// For unsigned data values, zero-extension is used.
 	// Use the actual current types (x/y may have been updated above).
 	xType := x.Type()
 	yType := y.Type()
@@ -441,10 +461,18 @@ func (b *builder) spmdBroadcastMatch(x, y llvm.Value) (llvm.Value, llvm.Value) {
 		xType.ElementType() != yType.ElementType() {
 		xWidth := xType.ElementType().IntTypeWidth()
 		yWidth := yType.ElementType().IntTypeWidth()
-		if xWidth > yWidth {
-			y = b.CreateZExt(y, xType, "")
+		if useSExt {
+			if xWidth > yWidth {
+				y = b.CreateSExt(y, xType, "")
+			} else {
+				x = b.CreateSExt(x, yType, "")
+			}
 		} else {
-			x = b.CreateZExt(x, yType, "")
+			if xWidth > yWidth {
+				y = b.CreateZExt(y, xType, "")
+			} else {
+				x = b.CreateZExt(x, yType, "")
+			}
 		}
 	}
 	return x, y
@@ -525,6 +553,19 @@ func (c *compilerContext) createSPMDConst(expr *ssa.Const, spmdType *types.SPMDT
 			return llvm.ConstAllOnes(vecType)
 		}
 		return llvm.ConstNull(vecType)
+	}
+
+	// Varying[bool] constants use the WASM mask format: all-ones for true,
+	// all-zeros for false — matching comparison results (sext from i1).
+	// Using ConstAllOnes ensures correct bitwise-select behavior when the
+	// boolean is used as a select operand or mask input.
+	if c.spmdIsWASM() && expr.Value.Kind() == constant.Bool {
+		if basic, ok := spmdType.Elem().Underlying().(*types.Basic); ok && basic.Info()&types.IsBoolean != 0 {
+			if constant.BoolVal(expr.Value) {
+				return llvm.ConstAllOnes(vecType)
+			}
+			return llvm.ConstNull(vecType)
+		}
 	}
 
 	// Create scalar constant using the element type.
@@ -4599,8 +4640,22 @@ func (b *builder) createSPMDSelect(instr *ssa.SPMDSelect) llvm.Value {
 	x := b.getValue(instr.X, token.NoPos)
 	y := b.getValue(instr.Y, token.NoPos)
 
+	// Determine if the result type is boolean/mask. For such types, operands
+	// use the all-ones/all-zeros pattern and sign-extension must be used when
+	// aligning element widths (e.g., i8 0xFF → i32 0xFFFFFFFF, not 0x000000FF).
+	isBoolOrMask := false
+	if spmdType, ok := instr.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
+		elem := spmdType.Elem().Underlying()
+		if basic, ok := elem.(*types.Basic); ok && basic.Info()&types.IsBoolean != 0 {
+			isBoolOrMask = true
+		}
+		if spmdtypes.IsMask(spmdType.Elem()) {
+			isBoolOrMask = true
+		}
+	}
+
 	// Broadcast scalar operands to vector when needed (e.g., uniform constants).
-	x, y = b.spmdBroadcastMatch(x, y)
+	x, y = b.spmdBroadcastMatch(x, y, isBoolOrMask)
 
 	return b.spmdMaskSelect(mask, x, y)
 }
