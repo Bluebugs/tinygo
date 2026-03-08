@@ -4460,6 +4460,41 @@ func spmdIndexMaxValue(v ssa.Value) (uint64, bool) {
 			if k, ok := ssaConstUint64(val.Y); ok && k > 0 {
 				return k - 1, true
 			}
+
+		case token.ADD:
+			// x + y: upper bound is maxOf(x) + maxOf(y), guarding against overflow.
+			if maxX, okX := spmdIndexMaxValue(val.X); okX {
+				if maxY, okY := spmdIndexMaxValue(val.Y); okY {
+					sum := maxX + maxY
+					if sum >= maxX && sum >= maxY { // overflow guard
+						return sum, true
+					}
+				}
+			}
+
+		case token.SUB:
+			// x - y: upper bound is maxOf(x) (subtraction can only decrease).
+			// Only safe when y is a non-negative constant — for signed types,
+			// x - (-y) = x + y which can exceed maxOf(x).
+			if maxX, okX := spmdIndexMaxValue(val.X); okX {
+				if _, okY := ssaConstUint64(val.Y); okY {
+					return maxX, true
+				}
+			}
+
+		case token.MUL:
+			// x * y: upper bound is maxOf(x) * maxOf(y), guarding against overflow.
+			if maxX, okX := spmdIndexMaxValue(val.X); okX {
+				if maxY, okY := spmdIndexMaxValue(val.Y); okY {
+					if maxX == 0 || maxY == 0 {
+						return 0, true
+					}
+					prod := maxX * maxY
+					if prod/maxX == maxY { // overflow guard
+						return prod, true
+					}
+				}
+			}
 		}
 	}
 

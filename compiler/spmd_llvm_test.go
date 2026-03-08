@@ -3874,6 +3874,98 @@ func TestSPMDIndexMaxValueConst(t *testing.T) {
 	}
 }
 
+// TestSPMDIndexMaxValueBinOps verifies that spmdIndexMaxValue computes correct
+// maximums for ADD, SUB, and MUL binary operations on known-max operands.
+func TestSPMDIndexMaxValueBinOps(t *testing.T) {
+	// makeBinOp creates a BinOp with two const operands.
+	makeBinOp := func(op token.Token, x, y int64) *ssa.BinOp {
+		xConst := ssa.NewConst(constant.MakeInt64(x), types.Typ[types.Int])
+		yConst := ssa.NewConst(constant.MakeInt64(y), types.Typ[types.Int])
+		binop := &ssa.BinOp{
+			Op: op,
+			X:  xConst,
+			Y:  yConst,
+		}
+		return binop
+	}
+
+	// makeRemAdd creates a nested BinOp: (remX REM remY) ADD addZ.
+	makeRemAdd := func(remX, remY, addZ int64) *ssa.BinOp {
+		rem := makeBinOp(token.REM, remX, remY)
+		zConst := ssa.NewConst(constant.MakeInt64(addZ), types.Typ[types.Int])
+		add := &ssa.BinOp{
+			Op: token.ADD,
+			X:  rem,
+			Y:  zConst,
+		}
+		return add
+	}
+
+	tests := []struct {
+		name    string
+		val     ssa.Value
+		wantMax uint64
+		wantOK  bool
+	}{
+		{
+			name:    "ADD 3+5",
+			val:     makeBinOp(token.ADD, 3, 5),
+			wantMax: 8,
+			wantOK:  true,
+		},
+		{
+			name:    "ADD 0+10",
+			val:     makeBinOp(token.ADD, 0, 10),
+			wantMax: 10,
+			wantOK:  true,
+		},
+		{
+			// SUB max is maxOf(x); subtraction can only decrease the value.
+			name:    "SUB 10-3 (max is maxOf(x)=10)",
+			val:     makeBinOp(token.SUB, 10, 3),
+			wantMax: 10,
+			wantOK:  true,
+		},
+		{
+			name:    "MUL 3*4",
+			val:     makeBinOp(token.MUL, 3, 4),
+			wantMax: 12,
+			wantOK:  true,
+		},
+		{
+			name:    "MUL 0*100",
+			val:     makeBinOp(token.MUL, 0, 100),
+			wantMax: 0,
+			wantOK:  true,
+		},
+		{
+			// Composing REM + ADD: (i%3)+2 → max = 2+2 = 4.
+			name:    "nested: (i%3)+2 → max = 2+2 = 4",
+			val:     makeRemAdd(100, 3, 2),
+			wantMax: 4,
+			wantOK:  true,
+		},
+		{
+			// Composing REM + ADD: (i%16)+0 → max = 15+0 = 15.
+			name:    "nested: (i%16)+0 → max = 15+0 = 15",
+			val:     makeRemAdd(1000, 16, 0),
+			wantMax: 15,
+			wantOK:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := spmdIndexMaxValue(tt.val)
+			if ok != tt.wantOK {
+				t.Errorf("spmdIndexMaxValue() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && got != tt.wantMax {
+				t.Errorf("spmdIndexMaxValue() = %d, want %d", got, tt.wantMax)
+			}
+		})
+	}
+}
+
 func TestSPMDStoreCoalescing(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
