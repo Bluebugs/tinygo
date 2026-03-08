@@ -1733,6 +1733,23 @@ func (b *builder) spmdWasmAllTrue(mask llvm.Value) llvm.Value {
 	return b.createCall(fnType, fn, []llvm.Value{mask}, "")
 }
 
+// spmdWasmBitmask calls @llvm.wasm.bitmask on a vector.
+// Returns i32 with the high bit of each lane packed into a bitmask.
+// The input must be in WASM mask format (<N x iW>, not <N x i1>).
+// Only valid for WASM targets.
+func (b *builder) spmdWasmBitmask(vec llvm.Value) llvm.Value {
+	vecType := vec.Type()
+	suffix := spmdVectorTypeSuffix(vecType)
+	intrinsicName := "llvm.wasm.bitmask." + suffix
+	i32Type := b.ctx.Int32Type()
+	fnType := llvm.FunctionType(i32Type, []llvm.Type{vecType}, false)
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	return b.createCall(fnType, fn, []llvm.Value{vec}, "")
+}
+
 // spmdIsWASM returns true when the compiler target is a WebAssembly target.
 // On WASM, SIMD comparisons natively produce <N x i32> (all-ones/all-zeros),
 // so we use i32 as the internal mask element type to avoid the redundant
@@ -2625,34 +2642,21 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 	case name == "reduce.Mask":
 		// reduce.Mask(v Varying[bool]) int — bitmask of active lanes.
 		// On non-WASM: normalize to <N x i1>, bitcast to iN, zero-extend.
-		// On WASM: <N x i1> is sub-128-bit (e.g., <4 x i1> = 4 bits) and
-		// cannot be lowered by the WASM backend. Use per-lane scalar extract+
-		// compare+shift+OR to build the integer mask without any vector of
-		// bit-type elements.
+		// On WASM: use native i8x16.bitmask / i16x8.bitmask / i32x4.bitmask
+		// / i64x2.bitmask intrinsic which extracts the high bit of each lane.
 		vec := b.getValue(instr.Args[0], getPos(instr))
 		if b.spmdIsWASM() {
-			// WASM path: extract each lane as i32, test non-zero, shift to
-			// its bit position, and OR into a scalar integer result.
-			laneCount := vec.Type().VectorSize()
-			result := llvm.ConstNull(b.intType)
-			i32Type := b.ctx.Int32Type()
-			zero := llvm.ConstNull(i32Type)
-			for lane := 0; lane < laneCount; lane++ {
-				laneIdx := llvm.ConstInt(i32Type, uint64(lane), false)
-				elem := b.CreateExtractElement(vec, laneIdx, "")
-				if elem.Type() != i32Type {
-					// Widen to i32 if needed (e.g., i1 element from LLVM
-					// after optimization; rare in practice).
-					elem = b.CreateZExt(elem, i32Type, "")
-				}
-				// Non-zero element means this lane is active.
-				active := b.CreateICmp(llvm.IntNE, elem, zero, "")
-				bit := b.CreateZExt(active, b.intType, "")
-				shift := llvm.ConstInt(b.intType, uint64(lane), false)
-				bit = b.CreateShl(bit, shift, "")
-				result = b.CreateOr(result, bit, "")
+			// Ensure vec is in WASM mask format (<N x iW>, not <N x i1>).
+			if vec.Type().ElementType() == b.ctx.Int1Type() {
+				laneCount := vec.Type().VectorSize()
+				maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
+				vec = b.CreateSExt(vec, maskType, "")
 			}
-			return result, nil
+			// llvm.wasm.bitmask extracts the high bit of each lane element
+			// into a scalar i32 bitmask. For all-ones mask elements (e.g.,
+			// 0xFF or 0xFFFFFFFF), the high bit is 1; for all-zeros, it's 0.
+			result := b.spmdWasmBitmask(vec)
+			return b.createZExtOrTrunc(result, b.intType), nil
 		}
 		i1Vec := b.spmdNormalizeBoolVecToI1(vec)
 		vecSize := i1Vec.Type().VectorSize()
