@@ -4696,6 +4696,61 @@ func (b *builder) spmdExpandMaskForStride(mask llvm.Value, stride, N int) []llvm
 	return out
 }
 
+// spmdWidenMaskToOperandLanes widens a mask from M lanes to N lanes (N > M,
+// N % M == 0) by replicating each lane (N/M) times using a shufflevector.
+// This is needed when a Varying[bool] accumulator (16 lanes on WASM128) is
+// selected by a loop mask derived from a narrower type (e.g., 4-lane int32).
+//
+// The output mask uses the same element type as the input. For WASM i32 masks
+// the result is <N x i32>; for i1 masks the result is <N x i1>.
+func (b *builder) spmdWidenMaskToOperandLanes(mask llvm.Value, targetLanes int) llvm.Value {
+	maskType := mask.Type()
+	srcLanes := maskType.VectorSize()
+	if srcLanes == targetLanes {
+		return mask
+	}
+	if targetLanes%srcLanes != 0 {
+		panic(fmt.Sprintf("spmdWidenMaskToOperandLanes: targetLanes %d is not a multiple of srcLanes %d", targetLanes, srcLanes))
+	}
+	ratio := targetLanes / srcLanes
+
+	// Handle constant masks directly to avoid emitting runtime instructions.
+	if mask.IsConstant() {
+		if mask.IsNull() {
+			return llvm.ConstNull(llvm.VectorType(maskType.ElementType(), targetLanes))
+		}
+		return llvm.ConstAllOnes(llvm.VectorType(maskType.ElementType(), targetLanes))
+	}
+
+	// Normalize to <srcLanes x i1> so we can work with plain bits.
+	i1Type := b.ctx.Int1Type()
+	srcElem := maskType.ElementType()
+	var i1Mask llvm.Value
+	if srcElem == i1Type {
+		i1Mask = mask
+	} else {
+		i1Mask = b.CreateTrunc(mask, llvm.VectorType(i1Type, srcLanes), "spmd.widen.trunc")
+	}
+
+	// Build a shuffle that replicates each source lane `ratio` times:
+	// [0,0,...,0, 1,1,...,1, ..., srcLanes-1,...,srcLanes-1]
+	shuffleElems := make([]llvm.Value, targetLanes)
+	for i := 0; i < targetLanes; i++ {
+		srcIdx := i / ratio
+		shuffleElems[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(srcIdx), false)
+	}
+	shuffleMask := llvm.ConstVector(shuffleElems, false)
+	undef := llvm.Undef(llvm.VectorType(i1Type, srcLanes))
+	widened := b.CreateShuffleVector(i1Mask, undef, shuffleMask, "spmd.widen.shuf")
+
+	// Restore original element width if the input was not i1 (e.g., i32 WASM mask).
+	if srcElem == i1Type {
+		return widened
+	}
+	targetType := llvm.VectorType(srcElem, targetLanes)
+	return b.CreateSExt(widened, targetType, "spmd.widen.sext")
+}
+
 // createSPMDSelect emits LLVM IR for an SPMDSelect instruction.
 // SPMDSelect yields X where Mask is active, Y where inactive, per SIMD lane.
 // This is the predicated replacement for Phi at varying merge points.
@@ -4725,6 +4780,29 @@ func (b *builder) createSPMDSelect(instr *ssa.SPMDSelect) llvm.Value {
 
 	// Broadcast scalar operands to vector when needed (e.g., uniform constants).
 	x, y = b.spmdBroadcastMatch(x, y, isBoolOrMask)
+
+	// Handle lane count mismatch between mask and operands. This occurs when a
+	// Varying[bool] accumulator (16 lanes on WASM128) is used inside a 4-lane
+	// int32 go for loop — the loop mask has 4 lanes but the bool operands have 16.
+	//
+	// When operands have more lanes than the mask (widening), replicate each mask
+	// bit to cover the corresponding operand lanes using shufflevector. For example,
+	// a <4 x i32> mask for a 16-lane bool select becomes <16 x i1> with each bit
+	// replicated 4 times: [0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3].
+	//
+	// When operands have fewer lanes than the mask, the situation is unexpected
+	// (a wider loop mask selecting a narrower varying type), so we panic.
+	if x.Type().TypeKind() == llvm.VectorTypeKind {
+		maskLanes := mask.Type().VectorSize()
+		operandLanes := x.Type().VectorSize()
+		if maskLanes != operandLanes {
+			if maskLanes > operandLanes {
+				panic(fmt.Sprintf("createSPMDSelect: mask has more lanes than operands (mask=%d, operands=%d), cannot narrow Varying type in SPMD loop", maskLanes, operandLanes))
+			}
+			// Widen: replicate each mask lane (operandLanes/maskLanes) times.
+			mask = b.spmdWidenMaskToOperandLanes(mask, operandLanes)
+		}
+	}
 
 	return b.spmdMaskSelect(mask, x, y)
 }

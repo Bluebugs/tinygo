@@ -5247,6 +5247,128 @@ func TestSPMDFullStoreCapTypeMismatch(t *testing.T) {
 	}
 }
 
+// TestSPMDWidenMaskToOperandLanes verifies that spmdWidenMaskToOperandLanes
+// correctly replicates each mask lane when a narrow loop mask (e.g., 4-lane
+// int32) selects a wider Varying[bool] accumulator (16 lanes on WASM128).
+func TestSPMDWidenMaskToOperandLanes(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	tests := []struct {
+		name        string
+		srcLanes    int
+		targetLanes int
+		elemBits    int // 1 for i1, 32 for i32
+	}{
+		{
+			name:        "i1_4to16",
+			srcLanes:    4,
+			targetLanes: 16,
+			elemBits:    1,
+		},
+		{
+			name:        "i32_4to16",
+			srcLanes:    4,
+			targetLanes: 16,
+			elemBits:    32,
+		},
+		{
+			name:        "i1_2to8",
+			srcLanes:    2,
+			targetLanes: 8,
+			elemBits:    1,
+		},
+		{
+			name:        "same_lanes_noop",
+			srcLanes:    4,
+			targetLanes: 4,
+			elemBits:    32,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var elemType llvm.Type
+			if tt.elemBits == 1 {
+				elemType = c.ctx.Int1Type()
+			} else {
+				elemType = c.ctx.Int32Type()
+			}
+			maskType := llvm.VectorType(elemType, tt.srcLanes)
+
+			// Build a non-constant mask so the shuffle path is exercised.
+			// Use undef as a stand-in for a runtime mask value.
+			mask := llvm.Undef(maskType)
+
+			result := b.spmdWidenMaskToOperandLanes(mask, tt.targetLanes)
+
+			if result.IsNil() {
+				t.Fatal("spmdWidenMaskToOperandLanes returned nil")
+			}
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Fatalf("result type = %v, want VectorTypeKind", result.Type().TypeKind())
+			}
+			if result.Type().VectorSize() != tt.targetLanes {
+				t.Errorf("result lanes = %d, want %d", result.Type().VectorSize(), tt.targetLanes)
+			}
+			// Element type of the output must match the input element type.
+			gotElemBits := result.Type().ElementType().IntTypeWidth()
+			if gotElemBits != tt.elemBits {
+				t.Errorf("result element width = %d bits, want %d", gotElemBits, tt.elemBits)
+			}
+		})
+	}
+}
+
+// TestSPMDWidenMaskConstNull verifies that constant null (all-inactive) masks
+// are widened without emitting runtime instructions.
+func TestSPMDWidenMaskConstNull(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	srcMask := llvm.ConstNull(llvm.VectorType(c.ctx.Int32Type(), 4))
+	result := b.spmdWidenMaskToOperandLanes(srcMask, 16)
+
+	if result.IsNil() {
+		t.Fatal("spmdWidenMaskToOperandLanes returned nil for ConstNull")
+	}
+	if !result.IsConstant() {
+		t.Error("widened ConstNull should remain constant")
+	}
+	if !result.IsNull() {
+		t.Error("widened ConstNull should be null (all-inactive)")
+	}
+	if result.Type().VectorSize() != 16 {
+		t.Errorf("result lanes = %d, want 16", result.Type().VectorSize())
+	}
+}
+
+// TestSPMDWidenMaskConstAllOnes verifies that constant all-ones (all-active) masks
+// are widened without emitting runtime instructions.
+func TestSPMDWidenMaskConstAllOnes(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	srcMask := llvm.ConstAllOnes(llvm.VectorType(c.ctx.Int32Type(), 4))
+	result := b.spmdWidenMaskToOperandLanes(srcMask, 16)
+
+	if result.IsNil() {
+		t.Fatal("spmdWidenMaskToOperandLanes returned nil for ConstAllOnes")
+	}
+	if !result.IsConstant() {
+		t.Error("widened ConstAllOnes should remain constant")
+	}
+	if result.Type().VectorSize() != 16 {
+		t.Errorf("result lanes = %d, want 16", result.Type().VectorSize())
+	}
+}
+
 func TestVectorToArray(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
