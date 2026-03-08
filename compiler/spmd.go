@@ -335,7 +335,6 @@ func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.B
 	return b.spmdLaneCount(b.getLLVMType(incrBinOp.Type()))
 }
 
-// splatScalar broadcasts a scalar value to fill all lanes of a vector type.
 // spmdConvertScalarToElem converts a scalar integer to match the target element
 // type. For bool/mask values (useSExt=true), sign-extension preserves the
 // all-ones/all-zeros pattern (i1 true → i32 -1). For data values, zero-extension
@@ -359,6 +358,7 @@ func (b *builder) spmdConvertScalarToElem(scalar llvm.Value, elemType llvm.Type,
 	return b.CreateTrunc(scalar, elemType, "")
 }
 
+// splatScalar broadcasts a scalar value to fill all lanes of a vector type.
 func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
 	undef := llvm.Undef(vecType)
 	zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
