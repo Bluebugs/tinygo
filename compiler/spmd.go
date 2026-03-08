@@ -734,14 +734,23 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			continue
 		}
 
-		// Compute lane count. For rangeindex loops (range-over-slice), the
+		// Compute lane count. For rangeindex loops (range-over-slice/array), the
 		// iterator type is always int (i32 on WASM32) which gives 4 lanes, but
-		// the actual lane count depends on the slice element type (e.g., 16 for
-		// []byte). Use spmdRangeIndexLaneCount to get the correct width.
-		// For rangeint loops, the iter phi type is authoritative.
+		// the actual lane count depends on the element type (e.g., 16 for byte).
+		//
+		// Priority: (1) SSA metadata LaneCount from type checker (accounts for
+		// decomposed index optimization), (2) heuristic IndexAddr scan,
+		// (3) iterator type fallback.
 		var laneCount int
 		if ssaLoop.IsRangeIndex {
 			laneCount = b.spmdRangeIndexLaneCount(ssaLoop.BoundValue, ssaLoop.MainBodyBlock, mainIncrBinOp)
+			// If the heuristic fell back to iterator type (4 lanes) but the type
+			// checker computed a wider lane count (e.g., 16 for byte arrays),
+			// prefer the type checker's value. The index is decomposable so its
+			// int size should not limit the lane count.
+			if ssaLoop.LaneCount > laneCount {
+				laneCount = ssaLoop.LaneCount
+			}
 		} else {
 			elemType := b.getLLVMType(mainIterPhi.Type())
 			laneCount = b.spmdLaneCount(elemType)
@@ -996,6 +1005,11 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		// Compute lane count from the slice element type (if available) for optimal
 		// SIMD width. For []byte slices this yields 16 lanes instead of 4.
 		laneCount := b.spmdRangeIndexLaneCount(boundValue, block, incrBinOp)
+		// If the heuristic fell back to iterator type but the type checker computed
+		// a wider lane count, prefer the type checker's value (index is decomposable).
+		if loopInfo != nil && int(loopInfo.LaneCount) > laneCount {
+			laneCount = int(loopInfo.LaneCount)
+		}
 
 		// On WASM with laneCount > 4, a naive <laneCount x i32> index vector would
 		// be wider than 128 bits (e.g., <16 x i32> is 512-bit). Use decomposed
@@ -1088,7 +1102,58 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 		}
 		loop.scalarIterVal = scalarPhi
 
-		// Compute lane indices: <iter, iter+1, ..., iter+laneCount-1>.
+		if loop.isDecomposed {
+			// Decomposed path: represent the index as scalar base + <N x i8> offset.
+			// This avoids creating a <16 x i32> 512-bit vector on WASM SIMD128.
+			i8Type := b.ctx.Int8Type()
+			laneCount := loop.laneCount
+
+			varyingOffset := b.spmdLaneOffsetConst(laneCount, i8Type)
+
+			if b.spmdDecomposed != nil {
+				// Use the appropriate iter value as the body iterator for decomposition.
+				var bodyIter ssa.Value
+				if isMainBody {
+					bodyIter = ssaLoop.MainIterPhi
+				} else {
+					bodyIter = ssaLoop.TailIterPhi
+				}
+				b.spmdDecomposed[bodyIter] = &spmdDecomposedIndex{
+					scalarBase:    scalarPhi,
+					varyingOffset: varyingOffset,
+					laneCount:     laneCount,
+					loop:          loop,
+					fromBodyIter:  true,
+				}
+			}
+
+			if isMainBody {
+				maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
+				loop.tailMask = llvm.ConstAllOnes(maskType)
+			} else {
+				// Tail mask via <N x i8> comparison: offset < clamp(bound - base).
+				boundScalar := b.getValue(loop.boundValue, token.NoPos)
+				diff := b.CreateSub(boundScalar, scalarPhi, "spmd.diff")
+				zero32 := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+				lcConst := llvm.ConstInt(b.ctx.Int32Type(), uint64(laneCount), false)
+				diffClamped := b.CreateSelect(
+					b.CreateICmp(llvm.IntSGT, diff, lcConst, ""),
+					lcConst, diff, "spmd.diff.clamped")
+				diffClamped = b.CreateSelect(
+					b.CreateICmp(llvm.IntSLT, diffClamped, zero32, ""),
+					zero32, diffClamped, "spmd.diff.nonneg")
+				diffI8 := b.CreateTrunc(diffClamped, i8Type, "spmd.diff.i8")
+				diffVec := b.splatScalar(diffI8, llvm.VectorType(i8Type, laneCount))
+				tailMaskI1 := b.CreateICmp(llvm.IntULT, varyingOffset, diffVec, "spmd.tail.mask")
+				loop.tailMask = b.spmdWrapMask(tailMaskI1, laneCount)
+				if ssaLoop.TailMask != nil {
+					b.locals[ssaLoop.TailMask] = loop.tailMask
+				}
+			}
+			return
+		}
+
+		// Non-decomposed peeled path: full <laneCount x elemType> lane indices.
 		elemType := scalarPhi.Type()
 		vecType := llvm.VectorType(elemType, loop.laneCount)
 		iterVec := b.splatScalar(scalarPhi, vecType)
