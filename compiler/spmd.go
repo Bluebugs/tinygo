@@ -336,6 +336,29 @@ func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.B
 }
 
 // splatScalar broadcasts a scalar value to fill all lanes of a vector type.
+// spmdConvertScalarToElem converts a scalar integer to match the target element
+// type. For bool/mask values (useSExt=true), sign-extension preserves the
+// all-ones/all-zeros pattern (i1 true → i32 -1). For data values, zero-extension
+// is used. This is needed when splatting a scalar to a vector with a different
+// element width (e.g., i1 bool scalar into <4 x i32> mask vector).
+func (b *builder) spmdConvertScalarToElem(scalar llvm.Value, elemType llvm.Type, useSExt bool) llvm.Value {
+	if scalar.Type() == elemType {
+		return scalar
+	}
+	if scalar.Type().TypeKind() != llvm.IntegerTypeKind || elemType.TypeKind() != llvm.IntegerTypeKind {
+		return scalar
+	}
+	scalarWidth := scalar.Type().IntTypeWidth()
+	elemWidth := elemType.IntTypeWidth()
+	if scalarWidth < elemWidth {
+		if useSExt {
+			return b.CreateSExt(scalar, elemType, "")
+		}
+		return b.CreateZExt(scalar, elemType, "")
+	}
+	return b.CreateTrunc(scalar, elemType, "")
+}
+
 func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
 	undef := llvm.Undef(vecType)
 	zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
@@ -414,8 +437,12 @@ func (b *builder) spmdBroadcastMatch(x, y llvm.Value, signExtend ...bool) (llvm.
 	xIsVec := x.Type().TypeKind() == llvm.VectorTypeKind
 	yIsVec := y.Type().TypeKind() == llvm.VectorTypeKind
 	if xIsVec && !yIsVec {
+		// Convert scalar element type to match vector element type before splatting.
+		// This handles cases like splatting an i1 bool into a <4 x i32> mask vector.
+		y = b.spmdConvertScalarToElem(y, x.Type().ElementType(), useSExt)
 		y = b.splatScalar(y, x.Type())
 	} else if !xIsVec && yIsVec {
+		x = b.spmdConvertScalarToElem(x, y.Type().ElementType(), useSExt)
 		x = b.splatScalar(x, y.Type())
 	} else if xIsVec && yIsVec && x.Type().VectorSize() != y.Type().VectorSize() {
 		if useSExt {
