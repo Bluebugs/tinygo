@@ -3020,6 +3020,63 @@ func TestSPMDVectorIndexArrayLLVM(t *testing.T) {
 	}
 }
 
+func TestSPMDSwizzleArrayBytes(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+
+	tests := []struct {
+		name      string
+		arrayLen  int
+		laneCount int
+	}{
+		{"16xi8_4lanes", 16, 4},
+		{"8xi8_4lanes", 8, 4},
+		{"4xi8_4lanes", 4, 4},
+		{"16xi8_16lanes", 16, 16},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build a [N x i8] array value.
+			arrayType := llvm.ArrayType(i8Type, tt.arrayLen)
+			arrayVal := llvm.ConstNull(arrayType)
+
+			// Build index vector <4 x i32> = [0, 1, 2, 3].
+			vecType := llvm.VectorType(i32Type, tt.laneCount)
+			indexVec := llvm.Undef(vecType)
+			for i := 0; i < tt.laneCount; i++ {
+				indexVec = b.CreateInsertElement(indexVec,
+					llvm.ConstInt(i32Type, uint64(i%tt.arrayLen), false),
+					llvm.ConstInt(i32Type, uint64(i), false), "")
+			}
+
+			result, err := b.spmdSwizzleArrayBytes(arrayVal, indexVec, tt.arrayLen, tt.laneCount)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Result should be a vector.
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Fatalf("expected vector, got %v", result.Type().TypeKind())
+			}
+			if result.Type().VectorSize() != tt.laneCount {
+				t.Errorf("expected %d lanes, got %d", tt.laneCount, result.Type().VectorSize())
+			}
+
+			// Verify module IR contains llvm.wasm.swizzle.
+			modIR := b.mod.String()
+			if !strings.Contains(modIR, "llvm.wasm.swizzle") {
+				t.Error("expected llvm.wasm.swizzle in module IR")
+			}
+		})
+	}
+}
+
 // TestSPMDVectorReduceUmax verifies that spmdVectorReduceUmax emits
 // @llvm.vector.reduce.umax and produces a scalar result of the correct type.
 func TestSPMDVectorReduceUmax(t *testing.T) {

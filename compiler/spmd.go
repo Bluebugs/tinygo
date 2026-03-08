@@ -4212,20 +4212,8 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 		return llvm.Value{}, b.makeError(expr.Pos(), "SPMD vector index into array of varying elements is not supported")
 	}
 
-	alloca, allocaSize := b.createTemporaryAlloca(arrayType, "index.alloca")
-	b.CreateStore(collection, alloca)
-
-	// Pre-compute extended lane indices (used for both bounds check and GEP).
-	laneIdxs := make([]llvm.Value, laneCount)
-	for lane := 0; lane < laneCount; lane++ {
-		idx := b.CreateExtractElement(index, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
-		if idx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
-			idx = b.spmdExtendIndex(idx, expr.Index.Type(), b.uintptrType)
-		}
-		laneIdxs[lane] = idx
-	}
-
-	// Aggregate bounds check: OR per-lane OOB flags.
+	// Aggregate bounds check: works on the vector index directly, shared by
+	// both the swizzle fast path and the GEP fallback below.
 	arrayLen := llvm.ConstInt(b.uintptrType, uint64(xType.Len()), false)
 	if !b.info.nobounds {
 		canElide := false
@@ -4248,12 +4236,31 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 		}
 	}
 
+	// WASM fast path: use i8x16.swizzle for byte arrays ≤ 16 elements.
+	elemType := arrayType.ElementType()
+	if b.spmdIsWASM() && elemType == b.ctx.Int8Type() && xType.Len() <= 16 {
+		return b.spmdSwizzleArrayBytes(collection, index, int(xType.Len()), laneCount)
+	}
+
+	// Fallback: alloca + per-lane GEP + load.
+	alloca, allocaSize := b.createTemporaryAlloca(arrayType, "index.alloca")
+	b.CreateStore(collection, alloca)
+
+	// Pre-compute extended lane indices for GEP.
+	laneIdxs := make([]llvm.Value, laneCount)
+	for lane := 0; lane < laneCount; lane++ {
+		idx := b.CreateExtractElement(index, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
+		if idx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+			idx = b.spmdExtendIndex(idx, expr.Index.Type(), b.uintptrType)
+		}
+		laneIdxs[lane] = idx
+	}
+
 	// Per-lane: GEP, load, insert into result vector.
 	// On WASM, build the result in the mask element type (e.g., <4 x i32>) to avoid
 	// sub-128-bit vectors (e.g., <4 x i8> = 32 bits) which WASM cannot lower.
 	// Each loaded byte is zero-extended to the wider element type during insertion
 	// rather than after, so no intermediate sub-128-bit vector is ever created.
-	elemType := arrayType.ElementType()
 	resultElemType := elemType
 	if b.spmdIsWASM() {
 		vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(elemType, laneCount))) * 8
@@ -4342,6 +4349,73 @@ func (b *builder) spmdWasmSwizzle(tableBytes []byte, index llvm.Value, laneCount
 	return result
 }
 
+// spmdSwizzleArrayBytes uses i8x16.swizzle to perform vectorized byte lookup
+// from a runtime [N]byte array (N ≤ 16) on WASM. The array is loaded into a
+// <16 x i8> register and swizzled with the index vector. For sub-128-bit
+// results (laneCount < 16), each byte is widened to the mask element type.
+func (b *builder) spmdSwizzleArrayBytes(collection, index llvm.Value, arrayLen, laneCount int) (llvm.Value, error) {
+	i8Type := b.ctx.Int8Type()
+	i32Type := b.ctx.Int32Type()
+	v16i8 := llvm.VectorType(i8Type, 16)
+
+	// Load the array value into a <16 x i8> vector.
+	var tableVec llvm.Value
+	if arrayLen == 16 {
+		// Exact fit: store [16 x i8] to alloca, load back as <16 x i8>.
+		alloca, allocaSize := b.createTemporaryAlloca(collection.Type(), "swizzle.alloca")
+		b.CreateStore(collection, alloca)
+		tableVec = b.CreateLoad(v16i8, alloca, "swizzle.table")
+		b.emitLifetimeEnd(alloca, allocaSize)
+	} else {
+		// Pad to 16 bytes: extract each byte, insert into zero vector.
+		tableVec = llvm.ConstNull(v16i8)
+		for i := 0; i < arrayLen; i++ {
+			val := b.CreateExtractValue(collection, i, "")
+			tableVec = b.CreateInsertElement(tableVec, val,
+				llvm.ConstInt(i32Type, uint64(i), false), "")
+		}
+	}
+
+	// Prepare index as <16 x i8>.
+	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount)
+
+	// Call @llvm.wasm.swizzle(<16 x i8>, <16 x i8>).
+	intrinsicName := "llvm.wasm.swizzle"
+	fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	swizzled := b.createCall(fnType, fn, []llvm.Value{tableVec, idxVec}, "spmd.swizzle")
+
+	// Determine result element type. On WASM, widen bytes to avoid sub-128-bit vectors.
+	resultElemType := i8Type
+	if b.spmdIsWASM() {
+		vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(i8Type, laneCount))) * 8
+		if vecBits < 128 {
+			resultElemType = b.spmdMaskElemType(laneCount)
+		}
+	}
+
+	// Fast path: 16 byte lanes, no widening needed.
+	if laneCount == 16 && resultElemType == i8Type {
+		return swizzled, nil
+	}
+
+	// Extract laneCount bytes from swizzle result and widen if needed.
+	result := llvm.Undef(llvm.VectorType(resultElemType, laneCount))
+	for i := 0; i < laneCount; i++ {
+		val := b.CreateExtractElement(swizzled,
+			llvm.ConstInt(i32Type, uint64(i), false), "")
+		if resultElemType != i8Type {
+			val = b.CreateZExt(val, resultElemType, "")
+		}
+		result = b.CreateInsertElement(result, val,
+			llvm.ConstInt(i32Type, uint64(i), false), "")
+	}
+	return result, nil
+}
+
 // spmdSwizzlePrepareIndex converts a vector index to <16 x i8> for i8x16.swizzle.
 // If the index element type is wider than i8 (e.g., <4 x i32>), it is truncated to
 // <N x i8>. If N < 16, the vector is padded to 16 lanes using a shuffle; the padding
@@ -4363,7 +4437,7 @@ func (b *builder) spmdSwizzlePrepareIndex(index llvm.Value, laneCount int) llvm.
 
 	// Pad to 16 lanes using a shuffle. Padding lanes pick from the undef second operand
 	// and produce undef values; the swizzle result for those lanes is discarded by the
-	// extract shuffle in spmdWasmSwizzle, so undef padding is safe.
+	// caller's extraction step, so undef padding is safe.
 	maskElems := make([]llvm.Value, 16)
 	for i := 0; i < 16; i++ {
 		if i < laneCount {
