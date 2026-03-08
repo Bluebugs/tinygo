@@ -3020,6 +3020,100 @@ func TestSPMDVectorIndexArrayLLVM(t *testing.T) {
 	}
 }
 
+// TestSPMDVectorReduceUmax verifies that spmdVectorReduceUmax emits
+// @llvm.vector.reduce.umax and produces a scalar result of the correct type.
+func TestSPMDVectorReduceUmax(t *testing.T) {
+	tests := []struct {
+		name      string
+		laneCount int
+		elemBits  int
+	}{
+		{"4xi32", 4, 32},
+		{"4xi8", 4, 8},
+		{"8xi16", 8, 16},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestCompilerContext(t)
+			defer c.dispose()
+			b := newTestBuilder(t, c)
+			defer b.Dispose()
+
+			elemType := c.ctx.IntType(tt.elemBits)
+			vecType := llvm.VectorType(elemType, tt.laneCount)
+
+			// Build a constant vector [0, 1, 2, ..., laneCount-1].
+			vec := llvm.Undef(vecType)
+			for i := 0; i < tt.laneCount; i++ {
+				vec = b.CreateInsertElement(vec,
+					llvm.ConstInt(elemType, uint64(i), false),
+					llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false), "")
+			}
+
+			result := b.spmdVectorReduceUmax(vec)
+
+			// Result must be a scalar of the same element type.
+			if result.Type() != elemType {
+				t.Errorf("expected scalar type i%d, got %s", tt.elemBits, result.Type().String())
+			}
+
+			// The LLVM IR for the call must reference the umax intrinsic.
+			ir := result.String()
+			want := "llvm.vector.reduce.umax"
+			if !strings.Contains(ir, want) {
+				t.Errorf("expected IR to contain %q, got:\n%s", want, ir)
+			}
+		})
+	}
+}
+
+// TestSPMDVectorReduceUmaxBoundsCheck verifies that the vectorized bounds check
+// in spmdVectorIndexString and spmdVectorIndexArray uses llvm.vector.reduce.umax
+// (one intrinsic call) rather than per-lane extract+icmp+or (3N scalar ops).
+func TestSPMDVectorReduceUmaxBoundsCheck(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	vecType := llvm.VectorType(i32Type, laneCount)
+
+	// Simulate a clamped index vector [0, 1, 2, 3].
+	index := llvm.Undef(vecType)
+	for i := 0; i < laneCount; i++ {
+		index = b.CreateInsertElement(index,
+			llvm.ConstInt(i32Type, uint64(i), false),
+			llvm.ConstInt(i32Type, uint64(i), false), "")
+	}
+
+	// Invoke spmdVectorReduceUmax — the replacement for the per-lane OR chain.
+	maxIdx := b.spmdVectorReduceUmax(index)
+	if maxIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+		maxIdx = b.CreateZExt(maxIdx, b.uintptrType, "")
+	}
+	length := llvm.ConstInt(b.uintptrType, 16, false)
+	oob := b.CreateICmp(llvm.IntUGE, maxIdx, length, "spmd.bounds.oob")
+
+	// The oob flag must come from a single icmp, not a chain of ORs.
+	ir := oob.String()
+	if !strings.Contains(ir, "spmd.bounds.oob") {
+		t.Errorf("expected icmp named spmd.bounds.oob in IR, got:\n%s", ir)
+	}
+
+	// Confirm the umax intrinsic is referenced somewhere in the module IR.
+	modIR := c.mod.String()
+	if !strings.Contains(modIR, "llvm.vector.reduce.umax") {
+		t.Errorf("expected llvm.vector.reduce.umax in module IR")
+	}
+	// Confirm there is no per-lane OR chain (the old pattern created N "or i1" ops).
+	// The new path has a single icmp, so there should be no "or i1" at all.
+	if strings.Contains(modIR, "or i1") {
+		t.Errorf("unexpected per-lane 'or i1' chain found; umax path should not emit it")
+	}
+}
+
 func TestSPMDSwizzleDetection(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()

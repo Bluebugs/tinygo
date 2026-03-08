@@ -1730,6 +1730,24 @@ func (b *builder) spmdVectorAllTrue(mask llvm.Value) llvm.Value {
 	return b.CreateICmp(llvm.IntEQ, intVal, allOnes, "")
 }
 
+// spmdVectorReduceUmax reduces a vector of unsigned integers to the scalar
+// maximum across all lanes using the @llvm.vector.reduce.umax intrinsic.
+// This is used to collapse a vector of per-lane indices into a single scalar
+// for a unified bounds check: if max(indices) < length, all lanes are in bounds.
+func (b *builder) spmdVectorReduceUmax(vec llvm.Value) llvm.Value {
+	vecType := vec.Type()
+	elemType := vecType.ElementType()
+	laneCount := vecType.VectorSize()
+	elemBits := elemType.IntTypeWidth()
+	intrinsicName := fmt.Sprintf("llvm.vector.reduce.umax.v%di%d", laneCount, elemBits)
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fnType := llvm.FunctionType(elemType, []llvm.Type{vecType}, false)
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	return b.CreateCall(fn.GlobalValueType(), fn, []llvm.Value{vec}, "spmd.reduce.umax")
+}
+
 // spmdWasmAnyTrue calls @llvm.wasm.anytrue on a vector.
 // Returns i32 (0 or 1). Only valid for WASM targets.
 func (b *builder) spmdWasmAnyTrue(mask llvm.Value) llvm.Value {
@@ -4120,12 +4138,16 @@ func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.
 			}
 		}
 		if !canElide {
-			anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
-			for lane := 0; lane < laneCount; lane++ {
-				oob := b.CreateICmp(llvm.IntUGE, laneIdxs[lane], length, "")
-				anyOOB = b.CreateOr(anyOOB, oob, "")
+			// Vectorized prelude: reduce all lane indices to a single scalar max,
+			// then do one scalar bounds check. Inactive lanes were clamped to 0
+			// above, so they cannot cause a false OOB. This replaces N
+			// extract+compare+OR scalar ops with a single vector intrinsic.
+			maxIdx := b.spmdVectorReduceUmax(index)
+			if maxIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+				maxIdx = b.CreateZExt(maxIdx, b.uintptrType, "")
 			}
-			b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+			oob := b.CreateICmp(llvm.IntUGE, maxIdx, length, "spmd.bounds.oob")
+			b.createRuntimeAssert(oob, "lookup", "lookupPanic")
 		}
 	}
 
@@ -4213,12 +4235,16 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 			}
 		}
 		if !canElide {
-			anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
-			for lane := 0; lane < laneCount; lane++ {
-				oob := b.CreateICmp(llvm.IntUGE, laneIdxs[lane], arrayLen, "")
-				anyOOB = b.CreateOr(anyOOB, oob, "")
+			// Vectorized prelude: reduce all lane indices to a single scalar max,
+			// then do one scalar bounds check. Inactive lanes were clamped to 0
+			// above, so they cannot cause a false OOB. This replaces N
+			// extract+compare+OR scalar ops with a single vector intrinsic.
+			maxIdx := b.spmdVectorReduceUmax(index)
+			if maxIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+				maxIdx = b.CreateZExt(maxIdx, b.uintptrType, "")
 			}
-			b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+			oob := b.CreateICmp(llvm.IntUGE, maxIdx, arrayLen, "spmd.bounds.oob")
+			b.createRuntimeAssert(oob, "lookup", "lookupPanic")
 		}
 	}
 
