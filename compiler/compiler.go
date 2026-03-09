@@ -1934,6 +1934,29 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		srcBuf := b.CreateExtractValue(src, 0, "copy.srcArray")
 		elemType := b.getLLVMType(argTypes[0].Underlying().(*types.Slice).Elem())
 		elemSize := llvm.ConstInt(b.uintptrType, b.targetData.TypeAllocSize(elemType), false)
+		// Inline small byte copies: when element size is 1 (byte) and the
+		// destination length is a small constant, emit inline memmove instead
+		// of a runtime.sliceCopy call. This avoids a function call overhead
+		// for common patterns like copy(dst[:n], src) where n is a constant.
+		if b.targetData.TypeAllocSize(elemType) == 1 &&
+			dstLen.IsConstant() && dstLen.ZExtValue() <= 256 {
+			// n = min(srcLen, dstLen) using an unsigned compare so that
+			// oversized srcLen values don't incorrectly win.
+			cmp := b.CreateICmp(llvm.IntULT, srcLen, dstLen, "copy.cmp")
+			n := b.CreateSelect(cmp, srcLen, dstLen, "copy.n")
+			// Extend n to uintptr width for the memmove intrinsic, if needed.
+			nUintptr := n
+			if n.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+				nUintptr = b.CreateZExt(n, b.uintptrType, "copy.nUintptr")
+			}
+			memmoveFn := b.getMemmoveFunc()
+			isVolatile := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
+			b.CreateCall(memmoveFn.GlobalValueType(), memmoveFn,
+				[]llvm.Value{dstBuf, srcBuf, nUintptr, isVolatile}, "")
+			// The copy builtin returns int (same width as the slice length
+			// field, which is already the platform int width).
+			return n, nil
+		}
 		return b.createRuntimeCall("sliceCopy", []llvm.Value{dstBuf, srcBuf, dstLen, srcLen, elemSize}, "copy.n"), nil
 	case "delete":
 		m := argValues[0]

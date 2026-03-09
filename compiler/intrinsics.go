@@ -100,6 +100,17 @@ func (c *compilerContext) getMemsetFunc() llvm.Value {
 	return llvmFn
 }
 
+// Return the llvm.memmove.p0.p0.iN function declaration.
+func (c *compilerContext) getMemmoveFunc() llvm.Value {
+	fnName := "llvm.memmove.p0.p0.i" + strconv.Itoa(c.uintptrType.IntTypeWidth())
+	llvmFn := c.mod.NamedFunction(fnName)
+	if llvmFn.IsNil() {
+		fnType := llvm.FunctionType(c.ctx.VoidType(), []llvm.Type{c.dataPtrType, c.dataPtrType, c.uintptrType, c.ctx.Int1Type()}, false)
+		llvmFn = llvm.AddFunction(c.mod, fnName, fnType)
+	}
+	return llvmFn
+}
+
 // createKeepAlive creates the runtime.KeepAlive function. It is implemented
 // using inline assembly.
 func (b *builder) createKeepAliveImpl() {
