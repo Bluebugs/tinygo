@@ -184,6 +184,7 @@ type builder struct {
 	spmdEntryMask         llvm.Value                                    // SPMD function entry mask (zero if not SPMD function)
 	spmdContiguousPtr     map[ssa.Value]*spmdContiguousInfo             // IndexAddr SSA value -> contiguous access info
 	spmdShiftedPtr        map[ssa.Value]*spmdShiftedLoadInfo            // IndexAddr SSA value -> shifted load info (load+shuffle)
+	spmdSwizzleResult     map[ssa.Value]llvm.Value                      // IndexAddr SSA value -> pre-computed swizzle result (byte array ≤ 16 on WASM)
 	spmdInterleavedStores map[ssa.Instruction]*spmdInterleavedStoreInfo // store → interleaved group info (*ssa.Store or *ssa.SPMDStore)
 	spmdInterleavedAddrs  map[*ssa.IndexAddr]*spmdInterleavedStoreInfo  // IndexAddr → interleaved group info
 	spmdInterleavedValues map[*spmdInterleavedStoreGroup][]llvm.Value   // group → collected values (filled during codegen)
@@ -1472,6 +1473,7 @@ func (b *builder) createFunction() {
 	if b.spmdLoopState != nil || b.spmdFuncIsBody {
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
 		b.spmdShiftedPtr = make(map[ssa.Value]*spmdShiftedLoadInfo)
+		b.spmdSwizzleResult = make(map[ssa.Value]llvm.Value)
 
 		if b.spmdLoopState != nil {
 			b.spmdInterleavedStores = make(map[ssa.Instruction]*spmdInterleavedStoreInfo)
@@ -2837,6 +2839,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			}
 
 			// Vector bounds check: verify all lane indices are in bounds.
+			// Use a single vector reduce-umax + one scalar compare instead of N
+			// extract+compare+OR chains (matching the spmdVectorIndexArray pattern).
 			if !b.info.nobounds {
 				var buflen llvm.Value
 				switch ptrTyp := expr.X.Type().Underlying().(type) {
@@ -2847,18 +2851,33 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					buflen = b.CreateExtractValue(val, 1, "indexaddr.len")
 				}
 				if !buflen.IsNil() {
-					// Extract each lane index and check against length.
-					// OR all the out-of-bounds flags together.
-					anyOOB := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
-					for lane := 0; lane < laneCount; lane++ {
-						idx := b.CreateExtractElement(index, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
-						if idx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
-							idx = b.CreateSExt(idx, b.uintptrType, "")
-						}
-						oob := b.CreateICmp(llvm.IntUGE, idx, buflen, "")
-						anyOOB = b.CreateOr(anyOOB, oob, "")
+					maxIdx := b.spmdVectorReduceUmax(index)
+					if maxIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
+						// ZExt is correct: umax treats values as unsigned bit patterns,
+						// so a negative index (e.g., -1 = 0xFFFFFFFF) stays large after
+						// zero-extension and still triggers the IntUGE bounds check.
+						maxIdx = b.CreateZExt(maxIdx, b.uintptrType, "")
 					}
-					b.createRuntimeAssert(anyOOB, "lookup", "lookupPanic")
+					oob := b.CreateICmp(llvm.IntUGE, maxIdx, buflen, "spmd.bounds.oob")
+					b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+				}
+			}
+
+			// WASM swizzle fast path: for byte arrays ≤ 16 elements, load the whole
+			// array into a <16 x i8> register and use i8x16.swizzle instead of
+			// building a pointer vector for per-lane scatter/gather. The swizzle
+			// result is cached in spmdSwizzleResult; SPMDLoad returns it directly.
+			if b.spmdIsWASM() && b.spmdSwizzleResult != nil {
+				if ptrTyp, ok := expr.X.Type().Underlying().(*types.Pointer); ok {
+					if arrTyp, ok := ptrTyp.Elem().Underlying().(*types.Array); ok {
+						if b.getLLVMType(arrTyp.Elem()) == b.ctx.Int8Type() && arrTyp.Len() <= 16 {
+							arrLLVMType := b.getLLVMType(arrTyp)
+							arrVal := b.CreateLoad(arrLLVMType, val, "swizzle.arr")
+							result, _ := b.spmdSwizzleArrayBytes(arrVal, index, int(arrTyp.Len()), laneCount)
+							b.spmdSwizzleResult[expr] = result
+							return llvm.Undef(b.dataPtrType), nil
+						}
+					}
 				}
 			}
 

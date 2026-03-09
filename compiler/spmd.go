@@ -5077,6 +5077,15 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// target-specific width. instr.Lanes may use host int sizes.
 	laneCount := mask.Type().VectorSize()
 
+	// WASM swizzle fast path: IndexAddr detected a byte array ≤ 16 on WASM,
+	// loaded it as <16 x i8>, and ran i8x16.swizzle eagerly. Return the
+	// cached result directly — no per-lane loads needed.
+	if b.spmdSwizzleResult != nil {
+		if result, ok := b.spmdSwizzleResult[instr.Addr]; ok {
+			return result
+		}
+	}
+
 	// Shifted-contiguous access: e.g. src[i>>1] in a 16-lane rangeindex loop.
 	// TinyGo detects the shift pattern during IndexAddr compilation and records
 	// it in spmdShiftedPtr. Use spmdShiftedLoad which performs a narrow
