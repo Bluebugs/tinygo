@@ -2838,9 +2838,27 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				return llvm.Value{}, b.makeError(expr.Pos(), "unsupported SPMD vector indexaddr type: "+ptrTyp.String())
 			}
 
-			// Vector bounds check: verify all lane indices are in bounds.
-			// Use a single vector reduce-umax + one scalar compare instead of N
-			// extract+compare+OR chains (matching the spmdVectorIndexArray pattern).
+			// WASM swizzle fast path: for byte arrays ≤ 16 elements, load the whole
+			// array into a <16 x i8> register and use i8x16.swizzle instead of
+			// building a pointer vector for per-lane scatter/gather. The swizzle
+			// result is cached in spmdSwizzleResult; SPMDLoad returns it directly.
+			// No bounds check needed — swizzle returns 0 for indices >= 16.
+			if b.spmdIsWASM() && b.spmdSwizzleResult != nil {
+				if ptrTyp, ok := expr.X.Type().Underlying().(*types.Pointer); ok {
+					if arrTyp, ok := ptrTyp.Elem().Underlying().(*types.Array); ok {
+						if b.getLLVMType(arrTyp.Elem()) == b.ctx.Int8Type() && arrTyp.Len() <= 16 {
+							result, err := b.spmdSwizzleFromPtr(val, index, int(arrTyp.Len()), laneCount)
+							if err != nil {
+								return llvm.Value{}, err
+							}
+							b.spmdSwizzleResult[expr] = result
+							return llvm.Undef(b.dataPtrType), nil
+						}
+					}
+				}
+			}
+
+			// Vector bounds check for the GEP fallback path (actual memory access).
 			if !b.info.nobounds {
 				var buflen llvm.Value
 				switch ptrTyp := expr.X.Type().Underlying().(type) {
@@ -2860,27 +2878,6 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					}
 					oob := b.CreateICmp(llvm.IntUGE, maxIdx, buflen, "spmd.bounds.oob")
 					b.createRuntimeAssert(oob, "lookup", "lookupPanic")
-				}
-			}
-
-			// WASM swizzle fast path: for byte arrays ≤ 16 elements, load the whole
-			// array into a <16 x i8> register and use i8x16.swizzle instead of
-			// building a pointer vector for per-lane scatter/gather. The swizzle
-			// result is cached in spmdSwizzleResult; SPMDLoad returns it directly.
-			if b.spmdIsWASM() && b.spmdSwizzleResult != nil {
-				if ptrTyp, ok := expr.X.Type().Underlying().(*types.Pointer); ok {
-					if arrTyp, ok := ptrTyp.Elem().Underlying().(*types.Array); ok {
-						if b.getLLVMType(arrTyp.Elem()) == b.ctx.Int8Type() && arrTyp.Len() <= 16 {
-							// Load directly as <16 x i8> from the array pointer —
-							// no intermediate aggregate load or alloca round-trip.
-							result, err := b.spmdSwizzleFromPtr(val, index, int(arrTyp.Len()), laneCount)
-							if err != nil {
-								return llvm.Value{}, err
-							}
-							b.spmdSwizzleResult[expr] = result
-							return llvm.Undef(b.dataPtrType), nil
-						}
-					}
 				}
 			}
 

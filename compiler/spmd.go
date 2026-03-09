@@ -2525,6 +2525,135 @@ func boolToUint64(b bool) uint64 {
 	return 0
 }
 
+// spmdGetReduceMask returns the LLVM execution mask for a reduce builtin call.
+// The predication pass sets CallCommon.SPMDMask when the call site is inside a
+// varying control flow region.
+//
+// For go-for loops, the SSA predication assigns a constant all-ones mask for the
+// main body and a tail mask SSA value for peeled tail bodies. For non-peeled loops
+// (rangeindex/range-over-slice), the SSA mask is always all-ones even though only
+// some lanes are active — the actual tail mask is computed at runtime by TinyGo's
+// loop body prologue. We detect this case and return the loop's runtime tailMask
+// so that reduce operations only see values from active lanes.
+//
+// Returns a zero llvm.Value when no masking is needed (all lanes guaranteed active).
+func (b *builder) spmdGetReduceMask(instr *ssa.CallCommon) llvm.Value {
+	// First: get the SSA-level mask (may be nil or a constant all-ones).
+	var ssaMask llvm.Value
+	if instr.SPMDMask != nil {
+		ssaMask = b.getValue(instr.SPMDMask, getPos(instr))
+	}
+
+	// Second: check whether we are inside a loop body whose tailMask is a
+	// runtime value. Use direct bodyBlocks lookup only (no dominance fallback)
+	// to avoid matching done blocks after the loop — tailMask doesn't dominate
+	// those. Predication sub-blocks (varying if/else within the loop body)
+	// get their mask via SSA-level SPMDMask from predication.
+	var loopMask llvm.Value
+	if b.spmdLoopState != nil && b.currentBlock != nil {
+		if loop, ok := b.spmdLoopState.bodyBlocks[b.currentBlock.Index]; ok {
+			lm := loop.tailMask
+			if !lm.IsNil() {
+				if loop.isPeeled {
+					// For peeled loops, only use tailMask in the tail body block.
+					// Main body has all lanes active — no masking needed.
+					if loop.ssaLoopInfo != nil &&
+						loop.ssaLoopInfo.TailBodyBlock != nil &&
+						b.currentBlock.Index == loop.ssaLoopInfo.TailBodyBlock.Index {
+						if !lm.IsConstant() || ssaMask.IsNil() {
+							loopMask = lm
+						}
+					}
+				} else {
+					// Non-peeled: tailMask is in body prologue, dominates body.
+					if !lm.IsConstant() || ssaMask.IsNil() {
+						loopMask = lm
+					}
+				}
+			}
+		}
+	}
+
+	// Combine: if both masks are present, AND them so both varying-if and
+	// loop-tail constraints are applied. If only one is present, use it.
+	switch {
+	case ssaMask.IsNil() && loopMask.IsNil():
+		return llvm.Value{} // no masking needed
+	case ssaMask.IsNil():
+		return loopMask
+	case loopMask.IsNil():
+		// SSA mask may be a constant all-ones (predication assigned it for the
+		// main body); return zero so callers skip masking for the trivial case.
+		if ssaMask.IsConstant() && !ssaMask.IsNull() {
+			return llvm.Value{}
+		}
+		return ssaMask
+	default:
+		// Both non-nil: AND them. Normalize to the same type first.
+		laneCount := ssaMask.Type().VectorSize()
+		i1SSA := b.spmdUnwrapMaskForIntrinsic(ssaMask, laneCount)
+		i1Loop := b.spmdUnwrapMaskForIntrinsic(loopMask, laneCount)
+		combined := b.CreateAnd(i1SSA, i1Loop, "spmd.reduce.combined.mask")
+		return combined
+	}
+}
+
+// spmdMaskBoolVecForAny applies the execution mask to a boolean vector so that
+// inactive lanes appear false. Used by reduce.Any, reduce.Mask, reduce.FindFirstSet,
+// and reduce.Count: ANDs the bool vector with the mask so inactive lanes become 0.
+// Both inputs are normalized to <N x i1> before the AND; the result is <N x i1>.
+// When mask is a zero llvm.Value (no masking needed) vec is returned unchanged.
+func (b *builder) spmdMaskBoolVecForAny(vec, mask llvm.Value) llvm.Value {
+	if mask.IsNil() {
+		return vec
+	}
+	// Normalize both to <N x i1> so CreateAnd is valid.
+	i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+	laneCount := i1Vec.Type().VectorSize()
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+	return b.CreateAnd(i1Vec, i1Mask, "spmd.reduce.mask.and")
+}
+
+// spmdMaskBoolVecForAll applies the execution mask to a boolean vector so that
+// inactive lanes appear true. Used by reduce.All: ORs the bool vector with NOT mask
+// so inactive lanes become 1 and do not prevent "all true".
+// Both inputs are normalized to <N x i1> before the OR; the result is <N x i1>.
+// When mask is a zero llvm.Value (no masking needed) vec is returned unchanged.
+func (b *builder) spmdMaskBoolVecForAll(vec, mask llvm.Value) llvm.Value {
+	if mask.IsNil() {
+		return vec
+	}
+	// Normalize both to <N x i1>.
+	i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+	laneCount := i1Vec.Type().VectorSize()
+	i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+	notMask := b.CreateNot(i1Mask, "spmd.reduce.notmask")
+	return b.CreateOr(i1Vec, notMask, "spmd.reduce.mask.or")
+}
+
+// spmdMaskArithVec replaces inactive-lane values with an identity element so that
+// they do not affect the reduction result. Used by arithmetic reduce builtins.
+// identity must be a scalar constant of the vector element type; inactive lanes
+// are set to identity via a per-lane select driven by the execution mask.
+// When mask is a zero llvm.Value (no masking needed) vec is returned unchanged.
+func (b *builder) spmdMaskArithVec(vec, mask llvm.Value, identity llvm.Value) llvm.Value {
+	if mask.IsNil() {
+		return vec
+	}
+	// Build a constant splat of the identity value matching vec's vector type.
+	vecType := vec.Type()
+	laneCount := vecType.VectorSize()
+	elems := make([]llvm.Value, laneCount)
+	for i := range elems {
+		elems[i] = identity
+	}
+	identityVec := llvm.ConstVector(elems, false)
+	// Use spmdMaskSelect: active lanes keep vec, inactive lanes get identity.
+	// spmdMaskSelect accepts either WASM mask format or <N x i1>.
+	normalizedMask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+	return b.CreateSelect(normalizedMask, vec, identityVec, "spmd.reduce.masked")
+}
+
 // createReduceBuiltin handles interception of reduce.* function calls.
 // Returns the LLVM value result and nil error on success.
 func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
@@ -2533,30 +2662,43 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		vec := b.getValue(instr.Args[0], getPos(instr))
 		argType := instr.Args[0].Type()
 		if spmdType, ok := argType.(*types.SPMDType); ok && spmdIsFloat(spmdType.Elem()) {
-			// Float: ordered fadd reduction with start = 0.0
+			// Float: ordered fadd reduction with start = 0.0. Identity for add is 0.0.
 			elemType := vec.Type().ElementType()
+			identity := llvm.ConstFloat(elemType, 0.0)
+			vec = b.spmdMaskArithVec(vec, b.spmdGetReduceMask(instr), identity)
 			startVal := llvm.ConstFloat(elemType, 0.0)
 			return b.spmdCallVectorReduceFloat("fadd", startVal, vec), nil
 		}
+		// Integer add: identity is 0.
+		elemType := vec.Type().ElementType()
+		identity := llvm.ConstInt(elemType, 0, false)
+		vec = b.spmdMaskArithVec(vec, b.spmdGetReduceMask(instr), identity)
 		return b.spmdCallVectorReduce("add", vec), nil
 
 	case strings.HasPrefix(name, "reduce.Mul["):
 		vec := b.getValue(instr.Args[0], getPos(instr))
 		argType := instr.Args[0].Type()
 		if spmdType, ok := argType.(*types.SPMDType); ok && spmdIsFloat(spmdType.Elem()) {
-			// Float: ordered fmul reduction with start = 1.0
+			// Float: ordered fmul reduction with start = 1.0. Identity for mul is 1.0.
 			elemType := vec.Type().ElementType()
+			identity := llvm.ConstFloat(elemType, 1.0)
+			vec = b.spmdMaskArithVec(vec, b.spmdGetReduceMask(instr), identity)
 			startVal := llvm.ConstFloat(elemType, 1.0)
 			return b.spmdCallVectorReduceFloat("fmul", startVal, vec), nil
 		}
+		// Integer mul: identity is 1.
+		elemType := vec.Type().ElementType()
+		identity := llvm.ConstInt(elemType, 1, false)
+		vec = b.spmdMaskArithVec(vec, b.spmdGetReduceMask(instr), identity)
 		return b.spmdCallVectorReduce("mul", vec), nil
 
 	case name == "reduce.All":
-		// reduce.All(v Varying[bool]) bool — true if all lanes are true.
-		// Normalize to <N x i1> first (on WASM bool vectors are <N x i32>),
-		// then bitcast to iN and compare == all-ones.
+		// reduce.All(v Varying[bool]) bool — true if all active lanes are true.
+		// Inactive lanes must appear true so they don't prevent "all true".
 		vec := b.getValue(instr.Args[0], getPos(instr))
-		i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+		masked := b.spmdMaskBoolVecForAll(vec, b.spmdGetReduceMask(instr))
+		// Normalize to <N x i1> then bitcast to iN and compare == all-ones.
+		i1Vec := b.spmdNormalizeBoolVecToI1(masked)
 		vecSize := i1Vec.Type().VectorSize()
 		intType := b.ctx.IntType(vecSize)
 		intVal := b.CreateBitCast(i1Vec, intType, "")
@@ -2564,47 +2706,91 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		return b.CreateICmp(llvm.IntEQ, intVal, allOnes, ""), nil
 
 	case name == "reduce.Any":
-		// reduce.Any(v Varying[bool]) bool — true if any lane is true.
-		// spmdVectorAnyTrue handles both <N x i1> and <N x i32> (WASM) formats.
+		// reduce.Any(v Varying[bool]) bool — true if any active lane is true.
+		// Inactive lanes must appear false so they don't falsely trigger "any".
 		vec := b.getValue(instr.Args[0], getPos(instr))
-		return b.spmdVectorAnyTrue(vec), nil
+		masked := b.spmdMaskBoolVecForAny(vec, b.spmdGetReduceMask(instr))
+		// spmdVectorAnyTrue handles both <N x i1> and <N x i32> (WASM) formats.
+		return b.spmdVectorAnyTrue(masked), nil
 
 	case strings.HasPrefix(name, "reduce.Max["):
 		vec := b.getValue(instr.Args[0], getPos(instr))
 		argType := instr.Args[0].Type()
+		execMask := b.spmdGetReduceMask(instr)
 		if spmdType, ok := argType.(*types.SPMDType); ok {
 			if spmdIsFloat(spmdType.Elem()) {
+				// Identity for fmax is -Inf: inactive lanes contribute -Inf and never win.
+				elemType := vec.Type().ElementType()
+				identity := llvm.ConstFloatFromString(elemType, "-Inf")
+				vec = b.spmdMaskArithVec(vec, execMask, identity)
 				return b.spmdCallVectorReduce("fmax", vec), nil
 			}
 			if spmdIsSignedInt(spmdType.Elem()) {
+				// Identity for smax is INT_MIN: inactive lanes contribute the minimum
+				// signed value and never beat any active lane's value.
+				elemType := vec.Type().ElementType()
+				bits := elemType.IntTypeWidth()
+				identity := llvm.ConstInt(elemType, uint64(1)<<(uint(bits)-1), false)
+				vec = b.spmdMaskArithVec(vec, execMask, identity)
 				return b.spmdCallVectorReduce("smax", vec), nil
 			}
 		}
+		// Unsigned max: identity is 0 (inactive lanes contribute 0 and never win).
+		elemType := vec.Type().ElementType()
+		identity := llvm.ConstInt(elemType, 0, false)
+		vec = b.spmdMaskArithVec(vec, execMask, identity)
 		return b.spmdCallVectorReduce("umax", vec), nil
 
 	case strings.HasPrefix(name, "reduce.Min["):
 		vec := b.getValue(instr.Args[0], getPos(instr))
 		argType := instr.Args[0].Type()
+		execMask := b.spmdGetReduceMask(instr)
 		if spmdType, ok := argType.(*types.SPMDType); ok {
 			if spmdIsFloat(spmdType.Elem()) {
+				// Identity for fmin is +Inf: inactive lanes contribute +Inf and never win.
+				elemType := vec.Type().ElementType()
+				identity := llvm.ConstFloatFromString(elemType, "+Inf")
+				vec = b.spmdMaskArithVec(vec, execMask, identity)
 				return b.spmdCallVectorReduce("fmin", vec), nil
 			}
 			if spmdIsSignedInt(spmdType.Elem()) {
+				// Identity for smin is INT_MAX: inactive lanes contribute the maximum
+				// signed value and never beat any active lane's value.
+				elemType := vec.Type().ElementType()
+				bits := elemType.IntTypeWidth()
+				identity := llvm.ConstInt(elemType, (uint64(1)<<(uint(bits)-1))-1, false)
+				vec = b.spmdMaskArithVec(vec, execMask, identity)
 				return b.spmdCallVectorReduce("smin", vec), nil
 			}
 		}
+		// Unsigned min: identity is UINT_MAX (inactive lanes contribute max, never win).
+		elemType := vec.Type().ElementType()
+		identity := llvm.ConstAllOnes(elemType)
+		vec = b.spmdMaskArithVec(vec, execMask, identity)
 		return b.spmdCallVectorReduce("umin", vec), nil
 
 	case strings.HasPrefix(name, "reduce.Or["):
+		// Identity for OR is 0: inactive lanes contribute 0, preserving other bits.
 		vec := b.getValue(instr.Args[0], getPos(instr))
+		elemType := vec.Type().ElementType()
+		identity := llvm.ConstInt(elemType, 0, false)
+		vec = b.spmdMaskArithVec(vec, b.spmdGetReduceMask(instr), identity)
 		return b.spmdCallVectorReduce("or", vec), nil
 
 	case strings.HasPrefix(name, "reduce.And["):
+		// Identity for AND is all-ones: inactive lanes contribute all-ones, preserving other bits.
 		vec := b.getValue(instr.Args[0], getPos(instr))
+		elemType := vec.Type().ElementType()
+		identity := llvm.ConstAllOnes(elemType)
+		vec = b.spmdMaskArithVec(vec, b.spmdGetReduceMask(instr), identity)
 		return b.spmdCallVectorReduce("and", vec), nil
 
 	case strings.HasPrefix(name, "reduce.Xor["):
+		// Identity for XOR is 0: inactive lanes contribute 0, preserving other bits.
 		vec := b.getValue(instr.Args[0], getPos(instr))
+		elemType := vec.Type().ElementType()
+		identity := llvm.ConstInt(elemType, 0, false)
+		vec = b.spmdMaskArithVec(vec, b.spmdGetReduceMask(instr), identity)
 		return b.spmdCallVectorReduce("xor", vec), nil
 
 	case strings.HasPrefix(name, "reduce.From["):
@@ -2644,11 +2830,12 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		return slice, nil
 
 	case name == "reduce.Count":
-		// reduce.Count(v Varying[bool]) int — count of true lanes.
-		// Normalize to <N x i1> first (on WASM bool vectors are <N x i32>),
-		// then bitcast to iN and use llvm.ctpop.
+		// reduce.Count(v Varying[bool]) int — count of true active lanes.
+		// Inactive lanes are cleared to false before counting so they don't inflate the result.
 		vec := b.getValue(instr.Args[0], getPos(instr))
-		i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+		masked := b.spmdMaskBoolVecForAny(vec, b.spmdGetReduceMask(instr))
+		// Normalize to <N x i1> then bitcast to iN and use llvm.ctpop.
+		i1Vec := b.spmdNormalizeBoolVecToI1(masked)
 		vecSize := i1Vec.Type().VectorSize()
 		intType := b.ctx.IntType(vecSize)
 		intVal := b.CreateBitCast(i1Vec, intType, "")
@@ -2663,11 +2850,12 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		return b.createZExtOrTrunc(popcount, b.intType), nil
 
 	case name == "reduce.FindFirstSet":
-		// reduce.FindFirstSet(v Varying[bool]) int — index of first true lane.
-		// Normalize to <N x i1> first (on WASM bool vectors are <N x i32>),
-		// then bitcast to iN and use llvm.cttz.
+		// reduce.FindFirstSet(v Varying[bool]) int — index of first true active lane.
+		// Inactive lanes are cleared to false before searching so they don't appear first.
 		vec := b.getValue(instr.Args[0], getPos(instr))
-		i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+		masked := b.spmdMaskBoolVecForAny(vec, b.spmdGetReduceMask(instr))
+		// Normalize to <N x i1> then bitcast to iN and use llvm.cttz.
+		i1Vec := b.spmdNormalizeBoolVecToI1(masked)
 		vecSize := i1Vec.Type().VectorSize()
 		intType := b.ctx.IntType(vecSize)
 		intVal := b.CreateBitCast(i1Vec, intType, "")
@@ -2685,25 +2873,28 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		return b.createZExtOrTrunc(cttz, b.intType), nil
 
 	case name == "reduce.Mask":
-		// reduce.Mask(v Varying[bool]) int — bitmask of active lanes.
+		// reduce.Mask(v Varying[bool]) int — bitmask of active lanes that are true.
+		// Inactive lanes are cleared to false before computing the bitmask.
 		// On non-WASM: normalize to <N x i1>, bitcast to iN, zero-extend.
 		// On WASM: use native i8x16.bitmask / i16x8.bitmask / i32x4.bitmask
 		// / i64x2.bitmask intrinsic which extracts the high bit of each lane.
 		vec := b.getValue(instr.Args[0], getPos(instr))
+		masked := b.spmdMaskBoolVecForAny(vec, b.spmdGetReduceMask(instr))
 		if b.spmdIsWASM() {
-			// Ensure vec is in WASM mask format (<N x iW>, not <N x i1>).
-			if vec.Type().ElementType() == b.ctx.Int1Type() {
-				laneCount := vec.Type().VectorSize()
+			// Ensure masked is in WASM mask format (<N x iW>, not <N x i1>).
+			// spmdMaskBoolVecForAny returns <N x i1>; sign-extend to WASM format.
+			if masked.Type().ElementType() == b.ctx.Int1Type() {
+				laneCount := masked.Type().VectorSize()
 				maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
-				vec = b.CreateSExt(vec, maskType, "")
+				masked = b.CreateSExt(masked, maskType, "")
 			}
 			// llvm.wasm.bitmask extracts the high bit of each lane element
 			// into a scalar i32 bitmask. For all-ones mask elements (e.g.,
 			// 0xFF or 0xFFFFFFFF), the high bit is 1; for all-zeros, it's 0.
-			result := b.spmdWasmBitmask(vec)
+			result := b.spmdWasmBitmask(masked)
 			return b.createZExtOrTrunc(result, b.intType), nil
 		}
-		i1Vec := b.spmdNormalizeBoolVecToI1(vec)
+		i1Vec := b.spmdNormalizeBoolVecToI1(masked)
 		vecSize := i1Vec.Type().VectorSize()
 		intType := b.ctx.IntType(vecSize)
 		intVal := b.CreateBitCast(i1Vec, intType, "")
@@ -4212,8 +4403,22 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 		return llvm.Value{}, b.makeError(expr.Pos(), "SPMD vector index into array of varying elements is not supported")
 	}
 
-	// Aggregate bounds check: works on the vector index directly, shared by
-	// both the swizzle fast path and the GEP fallback below.
+	// WASM fast path: use i8x16.swizzle for byte arrays ≤ 16 elements.
+	// No bounds check needed — swizzle returns 0 for indices >= 16, so OOB
+	// is inherently safe (no memory access, purely register-based).
+	elemType := arrayType.ElementType()
+	if b.spmdIsWASM() && elemType == b.ctx.Int8Type() && xType.Len() <= 16 {
+		// If the collection was loaded from memory (SSA *UnOp dereference),
+		// use the source pointer directly — avoids aggregate→vector conversion
+		// that LLVM decomposes into per-byte loads.
+		if unop, ok := expr.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
+			srcPtr := b.getValue(unop.X, getPos(expr))
+			return b.spmdSwizzleFromPtr(srcPtr, index, int(xType.Len()), laneCount)
+		}
+		return b.spmdSwizzleArrayBytes(collection, index, int(xType.Len()), laneCount)
+	}
+
+	// Bounds check for the GEP fallback path (actual memory access).
 	arrayLen := llvm.ConstInt(b.uintptrType, uint64(xType.Len()), false)
 	if !b.info.nobounds {
 		canElide := false
@@ -4223,10 +4428,6 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 			}
 		}
 		if !canElide {
-			// Vectorized prelude: reduce all lane indices to a single scalar max,
-			// then do one scalar bounds check. Inactive lanes were clamped to 0
-			// above, so they cannot cause a false OOB. This replaces N
-			// extract+compare+OR scalar ops with a single vector intrinsic.
 			maxIdx := b.spmdVectorReduceUmax(index)
 			if maxIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
 				maxIdx = b.CreateZExt(maxIdx, b.uintptrType, "")
@@ -4234,12 +4435,6 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 			oob := b.CreateICmp(llvm.IntUGE, maxIdx, arrayLen, "spmd.bounds.oob")
 			b.createRuntimeAssert(oob, "lookup", "lookupPanic")
 		}
-	}
-
-	// WASM fast path: use i8x16.swizzle for byte arrays ≤ 16 elements.
-	elemType := arrayType.ElementType()
-	if b.spmdIsWASM() && elemType == b.ctx.Int8Type() && xType.Len() <= 16 {
-		return b.spmdSwizzleArrayBytes(collection, index, int(xType.Len()), laneCount)
 	}
 
 	// Fallback: alloca + per-lane GEP + load.
@@ -4358,22 +4553,13 @@ func (b *builder) spmdSwizzleArrayBytes(collection, index llvm.Value, arrayLen, 
 	i32Type := b.ctx.Int32Type()
 	v16i8 := llvm.VectorType(i8Type, 16)
 
-	// Load the array value into a <16 x i8> vector.
-	var tableVec llvm.Value
-	if arrayLen == 16 {
-		// Exact fit: store [16 x i8] to alloca, load back as <16 x i8>.
-		alloca, allocaSize := b.createTemporaryAlloca(collection.Type(), "swizzle.alloca")
-		b.CreateStore(collection, alloca)
-		tableVec = b.CreateLoad(v16i8, alloca, "swizzle.table")
-		b.emitLifetimeEnd(alloca, allocaSize)
-	} else {
-		// Pad to 16 bytes: extract each byte, insert into zero vector.
-		tableVec = llvm.ConstNull(v16i8)
-		for i := 0; i < arrayLen; i++ {
-			val := b.CreateExtractValue(collection, i, "")
-			tableVec = b.CreateInsertElement(tableVec, val,
-				llvm.ConstInt(i32Type, uint64(i), false), "")
-		}
+	// Convert [N x i8] aggregate to <16 x i8> vector entirely in registers.
+	// Aggregates are first-class SSA values — no memory round-trip needed.
+	tableVec := llvm.ConstNull(v16i8)
+	for i := 0; i < arrayLen; i++ {
+		val := b.CreateExtractValue(collection, i, "")
+		tableVec = b.CreateInsertElement(tableVec, val,
+			llvm.ConstInt(i32Type, uint64(i), false), "")
 	}
 
 	return b.spmdSwizzleWithTable(tableVec, index, laneCount)
