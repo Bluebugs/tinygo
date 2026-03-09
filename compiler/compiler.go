@@ -2871,9 +2871,12 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				if ptrTyp, ok := expr.X.Type().Underlying().(*types.Pointer); ok {
 					if arrTyp, ok := ptrTyp.Elem().Underlying().(*types.Array); ok {
 						if b.getLLVMType(arrTyp.Elem()) == b.ctx.Int8Type() && arrTyp.Len() <= 16 {
-							arrLLVMType := b.getLLVMType(arrTyp)
-							arrVal := b.CreateLoad(arrLLVMType, val, "swizzle.arr")
-							result, _ := b.spmdSwizzleArrayBytes(arrVal, index, int(arrTyp.Len()), laneCount)
+							// Load directly as <16 x i8> from the array pointer —
+							// no intermediate aggregate load or alloca round-trip.
+							result, err := b.spmdSwizzleFromPtr(val, index, int(arrTyp.Len()), laneCount)
+							if err != nil {
+								return llvm.Value{}, err
+							}
 							b.spmdSwizzleResult[expr] = result
 							return llvm.Undef(b.dataPtrType), nil
 						}

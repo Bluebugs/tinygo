@@ -4376,6 +4376,47 @@ func (b *builder) spmdSwizzleArrayBytes(collection, index llvm.Value, arrayLen, 
 		}
 	}
 
+	return b.spmdSwizzleWithTable(tableVec, index, laneCount)
+}
+
+// spmdSwizzleFromPtr loads a byte array (≤ 16 bytes) directly from a pointer
+// as a <16 x i8> vector and swizzles it with the index vector. For N=16, this
+// is a single v128.load — no alloca round-trip needed. For N<16, loads the
+// array and zero-pads to 16 bytes.
+func (b *builder) spmdSwizzleFromPtr(ptr, index llvm.Value, arrayLen, laneCount int) (llvm.Value, error) {
+	i8Type := b.ctx.Int8Type()
+	i32Type := b.ctx.Int32Type()
+	v16i8 := llvm.VectorType(i8Type, 16)
+
+	var tableVec llvm.Value
+	if arrayLen == 16 {
+		// Load directly as <16 x i8> from the pointer — one v128.load.
+		// Use alignment 1: Go [16]byte has no alignment guarantee beyond 1.
+		load := b.CreateLoad(v16i8, ptr, "swizzle.table")
+		load.SetAlignment(1)
+		tableVec = load
+	} else {
+		// Load the smaller array, then pad to 16 bytes.
+		arrType := llvm.ArrayType(i8Type, arrayLen)
+		arrVal := b.CreateLoad(arrType, ptr, "swizzle.arr")
+		tableVec = llvm.ConstNull(v16i8)
+		for i := 0; i < arrayLen; i++ {
+			val := b.CreateExtractValue(arrVal, i, "")
+			tableVec = b.CreateInsertElement(tableVec, val,
+				llvm.ConstInt(i32Type, uint64(i), false), "")
+		}
+	}
+
+	return b.spmdSwizzleWithTable(tableVec, index, laneCount)
+}
+
+// spmdSwizzleWithTable performs i8x16.swizzle with a pre-built <16 x i8> table
+// vector and extracts/widens the result for the given lane count.
+func (b *builder) spmdSwizzleWithTable(tableVec, index llvm.Value, laneCount int) (llvm.Value, error) {
+	i8Type := b.ctx.Int8Type()
+	i32Type := b.ctx.Int32Type()
+	v16i8 := llvm.VectorType(i8Type, 16)
+
 	// Prepare index as <16 x i8>.
 	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount)
 
