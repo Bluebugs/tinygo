@@ -4404,10 +4404,30 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 	}
 
 	// WASM fast path: use i8x16.swizzle for byte arrays ≤ 16 elements.
-	// No bounds check needed — swizzle returns 0 for indices >= 16, so OOB
-	// is inherently safe (no memory access, purely register-based).
+	// Bounds safety: swizzle returns 0 for indices >= 16 (no memory access,
+	// purely register-based). Identity path: arrayLen == laneCount with
+	// sequential lane index means every index is in-bounds by construction.
 	elemType := arrayType.ElementType()
 	if b.spmdIsWASM() && elemType == b.ctx.Int8Type() && xType.Len() <= 16 {
+		// Identity swizzle elimination: when the array has exactly laneCount
+		// byte elements and the index is the loop's sequential lane index,
+		// the swizzle would just return the input unchanged. Skip it and use
+		// the array directly as a <16 x i8> vector.
+		if int64(xType.Len()) == int64(laneCount) && b.spmdIsLoopLaneIndex(index, expr.Index) {
+			if unop, ok := expr.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
+				srcPtr := b.getValue(unop.X, getPos(expr))
+				if laneCount == 16 {
+					// Load directly as <16 x i8>. Alignment 1 because Go
+					// [16]byte has no alignment guarantee beyond byte.
+					v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
+					load := b.CreateLoad(v16i8, srcPtr, "spmd.identity.load")
+					load.SetAlignment(1)
+					return load, nil
+				}
+			}
+			// Register-based: bitcast the aggregate to vector.
+			return b.CreateBitCast(collection, llvm.VectorType(b.ctx.Int8Type(), laneCount), "spmd.identity.cast"), nil
+		}
 		// If the collection was loaded from memory (SSA *UnOp dereference),
 		// use the source pointer directly — avoids aggregate→vector conversion
 		// that LLVM decomposes into per-byte loads.
@@ -4521,15 +4541,22 @@ func (b *builder) spmdWasmSwizzle(tableBytes []byte, index llvm.Value, laneCount
 	// Prepare index as <16 x i8>.
 	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount)
 
-	// Call @llvm.wasm.swizzle(<16 x i8>, <16 x i8>).
-	// Note: the intrinsic has no type suffix — always @llvm.wasm.swizzle.
-	intrinsicName := "llvm.wasm.swizzle"
-	fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
-	fn := b.mod.NamedFunction(intrinsicName)
-	if fn.IsNil() {
-		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	// Identity swizzle optimization: if the index is [0, 1, 2, ..., N-1],
+	// the swizzle is a no-op — use the table directly.
+	var result llvm.Value
+	if spmdIsIdentitySwizzleIndex(idxVec) {
+		result = tableVec
+	} else {
+		// Call @llvm.wasm.swizzle(<16 x i8>, <16 x i8>).
+		// Note: the intrinsic has no type suffix — always @llvm.wasm.swizzle.
+		intrinsicName := "llvm.wasm.swizzle"
+		fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
+		fn := b.mod.NamedFunction(intrinsicName)
+		if fn.IsNil() {
+			fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+		}
+		result = b.createCall(fnType, fn, []llvm.Value{tableVec, idxVec}, "spmd.swizzle")
 	}
-	result := b.createCall(fnType, fn, []llvm.Value{tableVec, idxVec}, "spmd.swizzle")
 
 	// If laneCount < 16, extract the first laneCount lanes.
 	if laneCount < 16 {
@@ -4606,14 +4633,21 @@ func (b *builder) spmdSwizzleWithTable(tableVec, index llvm.Value, laneCount int
 	// Prepare index as <16 x i8>.
 	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount)
 
-	// Call @llvm.wasm.swizzle(<16 x i8>, <16 x i8>).
-	intrinsicName := "llvm.wasm.swizzle"
-	fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
-	fn := b.mod.NamedFunction(intrinsicName)
-	if fn.IsNil() {
-		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	// Identity swizzle optimization: if the index is [0, 1, 2, ..., N-1],
+	// the swizzle is a no-op — use the table directly.
+	var swizzled llvm.Value
+	if spmdIsIdentitySwizzleIndex(idxVec) {
+		swizzled = tableVec
+	} else {
+		// Call @llvm.wasm.swizzle(<16 x i8>, <16 x i8>).
+		intrinsicName := "llvm.wasm.swizzle"
+		fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
+		fn := b.mod.NamedFunction(intrinsicName)
+		if fn.IsNil() {
+			fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+		}
+		swizzled = b.createCall(fnType, fn, []llvm.Value{tableVec, idxVec}, "spmd.swizzle")
 	}
-	swizzled := b.createCall(fnType, fn, []llvm.Value{tableVec, idxVec}, "spmd.swizzle")
 
 	// Determine result element type. On WASM, widen bytes to avoid sub-128-bit vectors.
 	resultElemType := i8Type
@@ -4641,6 +4675,55 @@ func (b *builder) spmdSwizzleWithTable(tableVec, index llvm.Value, laneCount int
 			llvm.ConstInt(i32Type, uint64(i), false), "")
 	}
 	return result, nil
+}
+
+// spmdIsLoopLaneIndex checks whether the given LLVM vector value is the
+// sequential lane index of the active SPMD loop (e.g., <iter, iter+1, ...,
+// iter+N-1>). Used to detect identity swizzles: when an array index equals
+// the loop's lane index and the array length equals the lane count, the
+// swizzle is a no-op and can be elided.
+// For decomposed loops (laneIndices is nil), accepts the SSA index value
+// to check against the loop's bodyIterValue.
+func (b *builder) spmdIsLoopLaneIndex(index llvm.Value, ssaIndex ...ssa.Value) bool {
+	if b.spmdLoopState == nil || b.currentBlock == nil {
+		return false
+	}
+	loop := b.spmdFindActiveLoopForBlock(b.currentBlock)
+	if loop == nil {
+		return false
+	}
+	// Non-decomposed: compare LLVM values directly.
+	if !loop.laneIndices.IsNil() {
+		return index.C == loop.laneIndices.C
+	}
+	// Decomposed: compare SSA values (the LLVM value is materialized fresh each time).
+	if len(ssaIndex) > 0 && loop.bodyIterValue != nil && ssaIndex[0] != nil {
+		return ssaIndex[0] == loop.bodyIterValue
+	}
+	return false
+}
+
+// spmdIsIdentitySwizzleIndex checks whether a <16 x i8> swizzle index vector is
+// the identity permutation [0, 1, 2, ..., 15]. When true, the swizzle is a no-op
+// and can be elided — the table vector IS the result.
+func spmdIsIdentitySwizzleIndex(v llvm.Value) bool {
+	if !v.IsConstant() || v.Type().TypeKind() != llvm.VectorTypeKind {
+		return false
+	}
+	n := v.Type().VectorSize()
+	i32Type := v.Type().Context().Int32Type()
+	for i := 0; i < n; i++ {
+		elem := llvm.ConstExtractElement(v, llvm.ConstInt(i32Type, uint64(i), false))
+		if elem.IsUndef() {
+			// Undef padding lanes (from spmdSwizzlePrepareIndex for laneCount < 16)
+			// are acceptable — they correspond to don't-care positions.
+			continue
+		}
+		if elem.ZExtValue() != uint64(i) {
+			return false
+		}
+	}
+	return true
 }
 
 // spmdSwizzlePrepareIndex converts a vector index to <16 x i8> for i8x16.swizzle.
