@@ -3304,6 +3304,23 @@ func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Va
 	// pattern when extending element widths (e.g., <4 x i8> 0xFF → <4 x i32> 0xFFFFFFFF).
 	_, isMaskOp := typ.Underlying().(*spmdtypes.MaskType)
 	x, y = b.spmdBroadcastMatch(x, y, isMaskOp)
+
+	// SPMD Varying[bool]: AND (&) and OR (|) emitted by the logicalBinop
+	// flattening pass. SPMDType.Underlying() returns bool, which causes the
+	// scalar boolean branch to panic on non-EQL/NEQ ops. Handle these bitwise
+	// ops on the LLVM vector representation before the Underlying() dispatch.
+	if spmdTyp, ok := typ.(*types.SPMDType); ok {
+		if elemBasic, ok := spmdTyp.Elem().Underlying().(*types.Basic); ok &&
+			elemBasic.Info()&types.IsBoolean != 0 {
+			switch op {
+			case token.AND:
+				return b.CreateAnd(x, y, ""), nil
+			case token.OR:
+				return b.CreateOr(x, y, ""), nil
+			}
+		}
+	}
+
 	switch typ := typ.Underlying().(type) {
 	case *types.Basic:
 		if typ.Info()&types.IsInteger != 0 {
