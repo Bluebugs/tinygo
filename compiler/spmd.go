@@ -367,12 +367,14 @@ func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
 	return b.CreateShuffleVector(ins, undef, mask, "splat")
 }
 
-// arrayToVector converts an LLVM [N x T] array value to a <N x T> vector
-// by extracting each element and inserting it into a vector.
+// arrayToVector converts an LLVM [N x T] array value to a <M x T> vector
+// by extracting each element and inserting it into a vector. If arrayLen < M,
+// the remaining lanes are zero-initialized (safe padding for partial arrays).
 func (b *builder) arrayToVector(arr llvm.Value, vecType llvm.Type) llvm.Value {
 	n := vecType.VectorSize()
-	vec := llvm.Undef(vecType)
-	for i := 0; i < n; i++ {
+	arrayLen := arr.Type().ArrayLength()
+	vec := llvm.ConstNull(vecType) // zero-init instead of Undef for safe padding
+	for i := 0; i < arrayLen && i < n; i++ {
 		elem := b.CreateExtractValue(arr, i, "")
 		idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
 		vec = b.CreateInsertElement(vec, elem, idx, "")
@@ -802,16 +804,36 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 
 		// Map main body: activeLoops[phi] triggers emitSPMDBodyPrologue via phi handler.
 		state.activeLoops[mainIterPhi] = loop
-		state.bodyBlocks[ssaLoop.MainBodyBlock.Index] = loop
 		state.loopBlocks[ssaLoop.MainBodyBlock.Index] = loop
+
+		// Register all blocks reachable from the main body within the loop scope.
+		// After predication, body may span multiple blocks (body → if.done).
+		peeledStopBlocks := map[int]bool{ssaLoop.MainBodyBlock.Index: true}
+		if ssaLoop.DoneBlock != nil {
+			peeledStopBlocks[ssaLoop.DoneBlock.Index] = true
+		}
+		if ssaLoop.TailCheckBlock != nil {
+			peeledStopBlocks[ssaLoop.TailCheckBlock.Index] = true
+		}
+		spmdRegisterBodyBlocks(state, ssaLoop.MainBodyBlock, loop, peeledStopBlocks)
 
 		// Map tail body: no iter phi in TailBodyBlock (TailIterPhi is in TailCheckBlock).
 		// The prologue is triggered by body block entry code (isPeeled check).
 		// Do NOT add TailIterPhi to activeLoops — TailCheckBlock is not a body block
 		// and the phi handler must not call emitSPMDBodyPrologue for it.
 		if ssaLoop.TailBodyBlock != nil {
-			state.bodyBlocks[ssaLoop.TailBodyBlock.Index] = loop
 			state.loopBlocks[ssaLoop.TailBodyBlock.Index] = loop
+			// Register all blocks reachable from tail body too.
+			tailStopBlocks := map[int]bool{ssaLoop.TailBodyBlock.Index: true}
+			if ssaLoop.DoneBlock != nil {
+				tailStopBlocks[ssaLoop.DoneBlock.Index] = true
+			}
+			if ssaLoop.TrampolineBlock != nil {
+				tailStopBlocks[ssaLoop.TrampolineBlock.Index] = true
+			}
+			// Don't cross into main body.
+			tailStopBlocks[ssaLoop.MainBodyBlock.Index] = true
+			spmdRegisterBodyBlocks(state, ssaLoop.TailBodyBlock, loop, tailStopBlocks)
 		}
 	}
 
@@ -1043,8 +1065,24 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		// representation (scalar base + <N x i8> offset) to stay within 128 bits.
 		isDecomposed := b.spmdIsWASM() && laneCount > 4
 
+		// Find matching x-tools-spmd SPMDLoopInfo for non-peeled rangeindex loops.
+		// This enables TailMask registration so SSA-level masked loads use the
+		// correct tail mask instead of all-ones.
+		// Match by BodyBlock pointer first, then fall back to comment matching
+		// (blocks may be restructured after predication/optimization).
+		var ssaLoop *ssa.SPMDLoopInfo
+		for _, sl := range b.fn.SPMDLoops {
+			if sl.IsRangeIndex && !sl.IsPeeled {
+				if sl.BodyBlock == block || (sl.BodyBlock != nil && sl.BodyBlock.Comment == block.Comment) {
+					ssaLoop = sl
+					break
+				}
+			}
+		}
+
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
+			ssaLoopInfo:   ssaLoop,
 			iterPhi:       nil, // rangeindex has no iter phi in body
 			laneCount:     laneCount,
 			boundValue:    boundValue,
@@ -1059,8 +1097,18 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		// detection can find this loop via either value.
 		state.activeLoops[loopPhi] = loop
 		state.activeLoops[incrBinOp] = loop
-		state.bodyBlocks[block.Index] = loop
 		state.loopBlocks[loopBlock.Index] = loop
+
+		// Register body block AND all reachable successor blocks within the loop.
+		// After varying-if predication, the body may span multiple blocks (e.g.,
+		// body → if.done). All such blocks need the loop's tail mask for reduces.
+		stopBlocks := map[int]bool{loopBlock.Index: true}
+		// Also stop at DoneBlock to prevent post-loop blocks from being
+		// registered as body blocks (e.g., when break redirects to DoneBlock).
+		if loop.ssaLoopInfo != nil && loop.ssaLoopInfo.DoneBlock != nil {
+			stopBlocks[loop.ssaLoopInfo.DoneBlock.Index] = true
+		}
+		spmdRegisterBodyBlocks(state, block, loop, stopBlocks)
 	}
 
 	if len(state.activeLoops) == 0 {
@@ -1068,6 +1116,28 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 	}
 
 	return state
+}
+
+// spmdRegisterBodyBlocks BFS-walks from startBlock and registers all reachable
+// blocks as body blocks for the given loop, stopping at stopBlocks. This ensures
+// that multi-block loop bodies (e.g., after varying-if predication creates
+// if.done merge blocks) get the loop's tail mask applied to reduce builtins.
+func spmdRegisterBodyBlocks(state *spmdLoopState, startBlock *ssa.BasicBlock, loop *spmdActiveLoop, stopBlocks map[int]bool) {
+	state.bodyBlocks[startBlock.Index] = loop
+	queue := []*ssa.BasicBlock{startBlock}
+	visited := map[int]bool{startBlock.Index: true}
+	for len(queue) > 0 {
+		b := queue[0]
+		queue = queue[1:]
+		for _, succ := range b.Succs {
+			if visited[succ.Index] || stopBlocks[succ.Index] {
+				continue
+			}
+			visited[succ.Index] = true
+			state.bodyBlocks[succ.Index] = loop
+			queue = append(queue, succ)
+		}
+	}
 }
 
 // spmdRangeIndexInitOverride replaces val with -laneCount if phi is a
@@ -2589,8 +2659,25 @@ func (b *builder) spmdGetReduceMask(instr *ssa.CallCommon) llvm.Value {
 		}
 		return ssaMask
 	default:
-		// Both non-nil: AND them. Normalize to the same type first.
-		laneCount := ssaMask.Type().VectorSize()
+		// Both non-nil: AND them. But first check if either is a trivial
+		// all-ones constant — if so, the other mask alone is sufficient.
+		// This avoids lane-count mismatches when the SSA mask (e.g., <4 x i32>
+		// from Varying[mask]) has fewer lanes than the loop mask (e.g., <16 x i8>
+		// for a uint8 rangeindex loop).
+		if ssaMask.IsConstant() && !ssaMask.IsNull() {
+			return loopMask
+		}
+		if loopMask.IsConstant() && !loopMask.IsNull() {
+			return ssaMask
+		}
+		// Both are non-trivial runtime masks: normalize to the larger lane count
+		// to avoid truncating tail mask information.
+		ssaLanes := ssaMask.Type().VectorSize()
+		loopLanes := loopMask.Type().VectorSize()
+		laneCount := ssaLanes
+		if loopLanes > laneCount {
+			laneCount = loopLanes
+		}
 		i1SSA := b.spmdUnwrapMaskForIntrinsic(ssaMask, laneCount)
 		i1Loop := b.spmdUnwrapMaskForIntrinsic(loopMask, laneCount)
 		combined := b.CreateAnd(i1SSA, i1Loop, "spmd.reduce.combined.mask")
@@ -2709,7 +2796,8 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		// reduce.Any(v Varying[bool]) bool — true if any active lane is true.
 		// Inactive lanes must appear false so they don't falsely trigger "any".
 		vec := b.getValue(instr.Args[0], getPos(instr))
-		masked := b.spmdMaskBoolVecForAny(vec, b.spmdGetReduceMask(instr))
+		reduceMask := b.spmdGetReduceMask(instr)
+		masked := b.spmdMaskBoolVecForAny(vec, reduceMask)
 		// spmdVectorAnyTrue handles both <N x i1> and <N x i32> (WASM) formats.
 		return b.spmdVectorAnyTrue(masked), nil
 
@@ -5415,11 +5503,13 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// values (scalarPtr, sliceCap) needed for actual codegen.
 	if b.spmdContiguousPtr != nil {
 		if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
+			_ = ci
 			ssaElemType := instr.Addr.Type().Underlying().(*types.Pointer).Elem()
 			elemType := b.getLLVMType(ssaElemType)
 
 			// Narrow load path (WASM byte/bool elements).
-			if narrowBits := b.spmdNarrowLoadElemBits(ssaElemType, laneCount); narrowBits > 0 {
+			narrowBits := b.spmdNarrowLoadElemBits(ssaElemType, laneCount)
+			if narrowBits > 0 {
 				return b.spmdMaskedLoadNarrow(narrowBits, ci.scalarPtr, laneCount, mask)
 			}
 			// Bool load fix: load as <N x i8>, truncate to <N x i1>.

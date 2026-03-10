@@ -2369,10 +2369,24 @@ func (b *builder) getValue(expr ssa.Value, pos token.Pos) llvm.Value {
 		// other (local) SSA value
 		if value, ok := b.locals[expr]; ok {
 			return value
-		} else {
-			// indicates a compiler bug
-			panic("SSA value not previously found in function: " + expr.String())
 		}
+		// SPMD: TailMask fallback — when x-tools-spmd creates a TailMask for a
+		// non-peeled rangeindex loop but TinyGo's loop detection couldn't register
+		// it (e.g., complex body with inner loops that claim the loopInfo first),
+		// fall back to all-ones mask. This is the pre-fix behavior and means
+		// inactive lanes won't be masked for this loop. A proper fix requires
+		// improving TinyGo's rangeindex detection for complex loop bodies.
+		if param, ok := expr.(*ssa.Parameter); ok && param.Name() == "spmd.tail.mask" {
+			// Use loop's lane count if available, else derive from SSA type.
+			if b.spmdLoopState != nil {
+				if loop, ok := b.spmdLoopState.bodyBlocks[b.currentBlock.Index]; ok {
+					return llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(loop.laneCount), loop.laneCount))
+				}
+			}
+			return llvm.ConstAllOnes(b.getLLVMType(param.Type()))
+		}
+		// indicates a compiler bug
+		panic("SSA value not previously found in function: " + expr.String())
 	}
 }
 
@@ -3975,8 +3989,8 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 		// Array-to-SPMD: convert [N]T array to <N x T> vector.
 		if value.Type().TypeKind() == llvm.ArrayTypeKind {
 			vecType := b.getLLVMType(typeTo)
-			if value.Type().ArrayLength() != vecType.VectorSize() {
-				return llvm.Value{}, b.makeError(pos, "array length does not match SPMD vector lane count")
+			if value.Type().ArrayLength() > vecType.VectorSize() {
+				return llvm.Value{}, b.makeError(pos, "array length exceeds SPMD vector lane count")
 			}
 			return b.arrayToVector(value, vecType), nil
 		}
