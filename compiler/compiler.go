@@ -1580,6 +1580,14 @@ func (b *builder) createFunction() {
 		if b.fn.Name() == "init" && len(block.Instrs) == 0 {
 			b.CreateRetVoid()
 		}
+		// Update the exit block to the current insert block. Instructions like
+		// spmdConditionalStore may split a block by inserting new LLVM basic
+		// blocks (e.g., spmd.struct.store -> spmd.struct.done). After all
+		// instructions are compiled, the current insert block is where the
+		// terminator (Jump/If/Return) was emitted. PHI resolution uses .exit
+		// to find the actual LLVM predecessor block, so it must reflect the
+		// final block in the chain, not the original entry block.
+		b.currentBlockInfo.exit = b.GetInsertBlock()
 	}
 
 	// The rundefers instruction needs to be created after all defer
