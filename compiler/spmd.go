@@ -4871,20 +4871,45 @@ func (b *builder) spmdCoalescedGather(expr *ssa.IndexAddr, arrayPtr, index llvm.
 // memberPos, the relevant byte for lane L is at index L*stride + memberPos in the
 // merged <16 x i8>.
 func (b *builder) spmdExtractGatherColumn(merged llvm.Value, memberPos, laneCount int) (llvm.Value, error) {
+	i8Type := b.ctx.Int8Type()
 	i32Type := b.ctx.Int32Type()
 	stride := 16 / laneCount
+	v16i8 := llvm.VectorType(i8Type, 16)
 
-	// Extract one byte per lane, zero-extend to i32, and assemble into <laneCount x i32>.
-	// This mirrors exactly what spmdSwizzleWithTable does for the non-coalesced path.
-	result := llvm.Undef(llvm.VectorType(i32Type, laneCount))
+	// Combined column extraction + zero-extend via single i8x16.shuffle + bitcast.
+	//
+	// For laneCount=4, stride=4, memberPos=0: column bytes are at merged[0,4,8,12].
+	// We build a <16 x i8> where each 4-byte group has the column byte in the
+	// little-endian LSB (byte 0) and zeros in bytes 1-3. Bitcasting to <4 x i32>
+	// gives us the zero-extended i32 values directly.
+	//
+	// Shuffle mask (memberPos=0): [0, 16, 16, 16, 4, 16, 16, 16, 8, 16, 16, 16, 12, 16, 16, 16]
+	// where index >= 16 refers to the second operand (zeroinitializer), giving 0 bytes.
+	//
+	// Cost: 1 i8x16.shuffle + 1 free bitcast = 2 ops total (vs 12 extract+zext+insert).
+	zero := llvm.ConstNull(v16i8)
+	shuffleMask := make([]llvm.Value, 16)
 	for lane := 0; lane < laneCount; lane++ {
-		srcByte := lane*stride + memberPos
-		byteVal := b.CreateExtractElement(merged,
-			llvm.ConstInt(i32Type, uint64(srcByte), false), "gather.byte")
-		widened := b.CreateZExt(byteVal, i32Type, "gather.zext")
-		result = b.CreateInsertElement(result, widened,
-			llvm.ConstInt(i32Type, uint64(lane), false), "gather.col")
+		srcIdx := lane*stride + memberPos // byte position in merged result
+		for bytePos := 0; bytePos < (16 / laneCount); bytePos++ {
+			outPos := lane*(16/laneCount) + bytePos
+			if bytePos == 0 {
+				// LSB: take the column byte from merged (first operand)
+				shuffleMask[outPos] = llvm.ConstInt(i32Type, uint64(srcIdx), false)
+			} else {
+				// High bytes: take zero from second operand (index 16+)
+				shuffleMask[outPos] = llvm.ConstInt(i32Type, uint64(16+bytePos), false)
+			}
+		}
 	}
+
+	packed := b.CreateShuffleVector(merged, zero,
+		llvm.ConstVector(shuffleMask, false), "gather.col.shuf")
+
+	// Bitcast <16 x i8> to <laneCount x i32> — free on all targets.
+	v4i32 := llvm.VectorType(i32Type, laneCount)
+	result := b.CreateBitCast(packed, v4i32, "gather.col.i32")
+
 	return result, nil
 }
 
