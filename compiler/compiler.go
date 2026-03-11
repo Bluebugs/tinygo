@@ -185,6 +185,7 @@ type builder struct {
 	spmdContiguousPtr     map[ssa.Value]*spmdContiguousInfo             // IndexAddr SSA value -> contiguous access info
 	spmdShiftedPtr        map[ssa.Value]*spmdShiftedLoadInfo            // IndexAddr SSA value -> shifted load info (load+shuffle)
 	spmdSwizzleResult     map[ssa.Value]llvm.Value                      // IndexAddr SSA value -> pre-computed swizzle result (byte array ≤ 16 on WASM)
+	spmdGatherCache       map[spmdGatherCacheKey]llvm.Value             // (group, mask) → merged <16 x i8> swizzle result (coalesced groups only)
 	spmdInterleavedStores map[ssa.Instruction]*spmdInterleavedStoreInfo // store → interleaved group info (*ssa.Store or *ssa.SPMDStore)
 	spmdInterleavedAddrs  map[*ssa.IndexAddr]*spmdInterleavedStoreInfo  // IndexAddr → interleaved group info
 	spmdInterleavedValues map[*spmdInterleavedStoreGroup][]llvm.Value   // group → collected values (filled during codegen)
@@ -1474,6 +1475,7 @@ func (b *builder) createFunction() {
 		b.spmdContiguousPtr = make(map[ssa.Value]*spmdContiguousInfo)
 		b.spmdShiftedPtr = make(map[ssa.Value]*spmdShiftedLoadInfo)
 		b.spmdSwizzleResult = make(map[ssa.Value]llvm.Value)
+		b.spmdGatherCache = make(map[spmdGatherCacheKey]llvm.Value)
 
 		if b.spmdLoopState != nil {
 			b.spmdInterleavedStores = make(map[ssa.Instruction]*spmdInterleavedStoreInfo)
@@ -2892,6 +2894,18 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				if ptrTyp, ok := expr.X.Type().Underlying().(*types.Pointer); ok {
 					if arrTyp, ok := ptrTyp.Elem().Underlying().(*types.Array); ok {
 						if b.getLLVMType(arrTyp.Elem()) == b.ctx.Int8Type() && arrTyp.Len() <= 16 {
+							// SPMD gather coalescing: if this IndexAddr is part of a gather
+							// group, emit one merged swizzle for the whole group on first
+							// access and extract the per-member column on subsequent accesses.
+							if expr.SPMDGatherGroup != nil {
+								result, err := b.spmdCoalescedGather(expr, val, index, laneCount)
+								if err == nil {
+									b.spmdSwizzleResult[expr] = result
+									return llvm.Undef(b.dataPtrType), nil
+								}
+								// Fall through to individual swizzle on error.
+							}
+
 							result, err := b.spmdSwizzleFromPtr(val, index, int(arrTyp.Len()), laneCount)
 							if err != nil {
 								return llvm.Value{}, err

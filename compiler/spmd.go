@@ -20,6 +20,14 @@ import (
 	"tinygo.org/x/go-llvm"
 )
 
+// spmdGatherCacheKey identifies a coalesced gather group under a specific mask context.
+// Two IndexAddr instructions in the same SPMDGatherGroup but under different SPMD masks
+// (e.g., from different varying-switch cases) must emit separate merged swizzles.
+type spmdGatherCacheKey struct {
+	group *ssa.SPMDGatherGroup
+	mask  ssa.Value // nil when the access has no SPMDMask (all-lanes-active context)
+}
+
 // SPMDLoopInfo holds metadata about a go for loop extracted from the AST.
 type SPMDLoopInfo struct {
 	ForPos    token.Pos // position of "for" keyword
@@ -4709,6 +4717,175 @@ func (b *builder) spmdSwizzleFromPtr(ptr, index llvm.Value, arrayLen, laneCount 
 	}
 
 	return b.spmdSwizzleWithTable(tableVec, index, laneCount)
+}
+
+// spmdCoalescedGather emits a single i8x16.swizzle for the entire SPMDGatherGroup
+// that expr belongs to, then extracts the per-member column for this particular
+// IndexAddr. On subsequent calls for the same group the cached merged result is
+// used directly, so only one swizzle instruction is emitted per group.
+//
+// The merged <16 x i8> swizzle result layout (stride = 16/laneCount):
+//
+//	[ m0_l0, m1_l0, …, pad,  m0_l1, m1_l1, …, pad,  … ]
+//	  ←── stride ──→          ←── stride ──→
+//
+// Each stride group holds one byte per group member (at positions 0…maxOffset)
+// and padding bytes (set to 0xFF so swizzle returns 0) for unused positions.
+func (b *builder) spmdCoalescedGather(expr *ssa.IndexAddr, arrayPtr, index llvm.Value, laneCount int) (llvm.Value, error) {
+	group := expr.SPMDGatherGroup
+	// Include the SSA mask value in the cache key: two members of the same gather
+	// group that live in different varying-switch cases have different SPMDMask values
+	// (e.g., case-3 mask vs case-2 mask). Using only the group pointer would reuse a
+	// merged swizzle built under the wrong mask, producing incorrect inactive-lane indices.
+	cacheKey := spmdGatherCacheKey{group: group, mask: expr.SPMDMask}
+
+	// Return cached merged result if the group was already processed under this mask.
+	if merged, ok := b.spmdGatherCache[cacheKey]; ok {
+		return b.spmdExtractGatherColumn(merged, expr.SPMDGatherPos, laneCount)
+	}
+
+	// First member: build and emit the merged swizzle for the whole group.
+
+	i8Type := b.ctx.Int8Type()
+	i32Type := b.ctx.Int32Type()
+	v16i8 := llvm.VectorType(i8Type, 16)
+
+	// Load the source array as <16 x i8>.
+	ptrTyp := expr.X.Type().Underlying().(*types.Pointer)
+	arrTyp := ptrTyp.Elem().Underlying().(*types.Array)
+	arrLen := int(arrTyp.Len())
+
+	var tableVec llvm.Value
+	if arrLen == 16 {
+		load := b.CreateLoad(v16i8, arrayPtr, "gather.table")
+		load.SetAlignment(1)
+		tableVec = load
+	} else {
+		arrType := llvm.ArrayType(i8Type, arrLen)
+		arrVal := b.CreateLoad(arrType, arrayPtr, "gather.arr")
+		tableVec = llvm.ConstNull(v16i8)
+		for i := 0; i < arrLen; i++ {
+			elem := b.CreateExtractValue(arrVal, i, "")
+			tableVec = b.CreateInsertElement(tableVec, elem,
+				llvm.ConstInt(i32Type, uint64(i), false), "")
+		}
+	}
+
+	// Determine the maximum offset across all group members.
+	maxOffset := 0
+	for _, m := range group.Members {
+		if m.Offset > maxOffset {
+			maxOffset = m.Offset
+		}
+	}
+
+	stride := group.Stride // bytes per lane in the merged result (= 16 / laneCount)
+
+	// Build the base index: this member's index minus its offset gives base[0].
+	// The base is a <laneCount x i32> vector of the starting element for each lane.
+	baseIndex := index
+	if expr.SPMDGatherPos > 0 {
+		offsetScalar := llvm.ConstInt(i32Type, uint64(expr.SPMDGatherPos), false)
+		offsetVec := b.splatScalar(offsetScalar, index.Type())
+		baseIndex = b.CreateSub(index, offsetVec, "gather.base")
+	}
+
+	// Truncate base from <laneCount x i32> to <laneCount x i8> (indices fit in a byte).
+	baseI8x4 := b.CreateTrunc(baseIndex, llvm.VectorType(i8Type, laneCount), "gather.base.i8")
+
+	// Replicate each lane's base byte across its stride group in a <16 x i8>.
+	// Shuffle mask: lane L occupies positions [L*stride … L*stride+stride-1];
+	// all positions in that group pick from element L of the first operand.
+	// Positions beyond laneCount*stride pick from a zero second operand (undef-safe).
+	shuffleMask1 := make([]llvm.Value, 16)
+	for i := 0; i < 16; i++ {
+		lane := i / stride
+		if lane < laneCount {
+			shuffleMask1[i] = llvm.ConstInt(i32Type, uint64(lane), false)
+		} else {
+			// Pick element 0 of the zero second operand (laneCount + 0).
+			shuffleMask1[i] = llvm.ConstInt(i32Type, uint64(laneCount), false)
+		}
+	}
+	zeros4 := llvm.ConstNull(llvm.VectorType(i8Type, laneCount))
+	replicated := b.CreateShuffleVector(baseI8x4, zeros4,
+		llvm.ConstVector(shuffleMask1, false), "gather.rep")
+	// replicated = [s0,s0,s0,…, s1,s1,s1,…, s2,s2,s2,…, s3,s3,s3,…] (stride groups)
+
+	// Add per-position offsets within each stride group.
+	// Position (lane*stride + posInStride) gets offset posInStride when posInStride ≤ maxOffset,
+	// or 0 for padding positions (the padding index will be masked to 0xFF below).
+	offsetElems := make([]llvm.Value, 16)
+	for i := 0; i < 16; i++ {
+		posInStride := i % stride
+		if posInStride <= maxOffset {
+			offsetElems[i] = llvm.ConstInt(i8Type, uint64(posInStride), false)
+		} else {
+			offsetElems[i] = llvm.ConstInt(i8Type, 0, false)
+		}
+	}
+	offsetVec := llvm.ConstVector(offsetElems, false)
+	indexed := b.CreateAdd(replicated, offsetVec, "gather.idx")
+	// indexed = [s0+0, s0+1, …, s1+0, s1+1, …, …]
+
+	// For positions outside the valid member range (posInStride > maxOffset, or
+	// lane >= laneCount) set the index to 0xFF so the swizzle returns 0 there.
+	// These positions are extracted by spmdExtractGatherColumn only as padding.
+	validElems := make([]llvm.Value, 16)
+	for i := 0; i < 16; i++ {
+		posInStride := i % stride
+		lane := i / stride
+		if lane < laneCount && posInStride <= maxOffset {
+			validElems[i] = llvm.ConstInt(i8Type, 0xFF, false) // keep indexed
+		} else {
+			validElems[i] = llvm.ConstInt(i8Type, 0, false) // will be replaced by 0xFF
+		}
+	}
+	validMaskVec := llvm.ConstVector(validElems, false)
+	invalidFill := b.splatScalar(llvm.ConstInt(i8Type, 0xFF, false), v16i8)
+	// Use icmp ne to get <16 x i1>, then CreateSelect to choose indexed or 0xFF.
+	isValid := b.CreateICmp(llvm.IntNE, validMaskVec, llvm.ConstNull(v16i8), "gather.valid")
+	mergedIdx := b.CreateSelect(isValid, indexed, invalidFill, "gather.merged.idx")
+
+	// Emit a single i8x16.swizzle for the whole group.
+	intrinsicName := "llvm.wasm.swizzle"
+	fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	merged := b.createCall(fnType, fn, []llvm.Value{tableVec, mergedIdx}, "gather.swizzle")
+
+	// Cache the merged result for the remaining members under the same mask context.
+	b.spmdGatherCache[cacheKey] = merged
+
+	return b.spmdExtractGatherColumn(merged, expr.SPMDGatherPos, laneCount)
+}
+
+// spmdExtractGatherColumn extracts one byte per lane from a merged <16 x i8>
+// swizzle result (produced by spmdCoalescedGather) and widens it to <laneCount x i32>
+// to match the output format of individual spmdSwizzleFromPtr/spmdSwizzleWithTable calls
+// on WASM (which zero-extend each byte to i32).
+//
+// The merged layout uses stride = 16/laneCount bytes per lane. For the member at
+// memberPos, the relevant byte for lane L is at index L*stride + memberPos in the
+// merged <16 x i8>.
+func (b *builder) spmdExtractGatherColumn(merged llvm.Value, memberPos, laneCount int) (llvm.Value, error) {
+	i32Type := b.ctx.Int32Type()
+	stride := 16 / laneCount
+
+	// Extract one byte per lane, zero-extend to i32, and assemble into <laneCount x i32>.
+	// This mirrors exactly what spmdSwizzleWithTable does for the non-coalesced path.
+	result := llvm.Undef(llvm.VectorType(i32Type, laneCount))
+	for lane := 0; lane < laneCount; lane++ {
+		srcByte := lane*stride + memberPos
+		byteVal := b.CreateExtractElement(merged,
+			llvm.ConstInt(i32Type, uint64(srcByte), false), "gather.byte")
+		widened := b.CreateZExt(byteVal, i32Type, "gather.zext")
+		result = b.CreateInsertElement(result, widened,
+			llvm.ConstInt(i32Type, uint64(lane), false), "gather.col")
+	}
+	return result, nil
 }
 
 // spmdSwizzleWithTable performs i8x16.swizzle with a pre-built <16 x i8> table

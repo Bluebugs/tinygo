@@ -3046,12 +3046,16 @@ func TestSPMDSwizzleArrayBytes(t *testing.T) {
 			arrayType := llvm.ArrayType(i8Type, tt.arrayLen)
 			arrayVal := llvm.ConstNull(arrayType)
 
-			// Build index vector <4 x i32> = [0, 1, 2, 3].
+			// Build a non-identity index vector to ensure the swizzle
+			// intrinsic is emitted. Reversed indices [N-1, N-2, ..., 0]
+			// avoid the identity-swizzle elision path (which fires only
+			// for the sequential [0, 1, ..., N-1] permutation).
 			vecType := llvm.VectorType(i32Type, tt.laneCount)
 			indexVec := llvm.Undef(vecType)
 			for i := 0; i < tt.laneCount; i++ {
+				idx := (tt.arrayLen - 1 - i) % tt.arrayLen
 				indexVec = b.CreateInsertElement(indexVec,
-					llvm.ConstInt(i32Type, uint64(i%tt.arrayLen), false),
+					llvm.ConstInt(i32Type, uint64(idx), false),
 					llvm.ConstInt(i32Type, uint64(i), false), "")
 			}
 
