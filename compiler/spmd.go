@@ -6030,57 +6030,70 @@ func (b *builder) createSPMDExtractMask(instr *ssa.SPMDExtractMask) llvm.Value {
 // The source (instr.Ptr) is a string or []byte header, NOT a raw pointer.
 // Field 0 is the data pointer, field 1 is the length.
 //
-// Safety: the source may be shorter than the vector width (e.g., a 7-byte
-// string loaded into a 16-lane vector). We use spmdMaskedLoad to avoid OOB
-// reads — on WASM this scalarizes to per-lane conditional loads, which is
-// safe but slower than a full v128.load. Future optimization: runtime length
-// check with fast-path full load when len >= lanes.
+// Strategy: allocate a zeroed Lanes-byte stack buffer in the entry block,
+// memcpy min(len,lanes) bytes from source into it, then do a single
+// unconditional v128.load. This replaces the previous per-lane masked load
+// (202 WAT instructions) with ~10 instructions (memset + memcpy + v128.load).
+// The buffer is always valid stack memory, so the load is safe even when
+// len(src) < lanes; unwritten bytes remain zero, correct padding for
+// algorithms like Muła's SIMD IPv4 parser.
+//
+// The alloca is hoisted to the function entry block via createTemporaryAlloca
+// to avoid dynamic stack adjustment on every loop iteration.
 func (b *builder) createSPMDVectorFromMemory(instr *ssa.SPMDVectorFromMemory) llvm.Value {
-	// Obtain the source value (string or []byte slice) and the length.
 	src := b.getValue(instr.Ptr, instr.Pos())
 	length := b.getValue(instr.Len, instr.Pos())
 
 	lanes := instr.Lanes
-
-	// Determine the LLVM vector type from the SSA result type (e.g., <16 x i8>).
 	vecType := b.getLLVMType(instr.Type())
-
-	// Extract the data pointer from the source value.
-	// Both strings ({ptr, len}) and slices ({ptr, len, cap}) store the data
-	// pointer in field 0.
 	dataPtr := b.CreateExtractValue(src, 0, "vfm.ptr")
 
-	// Build the tail mask: lane i is active iff i < len.
-	// Use i32 for the comparison to avoid truncation bugs — lane indices
-	// always fit in i32 (max 16), and len may exceed 255 on 16-lane targets
-	// where maskElemType would be i8.
-	i32Type := b.ctx.Int32Type()
-	i32VecType := llvm.VectorType(i32Type, lanes)
+	i8Type := b.ctx.Int8Type()
+	isVolatile := llvm.ConstInt(b.ctx.Int1Type(), 0, false)
 
-	// Convert length to i32 for comparison.
-	lenI32 := length
+	// Allocate a stack buffer of exactly Lanes bytes in the function entry
+	// block. This makes it a static frame slot rather than a dynamic alloca,
+	// so there is no shadow-stack adjustment per loop iteration.
+	bufType := llvm.ArrayType(i8Type, lanes)
+	buf, bufSize := b.createTemporaryAlloca(bufType, "vfm.buf")
+	buf.SetAlignment(1)
+
+	// Zero the entire buffer so unwritten lanes read as zero.
+	lanesVal := llvm.ConstInt(b.uintptrType, uint64(lanes), false)
+	memsetFn := b.getMemsetFunc()
+	b.CreateCall(memsetFn.GlobalValueType(), memsetFn, []llvm.Value{
+		buf,
+		llvm.ConstInt(i8Type, 0, false),
+		lanesVal,
+		isVolatile,
+	}, "")
+
+	// Copy min(length, lanes) bytes from the source into the buffer.
+	// Source and destination never overlap (string/heap vs stack alloca),
+	// so memcpy is correct and avoids the overlap-check branch of memmove.
+	lenUintptr := length
 	lenWidth := length.Type().IntTypeWidth()
-	if lenWidth < 32 {
-		lenI32 = b.CreateZExt(length, i32Type, "vfm.len32")
-	} else if lenWidth > 32 {
-		lenI32 = b.CreateTrunc(length, i32Type, "vfm.len32")
+	uintptrWidth := b.uintptrType.IntTypeWidth()
+	if lenWidth < uintptrWidth {
+		lenUintptr = b.CreateZExt(length, b.uintptrType, "vfm.srclen")
+	} else if lenWidth > uintptrWidth {
+		lenUintptr = b.CreateTrunc(length, b.uintptrType, "vfm.srclen")
 	}
+	useLen := b.CreateICmp(llvm.IntULT, lenUintptr, lanesVal, "vfm.useLen")
+	copyLen := b.CreateSelect(useLen, lenUintptr, lanesVal, "vfm.copylen")
+	memcpyFn := b.getMemcpyFunc()
+	b.CreateCall(memcpyFn.GlobalValueType(), memcpyFn, []llvm.Value{
+		buf,
+		dataPtr,
+		copyLen,
+		isVolatile,
+	}, "")
 
-	// Splat length and build lane index vector in i32.
-	lenVec := b.splatScalar(lenI32, i32VecType)
-	indices := make([]llvm.Value, lanes)
-	for i := 0; i < lanes; i++ {
-		indices[i] = llvm.ConstInt(i32Type, uint64(i), false)
-	}
-	idxVec := llvm.ConstVector(indices, false)
+	// Single unconditional v128.load from the fully-allocated buffer.
+	result := b.CreateLoad(vecType, buf, "vfm.load")
+	result.SetAlignment(1)
 
-	// Compute the mask: active lanes are those with index < len (unsigned).
-	maskI1 := b.CreateICmp(llvm.IntULT, idxVec, lenVec, "vfm.mask.i1")
-
-	// Convert <N x i1> to the platform mask format (<N x i32> on WASM).
-	mask := b.spmdWrapMask(maskI1, lanes)
-
-	// Use masked load to safely handle sources shorter than the vector width.
-	// This avoids OOB reads when len(src) < lanes.
-	return b.spmdMaskedLoad(vecType, dataPtr, mask)
+	// Signal end of buffer lifetime so LLVM can reuse the frame slot.
+	b.emitLifetimeEnd(buf, bufSize)
+	return result
 }
