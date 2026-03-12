@@ -6022,3 +6022,65 @@ func (b *builder) createSPMDExtractMask(instr *ssa.SPMDExtractMask) llvm.Value {
 	maskArr := b.CreateExtractValue(boxedStruct, 1, "spmd.extract.maskarr")
 	return b.arrayToVector(maskArr, maskVecType)
 }
+
+// createSPMDVectorFromMemory lowers an SSA SPMDVectorFromMemory instruction to
+// LLVM IR. It loads elements from a string or slice source into a vector,
+// zeroing lanes whose index >= len(src).
+//
+// The source (instr.Ptr) is a string or []byte header, NOT a raw pointer.
+// Field 0 is the data pointer, field 1 is the length.
+//
+// Safety: the source may be shorter than the vector width (e.g., a 7-byte
+// string loaded into a 16-lane vector). We use spmdMaskedLoad to avoid OOB
+// reads — on WASM this scalarizes to per-lane conditional loads, which is
+// safe but slower than a full v128.load. Future optimization: runtime length
+// check with fast-path full load when len >= lanes.
+func (b *builder) createSPMDVectorFromMemory(instr *ssa.SPMDVectorFromMemory) llvm.Value {
+	// Obtain the source value (string or []byte slice) and the length.
+	src := b.getValue(instr.Ptr, instr.Pos())
+	length := b.getValue(instr.Len, instr.Pos())
+
+	lanes := instr.Lanes
+
+	// Determine the LLVM vector type from the SSA result type (e.g., <16 x i8>).
+	vecType := b.getLLVMType(instr.Type())
+
+	// Extract the data pointer from the source value.
+	// Both strings ({ptr, len}) and slices ({ptr, len, cap}) store the data
+	// pointer in field 0.
+	dataPtr := b.CreateExtractValue(src, 0, "vfm.ptr")
+
+	// Build the tail mask: lane i is active iff i < len.
+	// Use i32 for the comparison to avoid truncation bugs — lane indices
+	// always fit in i32 (max 16), and len may exceed 255 on 16-lane targets
+	// where maskElemType would be i8.
+	i32Type := b.ctx.Int32Type()
+	i32VecType := llvm.VectorType(i32Type, lanes)
+
+	// Convert length to i32 for comparison.
+	lenI32 := length
+	lenWidth := length.Type().IntTypeWidth()
+	if lenWidth < 32 {
+		lenI32 = b.CreateZExt(length, i32Type, "vfm.len32")
+	} else if lenWidth > 32 {
+		lenI32 = b.CreateTrunc(length, i32Type, "vfm.len32")
+	}
+
+	// Splat length and build lane index vector in i32.
+	lenVec := b.splatScalar(lenI32, i32VecType)
+	indices := make([]llvm.Value, lanes)
+	for i := 0; i < lanes; i++ {
+		indices[i] = llvm.ConstInt(i32Type, uint64(i), false)
+	}
+	idxVec := llvm.ConstVector(indices, false)
+
+	// Compute the mask: active lanes are those with index < len (unsigned).
+	maskI1 := b.CreateICmp(llvm.IntULT, idxVec, lenVec, "vfm.mask.i1")
+
+	// Convert <N x i1> to the platform mask format (<N x i32> on WASM).
+	mask := b.spmdWrapMask(maskI1, lanes)
+
+	// Use masked load to safely handle sources shorter than the vector width.
+	// This avoids OOB reads when len(src) < lanes.
+	return b.spmdMaskedLoad(vecType, dataPtr, mask)
+}

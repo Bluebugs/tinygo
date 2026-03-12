@@ -3323,6 +3323,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		return b.createSPMDIndex(expr), nil
 	case *ssa.SPMDExtractMask:
 		return b.createSPMDExtractMask(expr), nil
+	case *ssa.SPMDVectorFromMemory:
+		return b.createSPMDVectorFromMemory(expr), nil
 	default:
 		return llvm.Value{}, b.makeError(expr.Pos(), "todo: unknown expression: "+expr.String())
 	}
