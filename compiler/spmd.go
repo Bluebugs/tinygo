@@ -2899,16 +2899,30 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		vec := b.getValue(instr.Args[0], getPos(instr))
 		vecType := vec.Type()
 		elemType := vecType.ElementType()
-		laneCount := vecType.VectorSize()
+
+		// Varying[aggregateType] uses [N x T] arrays (LLVM vectors require scalar
+		// elements); Varying[scalarType] uses <N x T> vectors.
+		var laneCount int
+		if vecType.TypeKind() == llvm.ArrayTypeKind {
+			laneCount = vecType.ArrayLength()
+		} else {
+			laneCount = vecType.VectorSize()
+		}
 
 		// Allocate stack space for the elements.
 		arrType := llvm.ArrayType(elemType, laneCount)
 		alloca := b.CreateAlloca(arrType, "reduce.from.arr")
 
-		// Extract each element and store
+		// Extract each element and store. Use extractvalue for [N x T] array
+		// types and extractelement for <N x T> vector types.
 		for i := 0; i < laneCount; i++ {
-			idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
-			elem := b.CreateExtractElement(vec, idx, "")
+			var elem llvm.Value
+			if vecType.TypeKind() == llvm.ArrayTypeKind {
+				elem = b.CreateExtractValue(vec, i, "")
+			} else {
+				idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+				elem = b.CreateExtractElement(vec, idx, "")
+			}
 			gep := b.CreateInBoundsGEP(arrType, alloca, []llvm.Value{
 				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
 				llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false),
