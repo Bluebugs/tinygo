@@ -667,9 +667,10 @@ type spmdActiveLoop struct {
 	isPeeled bool // loop was peeled at SSA level; main body uses all-ones mask
 
 	// Set during IR generation:
-	laneIndices   llvm.Value // <iter, iter+1, ..., iter+laneCount-1> (nil when isDecomposed)
-	tailMask      llvm.Value // per-lane bounds check
-	scalarIterVal llvm.Value // scalar LLVM value (before override to lane indices)
+	laneIndices     llvm.Value // <iter, iter+1, ..., iter+laneCount-1> (nil when isDecomposed)
+	tailMask        llvm.Value // per-lane bounds check
+	scalarIterVal   llvm.Value // scalar LLVM value (before override to lane indices)
+	prologueEmitted bool       // true after emitSPMDBodyPrologue ran for this loop
 }
 
 // spmdDecomposedIndex tracks a base+offset decomposed SPMD index value.
@@ -5773,6 +5774,14 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// put in LLVM vector types. Return the scalar value directly — all active
 	// lanes share the same scalar address so the single loaded value is correct.
 	if !spmdIsVectorizableElemType(resultType) {
+		return loaded
+	}
+
+	// N=1 serial path: laneCount=1 means serial execution (e.g., Varying[[]int]
+	// where the slice element is 12 bytes). Return the scalar value directly —
+	// broadcasting to <1 x T> would produce type mismatches with phi nodes in
+	// the inner loop, since the phi was typed as T (scalar), not <1 x T>.
+	if laneCount == 1 && resultType.TypeKind() != llvm.VectorTypeKind {
 		return loaded
 	}
 

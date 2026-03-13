@@ -509,6 +509,18 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 	case *types.SPMDType:
 		if typ.IsVarying() {
 			elemType := c.getLLVMType(typ.Elem())
+			// LLVM does not support vectors of aggregate types (structs, arrays).
+			// Slices, interfaces, and other composite Go types lower to structs.
+			// Use [N x elemType] array representation so the LLVM IR stays valid.
+			// N=1 means serial (scalar) execution; the lane count is still correct
+			// but SIMD hardware acceleration is not achieved.
+			if elemType.TypeKind() == llvm.StructTypeKind || elemType.TypeKind() == llvm.ArrayTypeKind {
+				n := c.spmdLaneCount(elemType)
+				if n < 1 {
+					n = 1
+				}
+				return llvm.ArrayType(elemType, n)
+			}
 			laneCount := c.spmdEffectiveLaneCount(typ, elemType)
 			return llvm.VectorType(elemType, laneCount)
 		}
@@ -1507,7 +1519,14 @@ func (b *builder) createFunction() {
 					// Peeled tail body: emit prologue immediately (TailIterPhi is in TailCheckBlock).
 					b.emitSPMDBodyPrologue(loop)
 					b.spmdValueOverride[loop.ssaLoopInfo.TailIterPhi] = loop.laneIndices
-				} else if loop.isRangeIndex {
+				} else if loop.isRangeIndex && !loop.prologueEmitted {
+					// Emit prologue only once per rangeindex loop. spmdRegisterBodyBlocks
+					// walks all successors of the actual body block, which may include inner
+					// loop headers (e.g., rangeindex.loop1 for a nested range loop). Those
+					// inner blocks have phi nodes that must remain at the very start of the
+					// block — emitting the prologue there inserts non-phi instructions
+					// before the phis and fails LLVM verification.
+					loop.prologueEmitted = true
 					b.emitSPMDBodyPrologue(loop)
 					if loop.isDecomposed {
 						// Decomposed path: do NOT set spmdValueOverride for the body iter value.
@@ -1872,7 +1891,13 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		case *types.Chan:
 			llvmCap = b.createRuntimeCall("chanCap", []llvm.Value{value}, "cap")
 		case *types.Slice:
-			llvmCap = b.CreateExtractValue(value, 2, "cap")
+			// Varying[[]T] lowers to [N x sliceStruct]; extract cap from lane 0.
+			if value.Type().TypeKind() == llvm.ArrayTypeKind {
+				lane0 := b.CreateExtractValue(value, 0, "lane0.slice")
+				llvmCap = b.CreateExtractValue(lane0, 2, "cap")
+			} else {
+				llvmCap = b.CreateExtractValue(value, 2, "cap")
+			}
 		default:
 			return llvm.Value{}, b.makeError(pos, "todo: cap: unknown type")
 		}
@@ -1980,8 +2005,15 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		var llvmLen llvm.Value
 		switch argTypes[0].Underlying().(type) {
 		case *types.Basic, *types.Slice:
-			// string or slice
-			llvmLen = b.CreateExtractValue(value, 1, "len")
+			// string or slice — but Varying[[]T] lowers to [N x sliceStruct] (array,
+			// not vector) because LLVM forbids vectors of aggregate types.
+			// Extract lane 0's slice header and read its length field.
+			if value.Type().TypeKind() == llvm.ArrayTypeKind {
+				lane0 := b.CreateExtractValue(value, 0, "lane0.slice")
+				llvmLen = b.CreateExtractValue(lane0, 1, "len")
+			} else {
+				llvmLen = b.CreateExtractValue(value, 1, "len")
+			}
 		case *types.Chan:
 			llvmLen = b.createRuntimeCall("chanLen", []llvm.Value{value}, "len")
 		case *types.Map:
@@ -2577,6 +2609,17 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				changeTypeResult = value
 			case llvm.IntegerTypeKind, llvm.PointerTypeKind, llvm.DoubleTypeKind, llvm.FloatTypeKind:
 				changeTypeResult = b.CreateBitCast(x, llvmType, "changetype")
+			case llvm.ArrayTypeKind:
+				// SPMD: Varying[aggregateT] is represented as [N x aggregateT].
+				// A ChangeType from scalar aggregateT to [N x aggregateT] means
+				// "broadcast" the scalar value into all N array slots.
+				// For N=1 (serial/degenerate case), this inserts into slot 0.
+				n := llvmType.ArrayLength()
+				arr := llvm.Undef(llvmType)
+				for i := 0; i < n; i++ {
+					arr = b.CreateInsertValue(arr, x, i, "changetype.arr")
+				}
+				changeTypeResult = arr
 			case llvm.VectorTypeKind:
 				if x.Type().TypeKind() != llvm.VectorTypeKind {
 					// Scalar to vector: broadcast (splat) the scalar.
@@ -2967,6 +3010,21 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		// Get buffer pointer and length
 		var bufptr, buflen llvm.Value
 		var bufType llvm.Type
+		// SPMD: Varying[[]T] lowers to [N x sliceStruct] (array, not vector).
+		// For N=1 (degenerate scalar case), extract lane 0's slice header and
+		// index it as a regular scalar slice. N>1 divergent inner loops are
+		// deferred — emit a plausible but potentially incorrect address for now.
+		if val.Type().TypeKind() == llvm.ArrayTypeKind {
+			if slicePtrTyp, ok := expr.X.Type().Underlying().(*types.Slice); ok {
+				lane0 := b.CreateExtractValue(val, 0, "lane0.slice")
+				bufptr = b.CreateExtractValue(lane0, 0, "indexaddr.ptr")
+				buflen = b.CreateExtractValue(lane0, 1, "indexaddr.len")
+				bufType = b.getLLVMType(slicePtrTyp.Elem())
+				index = b.extendInteger(index, expr.Index.Type(), b.uintptrType)
+				b.createLookupBoundsCheck(buflen, index)
+				return b.CreateInBoundsGEP(bufType, bufptr, []llvm.Value{index}, ""), nil
+			}
+		}
 		switch ptrTyp := expr.X.Type().Underlying().(type) {
 		case *types.Pointer:
 			typ := ptrTyp.Elem().Underlying()
@@ -4331,6 +4389,21 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 				return llvm.Value{}, b.makeError(unop.Pos(), "cgo function not found: "+name)
 			}
 			return fn, nil
+		} else if x.Type().TypeKind() == llvm.VectorTypeKind &&
+			(valueType.TypeKind() == llvm.StructTypeKind || valueType.TypeKind() == llvm.ArrayTypeKind) {
+			// SPMD: vector of pointers (<N x ptr>) dereferencing an aggregate type.
+			// LLVM cannot load a struct through a vector of pointers directly.
+			// Perform N individual scalar loads and pack results into [N x valueType].
+			n := x.Type().VectorSize()
+			arrType := llvm.ArrayType(valueType, n)
+			arr := llvm.Undef(arrType)
+			for i := 0; i < n; i++ {
+				idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+				ptr := b.CreateExtractElement(x, idx, "")
+				val := b.CreateLoad(valueType, ptr, "")
+				arr = b.CreateInsertValue(arr, val, i, "")
+			}
+			return arr, nil
 		} else {
 			b.createNilCheck(unop.X, x, "deref")
 			load := b.CreateLoad(valueType, x, "")

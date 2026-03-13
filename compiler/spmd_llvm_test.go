@@ -145,6 +145,61 @@ func TestSPMDMakeLLVMTypeVarying(t *testing.T) {
 	}
 }
 
+// TestSPMDMakeLLVMTypeVaryingAggregate verifies that Varying[T] for aggregate
+// element types (structs, slices) produces [N x T] ArrayType rather than an
+// invalid <N x T> VectorType. LLVM only supports scalar/pointer vector elements.
+// Varying[[]int] on WASM32 gives []int = 12 bytes, laneCount = 16/12 = 1.
+func TestSPMDMakeLLVMTypeVaryingAggregate(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	tests := []struct {
+		name          string
+		goType        types.Type
+		wantArrayLen  int
+		wantElemKind  llvm.TypeKind
+	}{
+		{
+			// Varying[[]int] on WASM32: []int is {ptr,i32,i32} = 12 bytes, laneCount = 16/12 = 1.
+			name:         "varying_slice_int",
+			goType:       types.NewVarying(types.NewSlice(types.Typ[types.Int])),
+			wantArrayLen: 1,
+			wantElemKind: llvm.StructTypeKind,
+		},
+		{
+			// Varying[[]float32] on WASM32: []float32 is {ptr,i32,i32} = 12 bytes, laneCount = 1.
+			name:         "varying_slice_float32",
+			goType:       types.NewVarying(types.NewSlice(types.Typ[types.Float32])),
+			wantArrayLen: 1,
+			wantElemKind: llvm.StructTypeKind,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			llvmType := c.getLLVMType(tt.goType)
+
+			// Aggregate-element Varying must use ArrayType, not VectorType.
+			if llvmType.TypeKind() != llvm.ArrayTypeKind {
+				t.Errorf("getLLVMType(%s) TypeKind = %v, want ArrayTypeKind (aggregate elements cannot be LLVM vector elements)", tt.name, llvmType.TypeKind())
+				return
+			}
+
+			// Verify array length matches expected lane count.
+			gotLen := llvmType.ArrayLength()
+			if gotLen != tt.wantArrayLen {
+				t.Errorf("getLLVMType(%s) ArrayLength = %d, want %d", tt.name, gotLen, tt.wantArrayLen)
+			}
+
+			// Verify element type kind.
+			elemKind := llvmType.ElementType().TypeKind()
+			if elemKind != tt.wantElemKind {
+				t.Errorf("getLLVMType(%s) ElementType.TypeKind = %v, want %v", tt.name, elemKind, tt.wantElemKind)
+			}
+		})
+	}
+}
+
 func TestSPMDConstVector(t *testing.T) {
 	c := newTestCompilerContext(t)
 	defer c.dispose()
