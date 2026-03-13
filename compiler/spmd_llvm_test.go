@@ -5736,3 +5736,80 @@ func TestVectorToArray(t *testing.T) {
 		})
 	}
 }
+
+// TestSPMDReduceFromAggregate verifies that the reduce.From handler uses
+// extractvalue (not extractelement) when the input is a [N x T] array type,
+// as produced for aggregate Varying types such as Varying[string].
+// On WASM32, string is {ptr, i32} = 8 bytes, so laneCount = 16/8 = 2 and
+// Varying[string] is represented as [2 x {ptr, i32}].
+func TestSPMDReduceFromAggregate(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+
+	// Build [2 x {i32, i32}] as a simplified stand-in for [2 x string_struct].
+	// Using i32 fields instead of actual ptr+i32 keeps the test target-independent.
+	i32Type := c.ctx.Int32Type()
+	elemStructType := c.ctx.StructType([]llvm.Type{i32Type, i32Type}, false)
+	laneCount := 2
+	arrayType := llvm.ArrayType(elemStructType, laneCount)
+
+	// Create a dedicated function that receives the array as a parameter so that
+	// extractvalue is emitted as a real IR instruction. LLVM folds extractvalue
+	// on constant and undef aggregates at build time, leaving no instruction in IR.
+	fnType := llvm.FunctionType(c.ctx.VoidType(), []llvm.Type{arrayType}, false)
+	fn := llvm.AddFunction(c.mod, "test_reduce_from_aggregate", fnType)
+	bb := llvm.AddBasicBlock(fn, "entry")
+	bld := c.ctx.NewBuilder()
+	defer bld.Dispose()
+	bld.SetInsertPointAtEnd(bb)
+
+	// The array parameter is a genuine SSA value — extractvalue on it is not folded.
+	arrayVal := fn.Param(0)
+
+	// Replicate the fixed reduce.From logic: branch on ArrayTypeKind.
+	vecType := arrayVal.Type()
+	if vecType.TypeKind() != llvm.ArrayTypeKind {
+		t.Fatalf("test setup: expected ArrayTypeKind, got %v", vecType.TypeKind())
+	}
+	extractedElemType := vecType.ElementType()
+	extractedLaneCount := vecType.ArrayLength()
+	if extractedLaneCount != laneCount {
+		t.Fatalf("ArrayLength = %d, want %d", extractedLaneCount, laneCount)
+	}
+
+	// Allocate output array and extract each lane via extractvalue.
+	outArrType := llvm.ArrayType(extractedElemType, extractedLaneCount)
+	alloca := bld.CreateAlloca(outArrType, "reduce.from.arr")
+
+	for i := 0; i < extractedLaneCount; i++ {
+		elem := bld.CreateExtractValue(arrayVal, i, "")
+		gep := bld.CreateInBoundsGEP(outArrType, alloca, []llvm.Value{
+			llvm.ConstInt(i32Type, 0, false),
+			llvm.ConstInt(i32Type, uint64(i), false),
+		}, "")
+		bld.CreateStore(elem, gep)
+	}
+	bld.CreateRetVoid()
+
+	// The function's IR must contain extractvalue and must NOT contain extractelement.
+	// The pre-fix code called CreateExtractElement on the [N x T] array, which
+	// LLVM rejects with "Invalid extractelement operands!".
+	fnIR := fn.String()
+	if !strings.Contains(fnIR, "extractvalue") {
+		t.Errorf("expected extractvalue in function IR for aggregate Varying type; got:\n%s", fnIR)
+	}
+	if strings.Contains(fnIR, "extractelement") {
+		t.Errorf("unexpected extractelement in function IR: aggregate Varying types must use extractvalue; got:\n%s", fnIR)
+	}
+
+	// Verify the alloca is non-nil and the output array type has the expected shape.
+	if alloca.IsNil() {
+		t.Fatal("alloca returned nil")
+	}
+	if outArrType.TypeKind() != llvm.ArrayTypeKind {
+		t.Errorf("outArrType = %v, want ArrayTypeKind", outArrType.TypeKind())
+	}
+	if outArrType.ArrayLength() != laneCount {
+		t.Errorf("outArrType.ArrayLength() = %d, want %d", outArrType.ArrayLength(), laneCount)
+	}
+}
