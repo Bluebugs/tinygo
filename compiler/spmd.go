@@ -5724,6 +5724,14 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 			ssaElemType := instr.Addr.Type().Underlying().(*types.Pointer).Elem()
 			elemType := b.getLLVMType(ssaElemType)
 
+			// If the element type is already a vector (e.g., Varying[T] as a slice
+			// element), do a plain load rather than creating an illegal nested vector
+			// <N x <M x T>>. This handles "go for over []Varying[T]" where laneCount=1
+			// but each element is a full SIMD vector (<M x T>).
+			if elemType.TypeKind() == llvm.VectorTypeKind {
+				return b.CreateLoad(elemType, ci.scalarPtr, "spmd.load.result")
+			}
+
 			// Narrow load path (WASM byte/bool elements).
 			narrowBits := b.spmdNarrowLoadElemBits(ssaElemType, laneCount)
 			if narrowBits > 0 {
@@ -5892,6 +5900,17 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 	// See createSPMDLoad for contiguity info sources (SSA-level + TinyGo-level).
 	if b.spmdContiguousPtr != nil {
 		if ci, ok := b.spmdContiguousPtr[instr.Addr]; ok {
+			// If the element type is already a full SIMD vector (e.g., Varying[T] as a
+			// slice element in "go for over []Varying[T]"), do a plain store.
+			// Wrapping in another vector would produce <N x <M x T>> which LLVM rejects.
+			// The outer loop's mask (laneCount=1) already controls execution at the
+			// block level, so unconditional store to the scalar pointer is correct.
+			if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
+				if b.getLLVMType(addrPtrType.Elem()).TypeKind() == llvm.VectorTypeKind {
+					b.CreateStore(val, ci.scalarPtr)
+					return
+				}
+			}
 			// Bool store fix.
 			if val.Type().TypeKind() == llvm.VectorTypeKind &&
 				val.Type().ElementType() == b.ctx.Int1Type() {

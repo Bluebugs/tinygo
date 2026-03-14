@@ -509,20 +509,27 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 	case *types.SPMDType:
 		if typ.IsVarying() {
 			elemType := c.getLLVMType(typ.Elem())
-			// LLVM does not support vectors of aggregate types (structs, arrays).
-			// Slices, interfaces, and other composite Go types lower to structs.
-			// Use [N x elemType] array representation so the LLVM IR stays valid.
-			// N=1 means serial (scalar) execution; the lane count is still correct
-			// but SIMD hardware acceleration is not achieved.
-			if elemType.TypeKind() == llvm.StructTypeKind || elemType.TypeKind() == llvm.ArrayTypeKind {
+			switch elemType.TypeKind() {
+			case llvm.VectorTypeKind:
+				// Varying[Varying[T]]: the elem is already a vector (<N x T>).
+				// LLVM does not support nested vectors. Return the inner vector
+				// directly — the outer Varying is a pass-through.
+				return elemType
+			case llvm.StructTypeKind, llvm.ArrayTypeKind:
+				// LLVM does not support vectors of aggregate types (structs, arrays).
+				// Slices, interfaces, and other composite Go types lower to structs.
+				// Use [N x elemType] array representation so the LLVM IR stays valid.
+				// N=1 means serial (scalar) execution; the lane count is still correct
+				// but SIMD hardware acceleration is not achieved.
 				n := c.spmdLaneCount(elemType)
 				if n < 1 {
 					n = 1
 				}
 				return llvm.ArrayType(elemType, n)
+			default:
+				laneCount := c.spmdEffectiveLaneCount(typ, elemType)
+				return llvm.VectorType(elemType, laneCount)
 			}
-			laneCount := c.spmdEffectiveLaneCount(typ, elemType)
-			return llvm.VectorType(elemType, laneCount)
 		}
 		return c.getLLVMType(typ.Elem())
 	case *spmdtypes.MaskType:
@@ -3102,7 +3109,20 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			var maskArr llvm.Value
 			if expr.SPMDMask != nil {
 				maskVec := b.getValue(expr.SPMDMask, getPos(expr))
-				maskArr = b.vectorToArray(maskVec)
+				// When the outer loop's mask lane count differs from the value's lane
+				// count (e.g., laneCount=1 outer loop containing a Varying[T] value
+				// with 4 lanes), the mask does not directly map to the value's lanes.
+				// In this case use an all-ones mask: the outer mask already controls
+				// whether this iteration executes at all, so all inner lanes are active.
+				if maskVec.Type().VectorSize() != laneCount {
+					maskArr = llvm.Undef(maskArrType)
+					allOnes := llvm.ConstAllOnes(maskElemType)
+					for i := 0; i < laneCount; i++ {
+						maskArr = b.CreateInsertValue(maskArr, allOnes, i, "")
+					}
+				} else {
+					maskArr = b.vectorToArray(maskVec)
+				}
 			} else {
 				// All-ones mask: all lanes valid.
 				maskArr = llvm.Undef(maskArrType)
