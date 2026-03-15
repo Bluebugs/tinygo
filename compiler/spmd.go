@@ -2228,6 +2228,8 @@ func spmdVectorTypeSuffix(vecType llvm.Type) string {
 		suffix = "f32"
 	case llvm.DoubleTypeKind:
 		suffix = "f64"
+	case llvm.PointerTypeKind:
+		suffix = "p0"
 	default:
 		suffix = "i32" // fallback
 	}
@@ -3589,6 +3591,24 @@ func (b *builder) spmdUnwrapScalar(v ssa.Value) (llvm.Value, bool) {
 		return llvm.Value{}, false
 	}
 	return scalarVal, true
+}
+
+// spmdFieldAddrPerLane computes per-lane field addresses when the FieldAddr
+// receiver is *Varying[Struct] (i.e., ptrVec is a <N x ptr> vector, each lane
+// pointing to a different struct instance). Returns a <N x ptr> vector where
+// element i is a pointer to fieldIndex within lane i's struct.
+func (b *builder) spmdFieldAddrPerLane(ptrVec llvm.Value, structType llvm.Type, fieldIndex, laneCount int) llvm.Value {
+	result := llvm.Undef(ptrVec.Type())
+	for i := 0; i < laneCount; i++ {
+		idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+		lanePtr := b.CreateExtractElement(ptrVec, idx, "fieldaddr.base")
+		fieldPtr := b.CreateInBoundsGEP(structType, lanePtr, []llvm.Value{
+			llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+			llvm.ConstInt(b.ctx.Int32Type(), uint64(fieldIndex), false),
+		}, "fieldaddr.lane")
+		result = b.CreateInsertElement(result, fieldPtr, idx, "")
+	}
+	return result
 }
 
 // spmdFieldAddrForVaryingPtr checks if the FieldAddr's base (expr.X) has a
@@ -5797,7 +5817,9 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 		// Fall back to per-lane conditional scalar loads.
 		// Returns [N x T] array (NOT <N x T> vector). Struct values must not
 		// flow into vector operations — they are only passed through to stores.
-		if !spmdIsVectorizableElemType(resultType) {
+		// Exception: if resultType is already a vector (e.g., Varying[int] → <4 x i32>),
+		// it IS vectorizable — fall through to spmdMaskedGather with vecResultType=resultType.
+		if !spmdIsVectorizableElemType(resultType) && resultType.TypeKind() != llvm.VectorTypeKind {
 			return b.spmdPerLaneGather(resultType, addr, mask, addrLaneCount)
 		}
 		vecResultType := resultType
