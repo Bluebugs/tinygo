@@ -2719,7 +2719,9 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			llvm.ConstInt(b.ctx.Int32Type(), uint64(expr.Field), false),
 		}
 		elementType := b.getLLVMType(expr.X.Type().Underlying().(*types.Pointer).Elem())
-		return b.CreateInBoundsGEP(elementType, val, indices, ""), nil
+		gep := b.CreateInBoundsGEP(elementType, val, indices, "")
+		b.spmdFieldAddrForVaryingPtr(expr, gep)
+		return gep, nil
 	case *ssa.Function:
 		panic("function is not an expression")
 	case *ssa.Global:

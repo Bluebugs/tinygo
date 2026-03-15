@@ -3591,6 +3591,28 @@ func (b *builder) spmdUnwrapScalar(v ssa.Value) (llvm.Value, bool) {
 	return scalarVal, true
 }
 
+// spmdFieldAddrForVaryingPtr checks if the FieldAddr's base (expr.X) has a
+// contiguous access entry (from a prior IndexAddr in a SPMD loop), and if so,
+// propagates it to the FieldAddr result with an updated scalarPtr pointing to
+// the field's GEP.
+//
+// This enables SPMDLoad/SPMDStore on the field to use masked vector load/store
+// instead of falling back to per-lane scatter/gather.
+func (b *builder) spmdFieldAddrForVaryingPtr(expr *ssa.FieldAddr, fieldGEP llvm.Value) {
+	if b.spmdContiguousPtr == nil {
+		return
+	}
+	baseCI, ok := b.spmdContiguousPtr[expr.X]
+	if !ok {
+		return
+	}
+	// Propagate: the field is contiguous because the base struct is contiguous.
+	// Inherit all metadata from the base entry but point scalarPtr at the field GEP.
+	fieldCI := *baseCI
+	fieldCI.scalarPtr = fieldGEP
+	b.spmdContiguousPtr[expr] = &fieldCI
+}
+
 // spmdContiguousIndexAddr handles IndexAddr for contiguous SPMD access.
 // Uses the loop's scalar iter value as the index.
 func (b *builder) spmdContiguousIndexAddr(expr *ssa.IndexAddr, loop *spmdActiveLoop) (llvm.Value, error) {
