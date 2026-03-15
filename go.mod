@@ -27,3 +27,5 @@ require (
 )
 
 replace golang.org/x/tools v0.42.0 => ../x-tools-spmd
+
+replace tinygo.org/x/go-llvm v0.0.0-20250422114502-b8f170971e74 => ../go-llvm

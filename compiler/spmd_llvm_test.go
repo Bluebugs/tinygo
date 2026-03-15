@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/tools/go/ssa"
 	"tinygo.org/x/go-llvm"
@@ -5811,5 +5812,162 @@ func TestSPMDReduceFromAggregate(t *testing.T) {
 	}
 	if outArrType.ArrayLength() != laneCount {
 		t.Errorf("outArrType.ArrayLength() = %d, want %d", outArrType.ArrayLength(), laneCount)
+	}
+}
+
+// ssaValueWithType creates an SSA value of a concrete type V (e.g. *ssa.IndexAddr)
+// and sets its unexported typ field via reflection+unsafe so that v.Type() returns
+// the given Go type.  This matches the ssaAllocWithType pattern in spmd_test.go.
+func ssaValueWithType[V any](t *testing.T, v *V, typ types.Type) *V {
+	t.Helper()
+	rv := reflect.ValueOf(v).Elem()
+	for i := 0; i < rv.NumField(); i++ {
+		f := rv.Field(i)
+		if f.Kind() == reflect.Struct {
+			for j := 0; j < f.NumField(); j++ {
+				if f.Type().Field(j).Name == "typ" {
+					ptr := (*types.Type)(unsafe.Pointer(f.Field(j).UnsafeAddr()))
+					*ptr = typ
+					return v
+				}
+			}
+		}
+	}
+	t.Fatalf("ssaValueWithType: could not find typ field in %T — struct layout may have changed", v)
+	return nil
+}
+
+// TestSPMDFieldAddrVaryingPtr verifies that the FieldAddr handler in createExpr
+// propagates spmdContiguousPtr from the base IndexAddr so that a subsequent
+// SPMDLoad emits a vector masked load rather than a per-lane gather.
+//
+// The bug: when a go-for loop accesses points[i].Y —
+//
+//  1. IndexAddr(points, i) → scalar ptr registered in b.spmdContiguousPtr
+//  2. FieldAddr(indexAddrResult, fieldY) → scalar ptr to field Y, NOT registered
+//  3. SPMDLoad(fieldAddrResult) → sees no contiguous info → scatter/gather
+//
+// All four lanes gather from individually computed pointers instead of issuing a
+// single vector load that reads consecutive Y fields from consecutive structs.
+//
+// The Task 7 fix must, inside the *ssa.FieldAddr case of createExpr, look up
+// b.spmdContiguousPtr[expr.X] and, if found, register the computed field GEP
+// in b.spmdContiguousPtr[expr] with inherited loop/cap/index metadata.
+//
+// This test exercises the actual createExpr(fieldAddr) code path by:
+//
+//  1. Constructing real *ssa.IndexAddr and *ssa.FieldAddr SSA values via reflection.
+//  2. Pre-populating b.spmdContiguousPtr with the IndexAddr entry.
+//  3. Calling b.createInstruction(fieldAddr) to invoke the FieldAddr handler.
+//  4. Asserting that b.spmdContiguousPtr[fieldAddr] is now non-nil.
+//
+// Pre-fix: step 4 fails because createExpr does not propagate spmdContiguousPtr.
+// Post-fix: step 4 passes because the fix adds the propagation.
+func TestSPMDFieldAddrVaryingPtr(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i32Type := c.ctx.Int32Type()
+	laneCount := 4 // int on WASM32 → 4 lanes
+
+	// --- Go type setup ---
+	// Point{X, Y int} — field index 1 is Y.
+	intType := types.Typ[types.Int]
+	xField := types.NewField(token.NoPos, nil, "X", intType, false)
+	yField := types.NewField(token.NoPos, nil, "Y", intType, false)
+	pointStruct := types.NewStruct([]*types.Var{xField, yField}, nil)
+	ptrToPoint := types.NewPointer(pointStruct)
+	ptrToInt := types.NewPointer(intType)
+
+	// --- LLVM value setup ---
+	// Back buffer: [8 x {i32, i32}] alloca to serve as the slice backing array.
+	pointLLVM := c.ctx.StructType([]llvm.Type{i32Type, i32Type}, false)
+	bufArrayType := llvm.ArrayType(pointLLVM, 8)
+	bufAlloca := b.CreateAlloca(bufArrayType, "points.buf")
+	scalarIter := llvm.ConstInt(b.uintptrType, 0, false)
+
+	// basePtr = &points[0] — what spmdContiguousIndexAddrCore would emit.
+	basePtr := b.CreateInBoundsGEP(bufArrayType, bufAlloca, []llvm.Value{
+		llvm.ConstInt(i32Type, 0, false),
+		scalarIter,
+	}, "points.base")
+
+	// --- SSA value construction ---
+	// indexAddr represents the SSA result of IndexAddr(points, i).
+	// Its type is *Point (a pointer to the struct element).
+	// indexAddr.X must be non-nil so that getPos(indexAddr) → getPos(indexAddr.X)
+	// does not panic on a nil interface Pos() call.  A zero-valued int const
+	// (Pos() = token.NoPos) is sufficient — getPos returns NoPos in that case.
+	dummyX := ssa.NewConst(nil, types.Typ[types.Int])
+	indexAddr := ssaValueWithType(t, &ssa.IndexAddr{X: dummyX}, ptrToPoint)
+
+	// fieldAddr represents the SSA result of FieldAddr(indexAddr, 1) — &elem.Y.
+	// Its type is *int (pointer to the Y field).
+	// X must be set to indexAddr so createExpr can look it up in b.locals and
+	// createNilCheck can recognise the *ssa.IndexAddr base (skipping the nil check).
+	fieldAddr := ssaValueWithType(t, &ssa.FieldAddr{X: indexAddr, Field: 1}, ptrToInt)
+
+	// --- Builder state ---
+	// Initialize locals so getValue(indexAddr) returns basePtr.
+	mockLoop := &spmdActiveLoop{laneCount: laneCount}
+	b.locals = map[ssa.Value]llvm.Value{
+		indexAddr: basePtr,
+	}
+	// Pre-populate contiguous map for IndexAddr (simulates spmdContiguousIndexAddrCore).
+	b.spmdContiguousPtr = map[ssa.Value]*spmdContiguousInfo{
+		indexAddr: {
+			scalarPtr:   basePtr,
+			loop:        mockLoop,
+			scalarIndex: scalarIter,
+		},
+	}
+
+	// --- Exercise the FieldAddr handler ---
+	// createInstruction calls createExpr(fieldAddr), stores the result in b.locals,
+	// and (post-fix) populates b.spmdContiguousPtr[fieldAddr].
+	b.createInstruction(fieldAddr)
+
+	// --- KEY ASSERTION ---
+	// Pre-fix: createExpr does NOT propagate spmdContiguousPtr → lookup returns nil → FAIL.
+	// Post-fix: the fix registers the field's scalar GEP → lookup succeeds → PASS.
+	fieldCI, ok := b.spmdContiguousPtr[fieldAddr]
+	if !ok || fieldCI == nil {
+		t.Fatalf("spmdContiguousPtr[fieldAddr] = nil after createInstruction(fieldAddr): "+
+			"the FieldAddr handler in createExpr must propagate contiguous access info "+
+			"from indexAddr so that SPMDLoad can emit llvm.masked.load instead of gather "+
+			"(Task 7 fix needed)")
+	}
+
+	// --- Post-fix integrity checks ---
+	if fieldCI.scalarPtr.IsNil() {
+		t.Fatal("fieldCI.scalarPtr is nil — expected GEP to field Y")
+	}
+	if fieldCI.loop != mockLoop {
+		t.Error("fieldCI.loop was not inherited from the base IndexAddr contiguous info")
+	}
+
+	// The field's scalar ptr must be a GEP into the Point struct.  Verify by
+	// calling spmdMaskedLoad and checking the IR for llvm.masked.load.
+	maskElts := make([]llvm.Value, laneCount)
+	for k := range maskElts {
+		maskElts[k] = llvm.ConstAllOnes(i32Type)
+	}
+	mask := llvm.ConstVector(maskElts, false)
+	vecType := llvm.VectorType(i32Type, laneCount)
+	result := b.spmdMaskedLoad(vecType, fieldCI.scalarPtr, mask)
+	b.CreateRetVoid()
+
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("spmdMaskedLoad result type = %v, want VectorTypeKind", result.Type())
+	}
+	if result.Type().VectorSize() != laneCount {
+		t.Errorf("spmdMaskedLoad result lanes = %d, want %d", result.Type().VectorSize(), laneCount)
+	}
+
+	ir := b.llvmFn.String()
+	if !strings.Contains(ir, "llvm.masked.load") {
+		t.Errorf("IR must contain llvm.masked.load for contiguous field access; got:\n%s", ir)
 	}
 }
