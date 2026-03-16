@@ -5971,3 +5971,193 @@ func TestSPMDFieldAddrVaryingPtr(t *testing.T) {
 		t.Errorf("IR must contain llvm.masked.load for contiguous field access; got:\n%s", ir)
 	}
 }
+
+// TestSPMDPromoteByteArrayCopyToVector verifies that spmdPromoteByteArrayCopyToVector
+// returns a <N x i8> vector loaded from the source pointer when the pattern matches
+// (store of a [N]byte dereference to a local alloc on WASM with SPMD loops), and
+// returns a nil (zero) Value when guards are not satisfied.
+func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Activate the SPMD loop state guard (without it the function returns nil).
+	b.spmdLoopState = &spmdLoopState{
+		activeLoops: make(map[ssa.Value]*spmdActiveLoop),
+		bodyBlocks:  make(map[int]*spmdActiveLoop),
+		loopBlocks:  make(map[int]*spmdActiveLoop),
+	}
+
+	byteType := types.Typ[types.Uint8]
+	arr16GoType := types.NewArray(byteType, 16)
+	arr8GoType := types.NewArray(byteType, 8)
+	arr17GoType := types.NewArray(byteType, 17)
+	int32GoType := types.Typ[types.Int32]
+	arr4i32GoType := types.NewArray(int32GoType, 4)
+
+	ptrArr16 := types.NewPointer(arr16GoType)
+	ptrArr8 := types.NewPointer(arr8GoType)
+	ptrArr17 := types.NewPointer(arr17GoType)
+	ptrArr4i32 := types.NewPointer(arr4i32GoType)
+	ptrArr16ForAlloc := types.NewPointer(arr16GoType)
+
+	// Build a fake LLVM alloca for the destination pointer (the *ssa.Alloc's address).
+	llvmArr16Type := llvm.ArrayType(c.ctx.Int8Type(), 16)
+	allocaLLVM := b.CreateAlloca(llvmArr16Type, "test.dest.alloc")
+
+	// Build a fake LLVM ptr for the source (what the UnOp.X getValue returns).
+	// We use a global of [16 x i8] to simulate entry.shuffleMask.
+	srcGlobal := llvm.AddGlobal(c.mod, llvmArr16Type, "test.src.global")
+	srcGlobal.SetInitializer(llvm.ConstNull(llvmArr16Type))
+
+	makeStore := func(addrVal ssa.Value, valVal ssa.Value) *ssa.Store {
+		return &ssa.Store{Addr: addrVal, Val: valVal}
+	}
+	// makeUnop builds a *ssa.UnOp{MUL} using the ssaAllocWithType unsafe helper
+	// pattern but for UnOp, setting X to a dummy const with xType.
+	makeUnopMUL := func(xType types.Type) *ssa.UnOp {
+		u := &ssa.UnOp{Op: token.MUL}
+		// Use an *ssa.Alloc as X (not a Const) so that getValue(X) goes through
+		// the b.locals lookup path, which doesn't require b.program to be set.
+		// In production, unop.X is always a computed SSA value (FieldAddr, GlobalAddr,
+		// etc.), never a bare Const.
+		dummyAlloc := ssaAllocWithType(xType, false)
+		rv := reflect.ValueOf(u).Elem()
+		for i := range rv.NumField() {
+			f := rv.Type().Field(i)
+			if f.Name == "X" {
+				fv := rv.Field(i)
+				ptr := (*ssa.Value)(unsafe.Pointer(fv.UnsafeAddr()))
+				*ptr = dummyAlloc
+				return u
+			}
+		}
+		t.Fatalf("could not set UnOp.X via reflection")
+		return nil
+	}
+
+	setLocals := func(unop *ssa.UnOp) {
+		if b.locals == nil {
+			b.locals = make(map[ssa.Value]llvm.Value)
+		}
+		b.locals[unop.X] = srcGlobal
+	}
+
+	t.Run("match: [16]byte src, alloc dest, no extra referrers", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		if b.locals == nil {
+			b.locals = make(map[ssa.Value]llvm.Value)
+		}
+		b.locals[destAlloc] = allocaLLVM
+
+		unop := makeUnopMUL(ptrArr16)
+		setLocals(unop)
+		store := makeStore(destAlloc, unop)
+
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if result.IsNil() {
+			t.Error("expected non-nil result for matching [16]byte copy")
+		} else if result.Type().TypeKind() != llvm.VectorTypeKind {
+			t.Errorf("result type kind = %v, want VectorTypeKind", result.Type().TypeKind())
+		} else if result.Type().VectorSize() != 16 {
+			t.Errorf("vector size = %d, want 16", result.Type().VectorSize())
+		}
+	})
+
+	t.Run("match: [8]byte src, alloc dest", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		unop := makeUnopMUL(ptrArr8)
+		b.locals[unop.X] = srcGlobal
+
+		store := makeStore(destAlloc, unop)
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if result.IsNil() {
+			t.Error("expected non-nil for [8]byte copy")
+		} else if result.Type().VectorSize() != 8 {
+			t.Errorf("vector size = %d, want 8", result.Type().VectorSize())
+		}
+	})
+
+	t.Run("no match: [17]byte src (>16)", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		unop := makeUnopMUL(ptrArr17)
+		b.locals[unop.X] = srcGlobal
+
+		store := makeStore(destAlloc, unop)
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if !result.IsNil() {
+			t.Error("expected nil for [17]byte (N>16)")
+		}
+	})
+
+	t.Run("no match: [4]i32 src (non-byte)", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		unop := makeUnopMUL(ptrArr4i32)
+		b.locals[unop.X] = srcGlobal
+
+		store := makeStore(destAlloc, unop)
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if !result.IsNil() {
+			t.Error("expected nil for [4]i32 (non-byte array)")
+		}
+	})
+
+	t.Run("no match: dest is not alloc (const addr)", func(t *testing.T) {
+		dummyDest := ssa.NewConst(nil, types.Typ[types.Int])
+		unop := makeUnopMUL(ptrArr16)
+		b.locals[unop.X] = srcGlobal
+
+		store := makeStore(dummyDest, unop)
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if !result.IsNil() {
+			t.Error("expected nil when dest is not *ssa.Alloc")
+		}
+	})
+
+	t.Run("no match: val is not UnOp MUL (const val)", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		dummyVal := ssa.NewConst(nil, arr16GoType)
+		store := makeStore(destAlloc, dummyVal)
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if !result.IsNil() {
+			t.Error("expected nil when val is not *ssa.UnOp MUL")
+		}
+	})
+
+	t.Run("no match: spmdLoopState nil", func(t *testing.T) {
+		b2 := newTestBuilder(t, c)
+		defer b2.Dispose()
+
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		if b2.locals == nil {
+			b2.locals = make(map[ssa.Value]llvm.Value)
+		}
+		b2.locals[destAlloc] = allocaLLVM
+
+		unop := makeUnopMUL(ptrArr16)
+		b2.locals[unop.X] = srcGlobal
+
+		store := makeStore(destAlloc, unop)
+		result := b2.spmdPromoteByteArrayCopyToVector(store)
+		if !result.IsNil() {
+			t.Error("expected nil when spmdLoopState is nil")
+		}
+	})
+
+	// Verify the IR contains the vector load for successful matches.
+	b.CreateRetVoid()
+	ir := b.llvmFn.String()
+	if !strings.Contains(ir, "spmd.alloc.vec.copy") {
+		t.Logf("IR:\n%s", ir)
+		t.Error("expected spmd.alloc.vec.copy load in IR for matching [16]byte copy")
+	}
+}

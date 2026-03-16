@@ -4650,6 +4650,92 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 	return result, nil
 }
 
+// spmdPromoteByteArrayCopyToVector detects a [N]byte copy to a local alloc and
+// returns a <N x i8> vector loaded directly from the source pointer. This
+// prevents LLVM's store-forwarding from decomposing the subsequent identity
+// load <N x i8> (emitted by spmdVectorIndexArray) into N individual byte loads.
+//
+// Pattern detected:
+//
+//	*t72 = t74        -- SSA Store: copy [N]byte to local alloc t72
+//	t74 = *t73        -- SSA UnOp MUL: t74 is loaded from pointer t73
+//
+// When this pattern is matched, instead of storing the pre-loaded [N x i8]
+// aggregate (which LLVM would decompose via store-forwarding), we load <N x i8>
+// directly from t73's LLVM pointer value. LLVM then sees a clean vector store
+// followed by only the scalar patches, and the subsequent identity load
+// load <N x i8> from the alloca is store-forwarded as:
+//
+//	<N x i8> from_t73_ptr + insert(patch12) + insert(patch13) ...
+//
+// which produces a single v128.load + N_patches replace_lane instructions
+// instead of N individual byte loads + N replace_lane ops.
+//
+// Guards: WASM + SPMD loops present + dest is local *ssa.Alloc + val is a
+// *ssa.UnOp{MUL, srcPtr} + srcPtr points to [N]byte with N*1 <= 16 bytes.
+// N == 0 is excluded (zero-length types are handled elsewhere).
+//
+// Returns llvm.Value{} (nil) when the pattern does not match.
+func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value {
+	if !b.spmdIsWASM() || b.spmdLoopState == nil {
+		return llvm.Value{}
+	}
+	// Destination must be a local stack alloc.
+	if _, isAlloc := instr.Addr.(*ssa.Alloc); !isAlloc {
+		return llvm.Value{}
+	}
+	// Value must be a dereference (*ssa.UnOp with token.MUL).
+	unop, ok := instr.Val.(*ssa.UnOp)
+	if !ok || unop.Op != token.MUL {
+		return llvm.Value{}
+	}
+	// Source pointer must point to [N]byte with 1 <= N <= 16.
+	srcPtrType, ok := unop.X.Type().Underlying().(*types.Pointer)
+	if !ok {
+		return llvm.Value{}
+	}
+	arr, ok := srcPtrType.Elem().Underlying().(*types.Array)
+	if !ok {
+		return llvm.Value{}
+	}
+	basic, ok := arr.Elem().Underlying().(*types.Basic)
+	if !ok || basic.Kind() != types.Uint8 {
+		return llvm.Value{}
+	}
+	n := int(arr.Len())
+	if n == 0 || n > 16 {
+		return llvm.Value{}
+	}
+	// Only skip getValue(instr.Val) if instr.Val (the UnOp dereference) has
+	// no other referrers beyond instr itself. *ssa.DebugRef instructions are
+	// excluded: they generate no LLVM IR and cannot cause a type mismatch.
+	// If any other instruction uses this dereference result, it would call
+	// getValue and expect the aggregate [N x i8] type; changing it to <N x i8>
+	// here would cause a type mismatch.
+	if refs := unop.Referrers(); refs != nil {
+		for _, r := range *refs {
+			if _, isDebugRef := r.(*ssa.DebugRef); isDebugRef {
+				continue
+			}
+			if r == instr {
+				continue
+			}
+			// Another real instruction uses this value — cannot promote.
+			return llvm.Value{}
+		}
+	}
+
+	// Load the source as <N x i8> rather than [N x i8]. This changes the
+	// LLVM store type from aggregate to vector, preventing store-forwarding
+	// from decomposing the subsequent identity load <N x i8> from the alloca
+	// into N scalar byte loads (which would produce N replace_lane ops in WASM).
+	srcPtr := b.getValue(unop.X, getPos(unop))
+	vecType := llvm.VectorType(b.ctx.Int8Type(), n)
+	load := b.CreateLoad(vecType, srcPtr, "spmd.alloc.vec.copy")
+	load.SetAlignment(1)
+	return load
+}
+
 // spmdExtendIndex extends a scalar index extracted from a vector to the target type.
 // Determines signed/unsigned from the Go type (unwrapping SPMDType if needed).
 func (b *builder) spmdExtendIndex(value llvm.Value, goType types.Type, targetType llvm.Type) llvm.Value {

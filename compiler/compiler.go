@@ -1855,7 +1855,28 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		b.createChanSend(instr)
 	case *ssa.Store:
 		llvmAddr := b.getValue(instr.Addr, getPos(instr))
-		llvmVal := b.getValue(instr.Val, getPos(instr))
+
+		// SPMD: when copying a [N]byte value to a local stack alloc on WASM,
+		// re-load the source as <N x i8> and store as vector instead of array
+		// aggregate. This prevents LLVM's store-forwarding from decomposing a
+		// subsequent identity load <N x i8> (from spmdVectorIndexArray) into N
+		// individual byte loads + N replace_lane ops. With a vector store, LLVM
+		// forwards the vector value (one v128.load from the source) plus only
+		// the scalar patches, producing far fewer replace_lane instructions.
+		//
+		// Only applied when: WASM + SPMD + dest is local alloc + val is a
+		// dereference of a [N]byte source + N fits in one v128 lane (N <= 16).
+		// Checked BEFORE getValue(instr.Val) to avoid emitting a dead aggregate
+		// load when we know we'll use the vector load instead.
+		var llvmVal llvm.Value
+		if vecVal := b.spmdPromoteByteArrayCopyToVector(instr); !vecVal.IsNil() {
+			// Use the vector value directly. We intentionally skip getValue(instr.Val)
+			// to avoid emitting a dead aggregate load; spmdPromoteByteArrayCopyToVector
+			// checks that this is safe (val has no referrers that need the aggregate type).
+			llvmVal = vecVal
+		} else {
+			llvmVal = b.getValue(instr.Val, getPos(instr))
+		}
 
 		b.createNilCheck(instr.Addr, llvmAddr, "store")
 		if b.targetData.TypeAllocSize(llvmVal.Type()) == 0 {
