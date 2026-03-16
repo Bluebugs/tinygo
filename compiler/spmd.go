@@ -690,6 +690,27 @@ type spmdDecomposedIndex struct {
 	fromBodyIter bool
 }
 
+// spmdVecShadowState tracks register-based vector values for allocas initialized
+// by spmdPromoteByteArrayCopyToVector. When scalar byte stores at constant indices
+// partially modify the alloca, insertelement keeps the shadow in sync. At identity-load
+// time the shadow is returned directly, avoiding the alloca round-trip that LLVM
+// decomposes into per-byte loads on WASM (v128.load8_splat + 15× v128.load8_lane).
+// spmdVecShadowPendingPhi records an LLVM phi that was created at a merge block
+// before all SSA predecessors had been processed (DomPreorder may visit merge
+// blocks before some of their predecessors). spmdVecShadowFinalize completes
+// these phis after the full block-processing loop finishes.
+type spmdVecShadowPendingPhi struct {
+	phi      llvm.Value
+	ssaBlock *ssa.BasicBlock // the merge block that owns the phi
+	alloc    *ssa.Alloc      // the promoted alloca this phi tracks
+}
+
+type spmdVecShadowState struct {
+	current     map[*ssa.Alloc]llvm.Value                    // alloc → current shadow vector in this block
+	blockOut    map[llvm.BasicBlock]map[*ssa.Alloc]llvm.Value // LLVM block (exit) → shadow snapshot at block end
+	pendingPhis []spmdVecShadowPendingPhi                    // phis awaiting finalization after all blocks compile
+}
+
 // analyzeSPMDLoops performs two-pass pre-analysis of SPMD loops before block compilation.
 //
 // Pass 1 detects range-over-int (rangeint) patterns via "rangeint.body" block comments.
@@ -3414,6 +3435,39 @@ func (b *builder) spmdFullStoreWithBlend(val llvm.Value, ci *spmdContiguousInfo,
 				return
 			}
 		}
+		// Full-array optimization: when the alloca holds exactly laneCount elements
+		// and WASM codegen is active, use the alloca base pointer for both the old
+		// load and the blended store. Without this, the store goes through a GEP
+		// with a runtime iter offset (e.g. gep(digits, 0, %iter)), preventing LLVM
+		// from forwarding the value to a subsequent "load <N x i8>, ptr %digits".
+		// Shadow tracking is NOT updated here — this path targets SPMD loop output
+		// allocas, which are distinct from the byte-array copy allocas tracked by
+		// spmdVecShadow.
+		if b.spmdIsWASM() {
+			if alloc, ok := ci.ssaSource.(*ssa.Alloc); ok {
+				ptrType, ptrOK := alloc.Type().Underlying().(*types.Pointer)
+				if ptrOK {
+					if arrType, arrOK := ptrType.Elem().Underlying().(*types.Array); arrOK {
+						if arrType.Len() == int64(ci.loop.laneCount) {
+							allocaPtr := b.getValue(alloc, getPos(alloc))
+							old := b.CreateLoad(vecType, allocaPtr, "spmd.alloca.old")
+							old.SetAlignment(1)
+							blended := b.spmdMaskSelect(mask, val, old)
+							// Store with align 1 to match the alignment of subsequent
+							// identity loads (e.g., in spmdSwizzleFromPtr). LLVM's
+							// store-to-load forwarding requires consistent alignment;
+							// a store with the default vector alignment (16 for <16 x i8>)
+							// and a load with align 1 from the same Go [N]byte alloca
+							// prevents EarlyCSE/GVN forwarding, causing the WASM backend
+							// to emit load8_splat + load8_lane × (N-1) instead of v128.load.
+							st := b.CreateStore(blended, allocaPtr)
+							st.SetAlignment(1)
+							return
+						}
+					}
+				}
+			}
+		}
 		old := b.CreateLoad(vecType, ci.scalarPtr, "spmd.alloca.old")
 		blended := b.spmdMaskSelect(mask, val, old)
 		b.CreateStore(blended, ci.scalarPtr)
@@ -4568,6 +4622,16 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 		// the array directly as a <16 x i8> vector.
 		if int64(xType.Len()) == int64(laneCount) && b.spmdIsLoopLaneIndex(index, expr.Index) {
 			if unop, ok := expr.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
+				// Shadow vector bypass: when the alloca has a tracked shadow (kept
+				// in sync by insertelement on scalar byte stores), return it directly
+				// instead of loading from the alloca. Avoids the alloca round-trip
+				// that LLVM decomposes into v128.load8_splat + 15× v128.load8_lane.
+				if alloc, ok := unop.X.(*ssa.Alloc); ok && b.spmdVecShadow != nil {
+					if shadow, ok := b.spmdVecShadow.current[alloc]; ok {
+						return shadow, nil
+					}
+				}
+
 				srcPtr := b.getValue(unop.X, getPos(expr))
 				if laneCount == 16 {
 					// Load directly as <16 x i8>. Alignment 1 because Go
@@ -4585,6 +4649,15 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 		// use the source pointer directly — avoids aggregate→vector conversion
 		// that LLVM decomposes into per-byte loads.
 		if unop, ok := expr.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
+			// Shadow vector bypass: when the alloca has a tracked shadow (kept
+			// in sync by spmdFullStoreWithBlend), use it directly as the swizzle
+			// table instead of reloading from memory. Avoids LLVM's failure to
+			// forward through a GEP-indexed store (v128.load8_splat + N-1 load8_lane).
+			if alloc, ok := unop.X.(*ssa.Alloc); ok && b.spmdVecShadow != nil {
+				if shadow, ok := b.spmdVecShadow.current[alloc]; ok {
+					return b.spmdSwizzleWithTable(shadow, index, laneCount)
+				}
+			}
 			srcPtr := b.getValue(unop.X, getPos(expr))
 			return b.spmdSwizzleFromPtr(srcPtr, index, int(xType.Len()), laneCount)
 		}
@@ -4677,42 +4750,37 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 //
 // Returns llvm.Value{} (nil) when the pattern does not match.
 func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value {
-	if !b.spmdIsWASM() || b.spmdLoopState == nil {
+	if !b.spmdIsWASM() {
 		return llvm.Value{}
 	}
 	// Destination must be a local stack alloc.
-	if _, isAlloc := instr.Addr.(*ssa.Alloc); !isAlloc {
+	alloc, isAlloc := instr.Addr.(*ssa.Alloc)
+	if !isAlloc {
 		return llvm.Value{}
 	}
-	// Value must be a dereference (*ssa.UnOp with token.MUL).
-	unop, ok := instr.Val.(*ssa.UnOp)
-	if !ok || unop.Op != token.MUL {
-		return llvm.Value{}
-	}
-	// Source pointer must point to [N]byte with 1 <= N <= 16.
-	srcPtrType, ok := unop.X.Type().Underlying().(*types.Pointer)
-	if !ok {
-		return llvm.Value{}
-	}
-	arr, ok := srcPtrType.Elem().Underlying().(*types.Array)
-	if !ok {
-		return llvm.Value{}
-	}
-	basic, ok := arr.Elem().Underlying().(*types.Basic)
-	if !ok || basic.Kind() != types.Uint8 {
-		return llvm.Value{}
-	}
-	n := int(arr.Len())
-	if n == 0 || n > 16 {
-		return llvm.Value{}
-	}
-	// Only skip getValue(instr.Val) if instr.Val (the UnOp dereference) has
-	// no other referrers beyond instr itself. *ssa.DebugRef instructions are
-	// excluded: they generate no LLVM IR and cannot cause a type mismatch.
-	// If any other instruction uses this dereference result, it would call
-	// getValue and expect the aggregate [N x i8] type; changing it to <N x i8>
-	// here would cause a type mismatch.
-	if refs := unop.Referrers(); refs != nil {
+
+	// spmdPromoteByteArrayCopyToVector handles two SSA patterns:
+	//
+	// Pattern A — direct pointer dereference:
+	//   Store(alloc, *ptr)  where ptr: *[N]byte
+	//
+	// Pattern B — struct field extraction from a dereferenced struct:
+	//   Store(alloc, Field(structVal, idx))  where structVal = *structPtr
+	//   and the field type is [N]byte.
+	//
+	// In both cases we load <N x i8> directly from the source address (the
+	// struct pointer GEP'd to the field, or the original pointer) instead of
+	// copying through the alloca as an aggregate. This prevents LLVM's
+	// store-forwarding from decomposing the subsequent identity load into N
+	// scalar byte loads (which would produce N replace_lane ops in WASM).
+
+	// checkReferrers returns false if val has real referrers beyond instr.
+	// DebugRef instructions are skipped — they generate no LLVM IR.
+	checkReferrers := func(val ssa.Value) bool {
+		refs := val.Referrers()
+		if refs == nil {
+			return true
+		}
 		for _, r := range *refs {
 			if _, isDebugRef := r.(*ssa.DebugRef); isDebugRef {
 				continue
@@ -4720,20 +4788,286 @@ func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value 
 			if r == instr {
 				continue
 			}
-			// Another real instruction uses this value — cannot promote.
+			return false
+		}
+		return true
+	}
+
+	registerShadow := func(load llvm.Value) {
+		if b.spmdVecShadow == nil {
+			b.spmdVecShadow = &spmdVecShadowState{
+				current:  make(map[*ssa.Alloc]llvm.Value),
+				blockOut: make(map[llvm.BasicBlock]map[*ssa.Alloc]llvm.Value),
+			}
+		}
+		b.spmdVecShadow.current[alloc] = load
+	}
+
+	// Pattern A: Store(alloc, *ptr) where ptr: *[N]byte.
+	if unop, ok := instr.Val.(*ssa.UnOp); ok && unop.Op == token.MUL {
+		srcPtrType, ok := unop.X.Type().Underlying().(*types.Pointer)
+		if !ok {
 			return llvm.Value{}
+		}
+		arr, ok := srcPtrType.Elem().Underlying().(*types.Array)
+		if !ok {
+			return llvm.Value{}
+		}
+		basic, ok := arr.Elem().Underlying().(*types.Basic)
+		if !ok || basic.Kind() != types.Uint8 {
+			return llvm.Value{}
+		}
+		n := int(arr.Len())
+		if n == 0 || n > 16 {
+			return llvm.Value{}
+		}
+		// Only promote if no other real instruction uses the dereference result;
+		// otherwise getValue would be called with the aggregate type and a vector
+		// store would cause a type mismatch.
+		if !checkReferrers(unop) {
+			return llvm.Value{}
+		}
+		srcPtr := b.getValue(unop.X, getPos(unop))
+		vecType := llvm.VectorType(b.ctx.Int8Type(), n)
+		load := b.CreateLoad(vecType, srcPtr, "spmd.alloc.vec.copy")
+		load.SetAlignment(1)
+		registerShadow(load)
+		return load
+	}
+
+	// Pattern B: Store(alloc, Field(structVal, idx)) where structVal = *structPtr
+	// and the field type is [N]byte.
+	if field, ok := instr.Val.(*ssa.Field); ok {
+		// The field's parent must be a pointer dereference: structVal = *structPtr.
+		structUnop, ok := field.X.(*ssa.UnOp)
+		if !ok || structUnop.Op != token.MUL {
+			return llvm.Value{}
+		}
+		// Field type must be [N]byte with 1 <= N <= 16.
+		arr, ok := field.Type().Underlying().(*types.Array)
+		if !ok {
+			return llvm.Value{}
+		}
+		basic, ok := arr.Elem().Underlying().(*types.Basic)
+		if !ok || basic.Kind() != types.Uint8 {
+			return llvm.Value{}
+		}
+		n := int(arr.Len())
+		if n == 0 || n > 16 {
+			return llvm.Value{}
+		}
+		// Only promote if no other real instruction uses the Field result.
+		if !checkReferrers(field) {
+			return llvm.Value{}
+		}
+		// Compute a GEP into the struct to get a pointer to the field, then load
+		// <N x i8> directly — avoiding the aggregate alloca round-trip.
+		structPtr := b.getValue(structUnop.X, getPos(field))
+		structLLVMType := b.getLLVMType(structUnop.X.Type().Underlying().(*types.Pointer).Elem())
+		fieldGEP := b.CreateGEP(structLLVMType, structPtr, []llvm.Value{
+			llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+			llvm.ConstInt(b.ctx.Int32Type(), uint64(field.Field), false),
+		}, "spmd.field.ptr")
+		vecType := llvm.VectorType(b.ctx.Int8Type(), n)
+		load := b.CreateLoad(vecType, fieldGEP, "spmd.alloc.vec.copy")
+		load.SetAlignment(1)
+		registerShadow(load)
+		return load
+	}
+
+	return llvm.Value{}
+}
+
+// spmdVecShadowUpdate keeps a shadow vector in sync when a scalar byte store writes
+// to a constant index of a tracked alloca. Called from the *ssa.Store handler after
+// the underlying CreateStore. Emits an insertelement into the shadow.
+func (b *builder) spmdVecShadowUpdate(instr *ssa.Store) {
+	if b.spmdVecShadow == nil || len(b.spmdVecShadow.current) == 0 {
+		return
+	}
+	// Direct store to a tracked alloc (not through IndexAddr) invalidates the
+	// shadow: the alloca content changed in a way we don't track via insertelement.
+	// The initial promote path (spmdPromoteByteArrayCopyToVector) sets the shadow;
+	// any subsequent direct store means re-initialization we haven't captured.
+	if alloc, ok := instr.Addr.(*ssa.Alloc); ok {
+		if _, tracked := b.spmdVecShadow.current[alloc]; tracked {
+			delete(b.spmdVecShadow.current, alloc)
+		}
+		return
+	}
+	ia, ok := instr.Addr.(*ssa.IndexAddr)
+	if !ok {
+		return
+	}
+	alloc, ok := ia.X.(*ssa.Alloc)
+	if !ok {
+		return
+	}
+	shadow, ok := b.spmdVecShadow.current[alloc]
+	if !ok {
+		return
+	}
+	constIdx, ok := ia.Index.(*ssa.Const)
+	if !ok {
+		// Non-constant index: drop tracking — shadow can no longer be forwarded.
+		delete(b.spmdVecShadow.current, alloc)
+		return
+	}
+	idxVal, ok := constant.Int64Val(constIdx.Value)
+	if !ok || idxVal < 0 || int(idxVal) >= shadow.Type().VectorSize() {
+		delete(b.spmdVecShadow.current, alloc)
+		return
+	}
+
+	val := b.getValue(instr.Val, getPos(instr))
+	elemType := shadow.Type().ElementType()
+	if val.Type() != elemType {
+		val = b.CreateTrunc(val, elemType, "spmd.shadow.trunc")
+	}
+	idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(idxVal), false)
+	newShadow := b.CreateInsertElement(shadow, val, idx, "spmd.shadow.insert")
+	b.spmdVecShadow.current[alloc] = newShadow
+}
+
+// spmdVecShadowSaveBlock snapshots the current shadow state for the given LLVM
+// exit block so that successor blocks can inherit or merge it via phi nodes.
+func (b *builder) spmdVecShadowSaveBlock(exitBlock llvm.BasicBlock) {
+	if b.spmdVecShadow == nil || len(b.spmdVecShadow.current) == 0 {
+		return
+	}
+	out := make(map[*ssa.Alloc]llvm.Value, len(b.spmdVecShadow.current))
+	for k, v := range b.spmdVecShadow.current {
+		out[k] = v
+	}
+	b.spmdVecShadow.blockOut[exitBlock] = out
+}
+
+// spmdVecShadowBlockEntry restores or merges shadow state at the start of a new
+// basic block. For single-predecessor blocks the shadow is inherited directly.
+// For merge blocks (multiple preds) an LLVM phi is inserted at the block entry.
+// When a predecessor has not yet been processed (DomPreorder may visit merge
+// blocks before some of their predecessors), a partial phi is created and
+// recorded in pendingPhis for completion by spmdVecShadowFinalize.
+func (b *builder) spmdVecShadowBlockEntry(entryBlock llvm.BasicBlock, ssaBlock *ssa.BasicBlock) {
+	if b.spmdVecShadow == nil {
+		return
+	}
+	preds := ssaBlock.Preds
+	if len(preds) == 0 {
+		return
+	}
+
+	// Collect allocs tracked by any already-processed predecessor.
+	allocs := make(map[*ssa.Alloc]bool)
+	for _, pred := range preds {
+		predLLVM := b.blockInfo[pred.Index].exit
+		if out, ok := b.spmdVecShadow.blockOut[predLLVM]; ok {
+			for alloc := range out {
+				allocs[alloc] = true
+			}
+		}
+	}
+	if len(allocs) == 0 {
+		return
+	}
+
+	// Save insert point; phi nodes must be at block entry before any instruction.
+	savedIP := b.GetInsertBlock()
+	firstInstr := entryBlock.FirstInstruction()
+	if firstInstr.IsNil() {
+		b.SetInsertPointAtEnd(entryBlock)
+	} else {
+		b.SetInsertPointBefore(firstInstr)
+	}
+
+	for alloc := range allocs {
+		var vals []llvm.Value
+		var predBlocks []llvm.BasicBlock
+		allSame := true
+		var first llvm.Value
+		hasMissing := false
+
+		for _, pred := range preds {
+			predLLVM := b.blockInfo[pred.Index].exit
+			var v llvm.Value
+			if out, ok := b.spmdVecShadow.blockOut[predLLVM]; ok {
+				v = out[alloc]
+			}
+			if v.IsNil() {
+				// Predecessor has no shadow yet (not yet processed, or never tracks this alloc).
+				hasMissing = true
+				continue
+			}
+			vals = append(vals, v)
+			predBlocks = append(predBlocks, predLLVM)
+			if first.IsNil() {
+				first = v
+			} else if v.C != first.C {
+				allSame = false
+			}
+		}
+
+		if len(vals) == 0 {
+			// No predecessor has a shadow — skip.
+			delete(b.spmdVecShadow.current, alloc)
+			continue
+		}
+
+		if !hasMissing && allSame {
+			// All predecessors agree on the same value — no phi needed.
+			b.spmdVecShadow.current[alloc] = first
+			continue
+		}
+
+		// Create a phi (possibly partial if hasMissing). Partial phis are completed
+		// by spmdVecShadowFinalize after all blocks are processed.
+		phi := b.CreatePHI(vals[0].Type(), "spmd.shadow.phi")
+		b.spmdVecShadow.current[alloc] = phi
+		if hasMissing {
+			// Defer filling in predecessor edges until all blocks are compiled.
+			b.spmdVecShadow.pendingPhis = append(b.spmdVecShadow.pendingPhis, spmdVecShadowPendingPhi{
+				phi:      phi,
+				ssaBlock: ssaBlock,
+				alloc:    alloc,
+			})
+		} else {
+			phi.AddIncoming(vals, predBlocks)
 		}
 	}
 
-	// Load the source as <N x i8> rather than [N x i8]. This changes the
-	// LLVM store type from aggregate to vector, preventing store-forwarding
-	// from decomposing the subsequent identity load <N x i8> from the alloca
-	// into N scalar byte loads (which would produce N replace_lane ops in WASM).
-	srcPtr := b.getValue(unop.X, getPos(unop))
-	vecType := llvm.VectorType(b.ctx.Int8Type(), n)
-	load := b.CreateLoad(vecType, srcPtr, "spmd.alloc.vec.copy")
-	load.SetAlignment(1)
-	return load
+	b.SetInsertPointAtEnd(savedIP)
+}
+
+// spmdVecShadowFinalize completes any LLVM phi nodes that were created with
+// partial predecessors during spmdVecShadowBlockEntry. Called once after all
+// SSA blocks have been compiled (so all blockOut entries are populated).
+//
+// For each pending phi, we walk all SSA predecessors and look up the shadow
+// value for the alloc in blockOut. Missing predecessors (alloc not tracked on
+// that path) get llvm.Undef, which LLVM will propagate/simplify. Phis with
+// all-same predecessors are left as phis (never erased) so that blockOut
+// entries referencing them remain valid throughout finalization.
+func (b *builder) spmdVecShadowFinalize() {
+	if b.spmdVecShadow == nil || len(b.spmdVecShadow.pendingPhis) == 0 {
+		return
+	}
+	for _, pending := range b.spmdVecShadow.pendingPhis {
+		for _, pred := range pending.ssaBlock.Preds {
+			predLLVM := b.blockInfo[pred.Index].exit
+			var v llvm.Value
+			if out, ok := b.spmdVecShadow.blockOut[predLLVM]; ok {
+				v = out[pending.alloc]
+			}
+			if v.IsNil() {
+				// Predecessor doesn't track this alloc — use undef so the phi
+				// remains valid LLVM IR. LLVM will simplify paths that never
+				// contribute to the final swizzle result.
+				v = llvm.Undef(pending.phi.Type())
+			}
+			pending.phi.AddIncoming([]llvm.Value{v}, []llvm.BasicBlock{predLLVM})
+		}
+	}
+	b.spmdVecShadow.pendingPhis = nil
 }
 
 // spmdExtendIndex extends a scalar index extracted from a vector to the target type.
@@ -5858,6 +6192,22 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 			// but each element is a full SIMD vector (<M x T>).
 			if elemType.TypeKind() == llvm.VectorTypeKind {
 				return b.CreateLoad(elemType, ci.scalarPtr, "spmd.load.result")
+			}
+
+			// Contiguous aggregate load: the element is a struct/string/slice
+			// that can't form an LLVM vector. Emit N scalar loads at
+			// consecutive GEP offsets and pack into [N x elemType].
+			if !spmdIsVectorizableElemType(elemType) {
+				arrType := llvm.ArrayType(elemType, laneCount)
+				result := llvm.Undef(arrType)
+				for lane := 0; lane < laneCount; lane++ {
+					gep := b.CreateInBoundsGEP(elemType, ci.scalarPtr, []llvm.Value{
+						llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false),
+					}, "spmd.agg.gep")
+					loaded := b.CreateLoad(elemType, gep, "spmd.agg.lane")
+					result = b.CreateInsertValue(result, loaded, lane, "")
+				}
+				return result
 			}
 
 			// Narrow load path (WASM byte/bool elements).

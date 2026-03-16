@@ -194,6 +194,9 @@ type builder struct {
 	// spmd.break.mask phi for that loop. Used for early-exit in SPMD function bodies.
 	// Non-nil only when fn.SPMDRegularBreaks is populated and spmdFuncIsBody is true.
 	spmdBreakMaskBackEdges map[int]ssa.Value
+	// spmdVecShadow tracks shadow vector values for allocas promoted by
+	// spmdPromoteByteArrayCopyToVector. Nil when no such alloca exists.
+	spmdVecShadow *spmdVecShadowState
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
@@ -1514,6 +1517,9 @@ func (b *builder) createFunction() {
 		b.currentBlockInfo = &b.blockInfo[block.Index]
 		b.SetInsertPointAtEnd(b.currentBlockInfo.entry)
 
+		// SPMD: restore shadow vector state from predecessor(s) at block entry.
+		b.spmdVecShadowBlockEntry(b.currentBlockInfo.entry, block)
+
 		// SPMD: enable value overrides for body blocks, clear for other blocks.
 		if b.spmdLoopState != nil {
 			if loop, isBody := b.spmdLoopState.bodyBlocks[block.Index]; isBody {
@@ -1616,7 +1622,15 @@ func (b *builder) createFunction() {
 		// to find the actual LLVM predecessor block, so it must reflect the
 		// final block in the chain, not the original entry block.
 		b.currentBlockInfo.exit = b.GetInsertBlock()
+
+		// SPMD: snapshot shadow vector state for successor blocks to inherit.
+		b.spmdVecShadowSaveBlock(b.currentBlockInfo.exit)
 	}
+
+	// SPMD: complete any shadow phi nodes that were created before their
+	// predecessor blocks had been processed (DomPreorder may visit merge
+	// blocks before some predecessors in the switch/if-else subgraph).
+	b.spmdVecShadowFinalize()
 
 	// The rundefers instruction needs to be created after all defer
 	// instructions have been created. Otherwise it won't handle all defer
@@ -1869,11 +1883,15 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		// Checked BEFORE getValue(instr.Val) to avoid emitting a dead aggregate
 		// load when we know we'll use the vector load instead.
 		var llvmVal llvm.Value
+		promoted := false
 		if vecVal := b.spmdPromoteByteArrayCopyToVector(instr); !vecVal.IsNil() {
 			// Use the vector value directly. We intentionally skip getValue(instr.Val)
 			// to avoid emitting a dead aggregate load; spmdPromoteByteArrayCopyToVector
 			// checks that this is safe (val has no referrers that need the aggregate type).
+			// spmdPromoteByteArrayCopyToVector also registers the shadow, so we must NOT
+			// call spmdVecShadowUpdate below (which would immediately invalidate it).
 			llvmVal = vecVal
+			promoted = true
 		} else {
 			llvmVal = b.getValue(instr.Val, getPos(instr))
 		}
@@ -1884,6 +1902,12 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			return
 		}
 		b.CreateStore(llvmVal, llvmAddr)
+		// SPMD: keep shadow vectors in sync when scalar byte stores write to
+		// constant indices of a tracked alloca. Skip when the store was handled
+		// by spmdPromoteByteArrayCopyToVector, which already registered the shadow.
+		if !promoted {
+			b.spmdVecShadowUpdate(instr)
+		}
 	default:
 		b.addError(instr.Pos(), "unknown instruction: "+instr.String())
 	}

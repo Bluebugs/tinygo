@@ -5982,7 +5982,8 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 	b := newTestBuilder(t, c)
 	defer b.Dispose()
 
-	// Activate the SPMD loop state guard (without it the function returns nil).
+	// Initialise spmdLoopState so that registerShadow's shadow map is available
+	// for the shadow-bypass tests in TestSPMDVecShadowForwarding that follow.
 	b.spmdLoopState = &spmdLoopState{
 		activeLoops: make(map[ssa.Value]*spmdActiveLoop),
 		bodyBlocks:  make(map[int]*spmdActiveLoop),
@@ -6121,7 +6122,7 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 		}
 	})
 
-	t.Run("no match: val is not UnOp MUL (const val)", func(t *testing.T) {
+	t.Run("no match: val is neither UnOp MUL nor Field (const val)", func(t *testing.T) {
 		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
 		b.locals[destAlloc] = allocaLLVM
 
@@ -6129,11 +6130,167 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 		store := makeStore(destAlloc, dummyVal)
 		result := b.spmdPromoteByteArrayCopyToVector(store)
 		if !result.IsNil() {
-			t.Error("expected nil when val is not *ssa.UnOp MUL")
+			t.Error("expected nil when val is not *ssa.UnOp MUL or *ssa.Field")
 		}
 	})
 
-	t.Run("no match: spmdLoopState nil", func(t *testing.T) {
+	// makeField builds a *ssa.Field{X: structVal, Field: fieldIdx} where structVal
+	// is a *ssa.UnOp{MUL} whose X has the given structPtrType, and the field's
+	// register type is set to fieldType.
+	makeField := func(structPtrType types.Type, fieldIdx int, fieldType types.Type) (*ssa.Field, *ssa.UnOp) {
+		structUnop := makeUnopMUL(structPtrType)
+		f := &ssa.Field{Field: fieldIdx}
+		// Set register.typ (field "typ" at offset 1 of the embedded register) via reflection.
+		rv := reflect.ValueOf(f).Elem()
+		for i := range rv.NumField() {
+			ft := rv.Type().Field(i)
+			if ft.Anonymous {
+				// register is the first anonymous field; drill into it.
+				inner := rv.Field(i)
+				for j := range inner.NumField() {
+					if inner.Type().Field(j).Name == "typ" {
+						ptr := (*types.Type)(unsafe.Pointer(inner.Field(j).UnsafeAddr()))
+						*ptr = fieldType
+					}
+				}
+			}
+			if ft.Name == "X" {
+				ptr := (*ssa.Value)(unsafe.Pointer(rv.Field(i).UnsafeAddr()))
+				*ptr = structUnop
+			}
+		}
+		return f, structUnop
+	}
+
+	// Build a struct type { shuffleMask [16]byte } to exercise Pattern B.
+	structFields := []*types.Var{
+		types.NewField(0, nil, "shuffleMask", arr16GoType, false),
+	}
+	structGoType := types.NewStruct(structFields, nil)
+	ptrStructType := types.NewPointer(structGoType)
+
+	// Build a struct with a non-byte-array field 0 and a [16]byte field 1.
+	structFields2 := []*types.Var{
+		types.NewField(0, nil, "n", int32GoType, false),
+		types.NewField(0, nil, "data", arr16GoType, false),
+	}
+	structGoType2 := types.NewStruct(structFields2, nil)
+	ptrStructType2 := types.NewPointer(structGoType2)
+
+	// Build an LLVM struct type matching structGoType for the GEP: { [16 x i8] }.
+	llvmStructType := c.ctx.StructType([]llvm.Type{llvmArr16Type}, false)
+	structGlobal := llvm.AddGlobal(c.mod, llvmStructType, "test.struct.global")
+	structGlobal.SetInitializer(llvm.ConstNull(llvmStructType))
+
+	setStructLocals := func(unop *ssa.UnOp) {
+		if b.locals == nil {
+			b.locals = make(map[ssa.Value]llvm.Value)
+		}
+		b.locals[unop.X] = structGlobal
+	}
+
+	t.Run("match: Field(structVal, 0) where field 0 is [16]byte", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		field, structUnop := makeField(ptrStructType, 0, arr16GoType)
+		setStructLocals(structUnop)
+		store := makeStore(destAlloc, field)
+
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if result.IsNil() {
+			t.Error("expected non-nil result for Field([16]byte) pattern")
+		} else if result.Type().TypeKind() != llvm.VectorTypeKind {
+			t.Errorf("result type kind = %v, want VectorTypeKind", result.Type().TypeKind())
+		} else if result.Type().VectorSize() != 16 {
+			t.Errorf("vector size = %d, want 16", result.Type().VectorSize())
+		}
+	})
+
+	t.Run("match: Field(structVal, 1) where field 1 is [16]byte", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		// Build a 2-field struct LLVM type matching structGoType2: { i32, [16 x i8] }.
+		llvmStructType2 := c.ctx.StructType([]llvm.Type{c.ctx.Int32Type(), llvmArr16Type}, false)
+		structGlobal2 := llvm.AddGlobal(c.mod, llvmStructType2, "test.struct2.global")
+		structGlobal2.SetInitializer(llvm.ConstNull(llvmStructType2))
+
+		field, structUnop := makeField(ptrStructType2, 1, arr16GoType)
+		b.locals[structUnop.X] = structGlobal2
+		store := makeStore(destAlloc, field)
+
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if result.IsNil() {
+			t.Error("expected non-nil result for Field(struct, 1) [16]byte pattern")
+		} else if result.Type().VectorSize() != 16 {
+			t.Errorf("vector size = %d, want 16", result.Type().VectorSize())
+		}
+	})
+
+	t.Run("no match: Field structUnop is not MUL (Field.X not a deref)", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		// Use a plain Alloc as Field.X (not a UnOp{MUL}).
+		dummyX := ssaAllocWithType(ptrStructType, false)
+		f := &ssa.Field{Field: 0}
+		rv := reflect.ValueOf(f).Elem()
+		for i := range rv.NumField() {
+			ft := rv.Type().Field(i)
+			if ft.Anonymous {
+				inner := rv.Field(i)
+				for j := range inner.NumField() {
+					if inner.Type().Field(j).Name == "typ" {
+						ptr := (*types.Type)(unsafe.Pointer(inner.Field(j).UnsafeAddr()))
+						*ptr = arr16GoType
+					}
+				}
+			}
+			if ft.Name == "X" {
+				ptr := (*ssa.Value)(unsafe.Pointer(rv.Field(i).UnsafeAddr()))
+				*ptr = dummyX
+			}
+		}
+		store := makeStore(destAlloc, f)
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if !result.IsNil() {
+			t.Error("expected nil when Field.X is not a *ssa.UnOp{MUL}")
+		}
+	})
+
+	t.Run("no match: Field type is not [N]byte (int32 array)", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		field, structUnop := makeField(ptrStructType, 0, arr4i32GoType)
+		setStructLocals(structUnop)
+		store := makeStore(destAlloc, field)
+
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if !result.IsNil() {
+			t.Error("expected nil when Field type is not [N]byte")
+		}
+	})
+
+	t.Run("no match: Field type is [17]byte (too large)", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		field, structUnop := makeField(ptrStructType, 0, arr17GoType)
+		setStructLocals(structUnop)
+		store := makeStore(destAlloc, field)
+
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if !result.IsNil() {
+			t.Error("expected nil when Field [17]byte is too large")
+		}
+	})
+
+	t.Run("match: spmdLoopState nil (function does not require it)", func(t *testing.T) {
+		// spmdPromoteByteArrayCopyToVector does not guard on spmdLoopState.
+		// A nil spmdLoopState means registerShadow will initialise spmdVecShadow
+		// on first use, so the function still returns a non-nil vector.
 		b2 := newTestBuilder(t, c)
 		defer b2.Dispose()
 
@@ -6148,8 +6305,8 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 
 		store := makeStore(destAlloc, unop)
 		result := b2.spmdPromoteByteArrayCopyToVector(store)
-		if !result.IsNil() {
-			t.Error("expected nil when spmdLoopState is nil")
+		if result.IsNil() {
+			t.Error("expected non-nil: spmdLoopState nil does not prevent promotion")
 		}
 	})
 
@@ -6160,4 +6317,194 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 		t.Logf("IR:\n%s", ir)
 		t.Error("expected spmd.alloc.vec.copy load in IR for matching [16]byte copy")
 	}
+}
+
+// TestSPMDVecShadowForwarding verifies that the shadow vector tracking mechanism:
+//  1. Initialises a shadow after spmdPromoteByteArrayCopyToVector
+//  2. Updates the shadow via insertelement when scalar byte stores write constant indices
+//  3. Returns the shadow directly from spmdVecShadowBlockEntry for single-predecessor blocks
+//  4. Drops tracking when a store uses a non-constant index
+func TestSPMDVecShadowForwarding(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	b.spmdLoopState = &spmdLoopState{
+		activeLoops: make(map[ssa.Value]*spmdActiveLoop),
+		bodyBlocks:  make(map[int]*spmdActiveLoop),
+		loopBlocks:  make(map[int]*spmdActiveLoop),
+	}
+	if b.locals == nil {
+		b.locals = make(map[ssa.Value]llvm.Value)
+	}
+
+	byteType := types.Typ[types.Uint8]
+	arr16GoType := types.NewArray(byteType, 16)
+	ptrArr16 := types.NewPointer(arr16GoType)
+	ptrArr16ForAlloc := types.NewPointer(arr16GoType)
+
+	llvmArr16Type := llvm.ArrayType(c.ctx.Int8Type(), 16)
+	allocaLLVM := b.CreateAlloca(llvmArr16Type, "test.dest.alloc")
+
+	srcGlobal := llvm.AddGlobal(c.mod, llvmArr16Type, "test.shadow.src.global")
+	srcGlobal.SetInitializer(llvm.ConstNull(llvmArr16Type))
+
+	// Build a *ssa.UnOp{MUL} whose X has type *[16]byte and maps to srcGlobal.
+	makeUnopMUL := func() *ssa.UnOp {
+		u := &ssa.UnOp{Op: token.MUL}
+		dummyAlloc := ssaAllocWithType(ptrArr16, false)
+		b.locals[dummyAlloc] = srcGlobal
+		rv := reflect.ValueOf(u).Elem()
+		for i := range rv.NumField() {
+			f := rv.Type().Field(i)
+			if f.Name == "X" {
+				fv := rv.Field(i)
+				ptr := (*ssa.Value)(unsafe.Pointer(fv.UnsafeAddr()))
+				*ptr = dummyAlloc
+				return u
+			}
+		}
+		t.Fatalf("could not set UnOp.X")
+		return nil
+	}
+
+	destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+	b.locals[destAlloc] = allocaLLVM
+
+	unop := makeUnopMUL()
+	initStore := &ssa.Store{Addr: destAlloc, Val: unop}
+
+	t.Run("shadow initialized after promote", func(t *testing.T) {
+		vecVal := b.spmdPromoteByteArrayCopyToVector(initStore)
+		if vecVal.IsNil() {
+			t.Fatal("expected non-nil from spmdPromoteByteArrayCopyToVector")
+		}
+		if b.spmdVecShadow == nil {
+			t.Fatal("expected spmdVecShadow to be initialized")
+		}
+		shadow, ok := b.spmdVecShadow.current[destAlloc]
+		if !ok {
+			t.Fatal("expected shadow entry for destAlloc")
+		}
+		if shadow.IsNil() {
+			t.Error("shadow value should not be nil")
+		}
+		if shadow.Type().TypeKind() != llvm.VectorTypeKind || shadow.Type().VectorSize() != 16 {
+			t.Errorf("shadow type = %v, want <16 x i8>", shadow.Type())
+		}
+	})
+
+	t.Run("shadow updated by const-index scalar store", func(t *testing.T) {
+		if b.spmdVecShadow == nil {
+			t.Skip("shadow not initialized")
+		}
+
+		// Build an IndexAddr pointing into destAlloc at index 3.
+		constIdx := ssa.NewConst(constant.MakeInt64(3), byteType)
+		ia := &ssa.IndexAddr{X: destAlloc, Index: constIdx}
+
+		// Use an *ssa.Alloc as Val so getValue goes through b.locals (avoids
+		// needing b.program which is nil in unit tests). The LLVM value is i8.
+		valAlloc := ssaAllocWithType(byteType, false)
+		b.locals[valAlloc] = llvm.ConstInt(c.ctx.Int8Type(), 0xAB, false)
+		scalarStore := &ssa.Store{Addr: ia, Val: valAlloc}
+
+		prevShadow := b.spmdVecShadow.current[destAlloc]
+		b.spmdVecShadowUpdate(scalarStore)
+
+		newShadow, ok := b.spmdVecShadow.current[destAlloc]
+		if !ok {
+			t.Fatal("shadow entry removed after const-index store")
+		}
+		if newShadow.C == prevShadow.C {
+			t.Error("shadow should have changed after scalar byte store")
+		}
+		ir := newShadow.String()
+		if !strings.Contains(ir, "spmd.shadow.insert") {
+			t.Errorf("expected spmd.shadow.insert in shadow update IR, got: %s", ir)
+		}
+	})
+
+	t.Run("shadow dropped on non-const index store", func(t *testing.T) {
+		if b.spmdVecShadow == nil {
+			t.Skip("shadow not initialized")
+		}
+		// Re-initialize shadow for this sub-test.
+		vecVal := b.spmdPromoteByteArrayCopyToVector(initStore)
+		if vecVal.IsNil() {
+			t.Fatal("promote failed")
+		}
+
+		// Build an IndexAddr with a non-constant (SSA value) index.
+		nonConstIdx := ssaAllocWithType(byteType, false) // acts as a varying index
+		ia := &ssa.IndexAddr{X: destAlloc, Index: nonConstIdx}
+		byteConst := ssa.NewConst(constant.MakeInt64(5), byteType)
+		scalarStore := &ssa.Store{Addr: ia, Val: byteConst}
+
+		b.spmdVecShadowUpdate(scalarStore)
+
+		if _, ok := b.spmdVecShadow.current[destAlloc]; ok {
+			t.Error("shadow should be dropped when index is non-constant")
+		}
+	})
+
+	t.Run("shadow saved and restored across single-predecessor block", func(t *testing.T) {
+		c2 := newTestCompilerContext(t)
+		defer c2.dispose()
+		b2 := newTestBuilder(t, c2)
+		defer b2.Dispose()
+
+		b2.spmdLoopState = &spmdLoopState{
+			activeLoops: make(map[ssa.Value]*spmdActiveLoop),
+			bodyBlocks:  make(map[int]*spmdActiveLoop),
+			loopBlocks:  make(map[int]*spmdActiveLoop),
+		}
+		if b2.locals == nil {
+			b2.locals = make(map[ssa.Value]llvm.Value)
+		}
+
+		// Create two LLVM blocks: pred → succ.
+		predBlock := c2.ctx.AddBasicBlock(b2.llvmFn, "pred")
+		succBlock := c2.ctx.AddBasicBlock(b2.llvmFn, "succ")
+
+		// Set up a fake blockInfo slice large enough for 2 blocks.
+		b2.blockInfo = []blockInfo{
+			{entry: predBlock, exit: predBlock},
+			{entry: succBlock, exit: succBlock},
+		}
+
+		// Create shadow state in predBlock.
+		b2.SetInsertPointAtEnd(predBlock)
+		vecType := llvm.VectorType(c2.ctx.Int8Type(), 16)
+		fakeVec := llvm.Undef(vecType)
+		alloc2 := ssaAllocWithType(types.NewPointer(types.NewArray(byteType, 16)), false)
+		b2.spmdVecShadow = &spmdVecShadowState{
+			current:  map[*ssa.Alloc]llvm.Value{alloc2: fakeVec},
+			blockOut: make(map[llvm.BasicBlock]map[*ssa.Alloc]llvm.Value),
+		}
+
+		// Save pred's shadow.
+		b2.spmdVecShadowSaveBlock(predBlock)
+
+		// Build a fake SSA block for succ with pred as its predecessor.
+		// Use the reflect trick to set the Preds slice on an ssa.BasicBlock.
+		// We build a minimal *ssa.BasicBlock manually.
+		ssaSucc := &ssa.BasicBlock{Index: 1}
+		ssaPred := &ssa.BasicBlock{Index: 0}
+		// Set Preds via reflect (Preds is exported).
+		ssaSucc.Preds = []*ssa.BasicBlock{ssaPred}
+
+		b2.SetInsertPointAtEnd(succBlock)
+		b2.spmdVecShadow.current = make(map[*ssa.Alloc]llvm.Value) // clear for succ
+		b2.spmdVecShadowBlockEntry(succBlock, ssaSucc)
+
+		restored, ok := b2.spmdVecShadow.current[alloc2]
+		if !ok {
+			t.Fatal("shadow not restored for successor block")
+		}
+		if restored.C != fakeVec.C {
+			t.Error("restored shadow should equal the saved shadow value (same C pointer for single-pred)")
+		}
+	})
 }
