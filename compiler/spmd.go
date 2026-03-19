@@ -4827,7 +4827,59 @@ func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value 
 		if !checkReferrers(unop) {
 			return llvm.Value{}
 		}
+
+		// Resolve the source pointer. When unop.X is a FieldAddr into a local
+		// alloca (i.e. `&entry.shuffleMask` where `entry` is a local copy of a
+		// struct from a table), LLVM's SROA pass decomposes the whole-struct
+		// store (table→alloca) into 16 individual byte stores. The subsequent
+		// `load <16 x i8>` from the alloca is then converted by wasm-ld's LTO
+		// SROA into an insertelement chain, which the WASM backend lowers as
+		// v128.load8_splat + 15× v128.load8_lane.
+		//
+		// To avoid this, when unop.X is FieldAddr(structAlloc, fieldIdx) and
+		// structAlloc was populated by Store(structAlloc, *srcPtr), compute the
+		// source directly: GEP(srcPtr, 0, fieldIdx). This bypasses the alloca
+		// and loads directly from the original source memory.
 		srcPtr := b.getValue(unop.X, getPos(unop))
+		if fa, isFAddr := unop.X.(*ssa.FieldAddr); isFAddr {
+			if structAlloc, isAlloc := fa.X.(*ssa.Alloc); isAlloc {
+				refs := structAlloc.Referrers()
+				if refs != nil {
+					for _, ref := range *refs {
+						refStore, isStore := ref.(*ssa.Store)
+						if !isStore || refStore.Addr != structAlloc {
+							continue
+						}
+						// The stored value must be a dereference: *srcStructPtr.
+						srcUnop, isMUL := refStore.Val.(*ssa.UnOp)
+						if !isMUL || srcUnop.Op != token.MUL {
+							continue
+						}
+						// srcStructPtr must point to the same struct type as structAlloc.
+						srcStructPtrType, ok := srcUnop.X.Type().Underlying().(*types.Pointer)
+						if !ok {
+							continue
+						}
+						allocPtrType, ok := structAlloc.Type().Underlying().(*types.Pointer)
+						if !ok {
+							continue
+						}
+						if !types.Identical(srcStructPtrType.Elem(), allocPtrType.Elem()) {
+							continue
+						}
+						// Found: bypass the alloca and GEP into the source pointer.
+						structSrcPtr := b.getValue(srcUnop.X, getPos(unop))
+						structLLVMType := b.getLLVMType(srcStructPtrType.Elem())
+						srcPtr = b.CreateGEP(structLLVMType, structSrcPtr, []llvm.Value{
+							llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+							llvm.ConstInt(b.ctx.Int32Type(), uint64(fa.Field), false),
+						}, "spmd.field.ptr")
+						break
+					}
+				}
+			}
+		}
+
 		vecType := llvm.VectorType(b.ctx.Int8Type(), n)
 		load := b.CreateLoad(vecType, srcPtr, "spmd.alloc.vec.copy")
 		load.SetAlignment(1)
@@ -4860,10 +4912,58 @@ func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value 
 		if !checkReferrers(field) {
 			return llvm.Value{}
 		}
+
+		// Determine the struct pointer to GEP from.
+		// When structUnop.X is a local *ssa.Alloc (i.e. a value copy like
+		// `entry := table[hash]`), loading from the alloca's field runs into a
+		// SROA hazard: the alloca is filled by a whole-struct store that LLVM's
+		// SROA pass decomposes into 16 individual byte stores. The subsequent
+		// `load <16 x i8>` from that alloca is then converted by wasm-ld's LTO
+		// SROA into a 16-element insertelement chain, which the WASM backend
+		// lowers as v128.load8_splat + 15× v128.load8_lane.
+		//
+		// To avoid this, when structUnop.X is an alloca, look through it to
+		// find the original source pointer via a Store(alloca, *sourcePtr) in
+		// the same function. Use that source pointer + field GEP instead.
+		structSrcPtr := structUnop.X
+		if structAlloc, isAlloc := structUnop.X.(*ssa.Alloc); isAlloc {
+			// Search referrers of structAlloc for a Store(structAlloc, *srcPtr).
+			refs := structAlloc.Referrers()
+			if refs != nil {
+				for _, ref := range *refs {
+					refStore, isStore := ref.(*ssa.Store)
+					if !isStore || refStore.Addr != structAlloc {
+						continue
+					}
+					// The stored value must be a dereference: *srcPtr.
+					srcUnop, isMUL := refStore.Val.(*ssa.UnOp)
+					if !isMUL || srcUnop.Op != token.MUL {
+						continue
+					}
+					// srcPtr must point to the same struct type.
+					srcPtrType, ok := srcUnop.X.Type().Underlying().(*types.Pointer)
+					if !ok {
+						continue
+					}
+					structType, ok := structUnop.X.Type().Underlying().(*types.Pointer)
+					if !ok {
+						continue
+					}
+					if !types.Identical(srcPtrType.Elem(), structType.Elem()) {
+						continue
+					}
+					// Found: use srcUnop.X (the original pointer) instead of
+					// the local alloca, bypassing SROA decomposition.
+					structSrcPtr = srcUnop.X
+					break
+				}
+			}
+		}
+
 		// Compute a GEP into the struct to get a pointer to the field, then load
 		// <N x i8> directly — avoiding the aggregate alloca round-trip.
-		structPtr := b.getValue(structUnop.X, getPos(field))
-		structLLVMType := b.getLLVMType(structUnop.X.Type().Underlying().(*types.Pointer).Elem())
+		structPtr := b.getValue(structSrcPtr, getPos(field))
+		structLLVMType := b.getLLVMType(structSrcPtr.Type().Underlying().(*types.Pointer).Elem())
 		fieldGEP := b.CreateGEP(structLLVMType, structPtr, []llvm.Value{
 			llvm.ConstInt(b.ctx.Int32Type(), 0, false),
 			llvm.ConstInt(b.ctx.Int32Type(), uint64(field.Field), false),
