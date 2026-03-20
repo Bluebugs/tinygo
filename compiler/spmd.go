@@ -6699,15 +6699,9 @@ func (b *builder) createSPMDVectorFromMemory(instr *ssa.SPMDVectorFromMemory) ll
 		isVolatile,
 	}, "")
 
-	// Copy min(length, lanes) bytes from the source into the buffer using
-	// statically unrolled conditional stores. Each lane index is a compile-time
-	// constant, so LLVM sees N independent guarded load+store pairs rather than
-	// a loop. This prevents LoopIdiomRecognize from re-synthesizing a memcpy
-	// (which Cranelift would lower to a memory.copy call, ~12 ns overhead).
-	//
-	// For each byte index i in [0, lanes):
-	//   if i < length: buf[i] = src[i]   (guarded by a condBr on length > i)
-	// Since the buffer is already zeroed, unwritten positions remain 0.
+	// Copy min(length, lanes) bytes from the source into the buffer.
+	// Source and destination never overlap (string/heap vs stack alloca),
+	// so memcpy is correct and avoids the overlap-check branch of memmove.
 	lenUintptr := length
 	lenWidth := length.Type().IntTypeWidth()
 	uintptrWidth := b.uintptrType.IntTypeWidth()
@@ -6716,21 +6710,15 @@ func (b *builder) createSPMDVectorFromMemory(instr *ssa.SPMDVectorFromMemory) ll
 	} else if lenWidth > uintptrWidth {
 		lenUintptr = b.CreateTrunc(length, b.uintptrType, "vfm.srclen")
 	}
-
-	for i := 0; i < lanes; i++ {
-		idxVal := llvm.ConstInt(b.uintptrType, uint64(i), false)
-		inRange := b.CreateICmp(llvm.IntUGT, lenUintptr, idxVal, fmt.Sprintf("vfm.inrange%d", i))
-		copyBB := b.insertBasicBlock(fmt.Sprintf("vfm.copy%d", i))
-		nextBB := b.insertBasicBlock(fmt.Sprintf("vfm.next%d", i))
-		b.CreateCondBr(inRange, copyBB, nextBB)
-		b.SetInsertPointAtEnd(copyBB)
-		srcGEP := b.CreateInBoundsGEP(i8Type, dataPtr, []llvm.Value{idxVal}, fmt.Sprintf("vfm.src%d", i))
-		byteVal := b.CreateLoad(i8Type, srcGEP, fmt.Sprintf("vfm.byte%d", i))
-		dstGEP := b.CreateInBoundsGEP(i8Type, buf, []llvm.Value{idxVal}, fmt.Sprintf("vfm.dst%d", i))
-		b.CreateStore(byteVal, dstGEP)
-		b.CreateBr(nextBB)
-		b.SetInsertPointAtEnd(nextBB)
-	}
+	useLen := b.CreateICmp(llvm.IntULT, lenUintptr, lanesVal, "vfm.useLen")
+	copyLen := b.CreateSelect(useLen, lenUintptr, lanesVal, "vfm.copylen")
+	memcpyFn := b.getMemcpyFunc()
+	b.CreateCall(memcpyFn.GlobalValueType(), memcpyFn, []llvm.Value{
+		buf,
+		dataPtr,
+		copyLen,
+		isVolatile,
+	}, "")
 
 	// Single unconditional v128.load from the fully-allocated buffer.
 	result := b.CreateLoad(vecType, buf, "vfm.load")
