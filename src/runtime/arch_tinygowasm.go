@@ -54,8 +54,14 @@ var (
 	// extends from this offset until heapEnd (exclusive).
 	heapStart = uintptr(unsafe.Pointer(&heapStartSymbol))
 
-	// heapEnd is the current memory length in bytes.
-	heapEnd = uintptr(wasm_memory_size(wasmMemoryIndex) * wasmPageSize)
+	// heapEnd is the current memory length in bytes, minus the SIMD guard zone.
+	//
+	// Reserve 16 bytes at the top of linear memory as a SIMD guard zone.
+	// This guarantees that v128.load from any heap-allocated pointer will
+	// not trap, even if it reads up to 15 bytes beyond the allocation.
+	// Cost: 16 bytes out of minimum 64KB. Used by createSPMDVectorFromMemory
+	// to do overread+mask instead of memset+memcpy+v128.load bounce buffer.
+	heapEnd = uintptr(wasm_memory_size(wasmMemoryIndex)*wasmPageSize) - 16
 
 	globalsStart = uintptr(unsafe.Pointer(&globalsStartSymbol))
 	globalsEnd   = uintptr(unsafe.Pointer(&heapStartSymbol))
@@ -92,7 +98,12 @@ func growHeap() bool {
 		return false
 	}
 
-	setHeapEnd(uintptr(wasm_memory_size(wasmMemoryIndex) * wasmPageSize))
+	// Reserve 16 bytes at the top of linear memory as a SIMD guard zone.
+	// This guarantees that v128.load from any heap-allocated pointer will
+	// not trap, even if it reads up to 15 bytes beyond the allocation.
+	// Cost: 16 bytes out of minimum 64KB. Used by createSPMDVectorFromMemory
+	// to do overread+mask instead of memset+memcpy+v128.load bounce buffer.
+	setHeapEnd(uintptr(wasm_memory_size(wasmMemoryIndex)*wasmPageSize) - 16)
 
 	// Heap has grown successfully.
 	return true

@@ -16,7 +16,12 @@ func wasmEntryCommand() {
 	// These need to be initialized early so that the heap can be initialized.
 	initializeCalled = true
 	heapStart = uintptr(unsafe.Pointer(&heapStartSymbol))
-	heapEnd = uintptr(wasm_memory_size(0) * wasmPageSize)
+	// Reserve 16 bytes at the top of linear memory as a SIMD guard zone.
+	// This guarantees that v128.load from any heap-allocated pointer will
+	// not trap, even if it reads up to 15 bytes beyond the allocation.
+	// Cost: 16 bytes out of minimum 64KB. Used by createSPMDVectorFromMemory
+	// to do overread+mask instead of memset+memcpy+v128.load bounce buffer.
+	heapEnd = uintptr(wasm_memory_size(0)*wasmPageSize) - 16
 	run()
 	if mainExited {
 		// To make sure wasm_exec.js knows that we've exited, exit explicitly.
@@ -33,7 +38,12 @@ func wasmEntryReactor() {
 
 	// Initialize the heap.
 	heapStart = uintptr(unsafe.Pointer(&heapStartSymbol))
-	heapEnd = uintptr(wasm_memory_size(0) * wasmPageSize)
+	// Reserve 16 bytes at the top of linear memory as a SIMD guard zone.
+	// This guarantees that v128.load from any heap-allocated pointer will
+	// not trap, even if it reads up to 15 bytes beyond the allocation.
+	// Cost: 16 bytes out of minimum 64KB. Used by createSPMDVectorFromMemory
+	// to do overread+mask instead of memset+memcpy+v128.load bounce buffer.
+	heapEnd = uintptr(wasm_memory_size(0)*wasmPageSize) - 16
 	initRand()
 	initHeap()
 
@@ -57,7 +67,12 @@ func wasmEntryLegacy() {
 	// These need to be initialized early so that the heap can be initialized.
 	initializeCalled = true
 	heapStart = uintptr(unsafe.Pointer(&heapStartSymbol))
-	heapEnd = uintptr(wasm_memory_size(0) * wasmPageSize)
+	// Reserve 16 bytes at the top of linear memory as a SIMD guard zone.
+	// This guarantees that v128.load from any heap-allocated pointer will
+	// not trap, even if it reads up to 15 bytes beyond the allocation.
+	// Cost: 16 bytes out of minimum 64KB. Used by createSPMDVectorFromMemory
+	// to do overread+mask instead of memset+memcpy+v128.load bounce buffer.
+	heapEnd = uintptr(wasm_memory_size(0)*wasmPageSize) - 16
 	run()
 }
 
