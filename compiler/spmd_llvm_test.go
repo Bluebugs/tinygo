@@ -5973,8 +5973,8 @@ func TestSPMDFieldAddrVaryingPtr(t *testing.T) {
 }
 
 // TestSPMDPromoteByteArrayCopyToVector verifies that spmdPromoteByteArrayCopyToVector
-// returns a <N x i8> vector loaded from the source pointer when the pattern matches
-// (store of a [N]byte dereference to a local alloc on WASM with SPMD loops), and
+// returns a <N x T> vector loaded from the source pointer when the pattern matches
+// (store of a [N]T dereference to a local alloc on WASM where N*sizeof(T)<=16), and
 // returns a nil (zero) Value when guards are not satisfied.
 func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 	c := newTestCompilerContext(t)
@@ -5996,11 +5996,13 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 	arr17GoType := types.NewArray(byteType, 17)
 	int32GoType := types.Typ[types.Int32]
 	arr4i32GoType := types.NewArray(int32GoType, 4)
+	arr5i32GoType := types.NewArray(int32GoType, 5) // 5*4=20 bytes, exceeds v128
 
 	ptrArr16 := types.NewPointer(arr16GoType)
 	ptrArr8 := types.NewPointer(arr8GoType)
 	ptrArr17 := types.NewPointer(arr17GoType)
 	ptrArr4i32 := types.NewPointer(arr4i32GoType)
+	ptrArr5i32 := types.NewPointer(arr5i32GoType)
 	ptrArr16ForAlloc := types.NewPointer(arr16GoType)
 
 	// Build a fake LLVM alloca for the destination pointer (the *ssa.Alloc's address).
@@ -6096,7 +6098,7 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 		}
 	})
 
-	t.Run("no match: [4]i32 src (non-byte)", func(t *testing.T) {
+	t.Run("match: [4]i32 src (4*4=16 bytes, fits in v128)", func(t *testing.T) {
 		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
 		b.locals[destAlloc] = allocaLLVM
 
@@ -6105,8 +6107,24 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 
 		store := makeStore(destAlloc, unop)
 		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if result.IsNil() {
+			t.Error("expected non-nil for [4]i32 (4*4=16 bytes fits in v128)")
+		} else if result.Type().VectorSize() != 4 {
+			t.Errorf("vector size = %d, want 4", result.Type().VectorSize())
+		}
+	})
+
+	t.Run("no match: [5]i32 src (5*4=20 bytes, exceeds v128)", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		unop := makeUnopMUL(ptrArr5i32)
+		b.locals[unop.X] = srcGlobal
+
+		store := makeStore(destAlloc, unop)
+		result := b.spmdPromoteByteArrayCopyToVector(store)
 		if !result.IsNil() {
-			t.Error("expected nil for [4]i32 (non-byte array)")
+			t.Error("expected nil for [5]i32 (5*4=20 bytes exceeds v128)")
 		}
 	})
 
@@ -6259,7 +6277,7 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 		}
 	})
 
-	t.Run("no match: Field type is not [N]byte (int32 array)", func(t *testing.T) {
+	t.Run("match: Field type is [4]i32 (4*4=16 bytes, fits in v128)", func(t *testing.T) {
 		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
 		b.locals[destAlloc] = allocaLLVM
 
@@ -6268,8 +6286,10 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 		store := makeStore(destAlloc, field)
 
 		result := b.spmdPromoteByteArrayCopyToVector(store)
-		if !result.IsNil() {
-			t.Error("expected nil when Field type is not [N]byte")
+		if result.IsNil() {
+			t.Error("expected non-nil for Field [4]i32 (4*4=16 bytes fits in v128)")
+		} else if result.Type().VectorSize() != 4 {
+			t.Errorf("vector size = %d, want 4", result.Type().VectorSize())
 		}
 	})
 
@@ -6284,6 +6304,20 @@ func TestSPMDPromoteByteArrayCopyToVector(t *testing.T) {
 		result := b.spmdPromoteByteArrayCopyToVector(store)
 		if !result.IsNil() {
 			t.Error("expected nil when Field [17]byte is too large")
+		}
+	})
+
+	t.Run("no match: Field type is [5]i32 (5*4=20 bytes, exceeds v128)", func(t *testing.T) {
+		destAlloc := ssaAllocWithType(ptrArr16ForAlloc, false)
+		b.locals[destAlloc] = allocaLLVM
+
+		field, structUnop := makeField(ptrStructType, 0, arr5i32GoType)
+		setStructLocals(structUnop)
+		store := makeStore(destAlloc, field)
+
+		result := b.spmdPromoteByteArrayCopyToVector(store)
+		if !result.IsNil() {
+			t.Error("expected nil when Field [5]i32 (5*4=20 bytes) exceeds v128")
 		}
 	})
 

@@ -4610,22 +4610,22 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 		return llvm.Value{}, b.makeError(expr.Pos(), "SPMD vector index into array of varying elements is not supported")
 	}
 
-	// WASM fast path: use i8x16.swizzle for byte arrays ≤ 16 elements.
-	// Bounds safety: swizzle returns 0 for indices >= 16 (no memory access,
-	// purely register-based). Identity path: arrayLen == laneCount with
-	// sequential lane index means every index is in-bounds by construction.
+	// WASM fast paths.
 	elemType := arrayType.ElementType()
-	if b.spmdIsWASM() && elemType == b.ctx.Int8Type() && xType.Len() <= 16 {
-		// Identity swizzle elimination: when the array has exactly laneCount
-		// byte elements and the index is the loop's sequential lane index,
-		// the swizzle would just return the input unchanged. Skip it and use
-		// the array directly as a <16 x i8> vector.
-		if int64(xType.Len()) == int64(laneCount) && b.spmdIsLoopLaneIndex(index, expr.Index) {
+	if b.spmdIsWASM() {
+		elemSize := b.targetData.TypeAllocSize(elemType)
+		totalSize := int(xType.Len()) * int(elemSize)
+
+		// Identity load elimination: when the array has exactly laneCount elements,
+		// the total array fits in v128, and the index is the loop's sequential lane
+		// index, the per-lane gather would just return each element in order.
+		// Skip the gather and load the array directly as a <N x T> vector.
+		if totalSize <= 16 && int64(xType.Len()) == int64(laneCount) && b.spmdIsLoopLaneIndex(index, expr.Index) {
 			if unop, ok := expr.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
 				// Shadow vector bypass: when the alloca has a tracked shadow (kept
-				// in sync by insertelement on scalar byte stores), return it directly
+				// in sync by insertelement on scalar stores), return it directly
 				// instead of loading from the alloca. Avoids the alloca round-trip
-				// that LLVM decomposes into v128.load8_splat + 15× v128.load8_lane.
+				// that LLVM decomposes into per-lane loads.
 				if alloc, ok := unop.X.(*ssa.Alloc); ok && b.spmdVecShadow != nil {
 					if shadow, ok := b.spmdVecShadow.current[alloc]; ok {
 						return shadow, nil
@@ -4633,35 +4633,42 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 				}
 
 				srcPtr := b.getValue(unop.X, getPos(expr))
-				if laneCount == 16 {
-					// Load directly as <16 x i8>. Alignment 1 because Go
-					// [16]byte has no alignment guarantee beyond byte.
-					v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
-					load := b.CreateLoad(v16i8, srcPtr, "spmd.identity.load")
-					load.SetAlignment(1)
+				if totalSize == 16 {
+					// Load directly as <N x T>. v128.load reads exactly 16 bytes
+					// regardless of element type; alignment from the element type.
+					vecType := llvm.VectorType(elemType, laneCount)
+					align := b.targetData.ABITypeAlignment(elemType)
+					load := b.CreateLoad(vecType, srcPtr, "spmd.identity.load")
+					load.SetAlignment(align)
 					return load, nil
 				}
 			}
 			// Register-based: bitcast the aggregate to vector.
-			return b.CreateBitCast(collection, llvm.VectorType(b.ctx.Int8Type(), laneCount), "spmd.identity.cast"), nil
+			return b.CreateBitCast(collection, llvm.VectorType(elemType, laneCount), "spmd.identity.cast"), nil
 		}
-		// If the collection was loaded from memory (SSA *UnOp dereference),
-		// use the source pointer directly — avoids aggregate→vector conversion
-		// that LLVM decomposes into per-byte loads.
-		if unop, ok := expr.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
-			// Shadow vector bypass: when the alloca has a tracked shadow (kept
-			// in sync by spmdFullStoreWithBlend), use it directly as the swizzle
-			// table instead of reloading from memory. Avoids LLVM's failure to
-			// forward through a GEP-indexed store (v128.load8_splat + N-1 load8_lane).
-			if alloc, ok := unop.X.(*ssa.Alloc); ok && b.spmdVecShadow != nil {
-				if shadow, ok := b.spmdVecShadow.current[alloc]; ok {
-					return b.spmdSwizzleWithTable(shadow, index, laneCount)
+
+		// i8x16.swizzle fast path: byte arrays ≤ 16 elements.
+		// Bounds safety: swizzle returns 0 for indices >= 16 (no memory access,
+		// purely register-based).
+		if elemType == b.ctx.Int8Type() && xType.Len() <= 16 {
+			// If the collection was loaded from memory (SSA *UnOp dereference),
+			// use the source pointer directly — avoids aggregate→vector conversion
+			// that LLVM decomposes into per-byte loads.
+			if unop, ok := expr.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
+				// Shadow vector bypass: when the alloca has a tracked shadow (kept
+				// in sync by spmdFullStoreWithBlend), use it directly as the swizzle
+				// table instead of reloading from memory. Avoids LLVM's failure to
+				// forward through a GEP-indexed store (v128.load8_splat + N-1 load8_lane).
+				if alloc, ok := unop.X.(*ssa.Alloc); ok && b.spmdVecShadow != nil {
+					if shadow, ok := b.spmdVecShadow.current[alloc]; ok {
+						return b.spmdSwizzleWithTable(shadow, index, laneCount)
+					}
 				}
+				srcPtr := b.getValue(unop.X, getPos(expr))
+				return b.spmdSwizzleFromPtr(srcPtr, index, int(xType.Len()), laneCount)
 			}
-			srcPtr := b.getValue(unop.X, getPos(expr))
-			return b.spmdSwizzleFromPtr(srcPtr, index, int(xType.Len()), laneCount)
+			return b.spmdSwizzleArrayBytes(collection, index, int(xType.Len()), laneCount)
 		}
-		return b.spmdSwizzleArrayBytes(collection, index, int(xType.Len()), laneCount)
 	}
 
 	// Bounds check for the GEP fallback path (actual memory access).
@@ -4723,30 +4730,30 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 	return result, nil
 }
 
-// spmdPromoteByteArrayCopyToVector detects a [N]byte copy to a local alloc and
-// returns a <N x i8> vector loaded directly from the source pointer. This
+// spmdPromoteByteArrayCopyToVector detects a [N]T copy to a local alloc and
+// returns a <N x T> vector loaded directly from the source pointer. This
 // prevents LLVM's store-forwarding from decomposing the subsequent identity
-// load <N x i8> (emitted by spmdVectorIndexArray) into N individual byte loads.
+// load <N x T> (emitted by spmdVectorIndexArray) into N individual element loads.
 //
 // Pattern detected:
 //
-//	*t72 = t74        -- SSA Store: copy [N]byte to local alloc t72
+//	*t72 = t74        -- SSA Store: copy [N]T to local alloc t72
 //	t74 = *t73        -- SSA UnOp MUL: t74 is loaded from pointer t73
 //
-// When this pattern is matched, instead of storing the pre-loaded [N x i8]
-// aggregate (which LLVM would decompose via store-forwarding), we load <N x i8>
+// When this pattern is matched, instead of storing the pre-loaded [N x T]
+// aggregate (which LLVM would decompose via store-forwarding), we load <N x T>
 // directly from t73's LLVM pointer value. LLVM then sees a clean vector store
 // followed by only the scalar patches, and the subsequent identity load
-// load <N x i8> from the alloca is store-forwarded as:
+// load <N x T> from the alloca is store-forwarded as:
 //
-//	<N x i8> from_t73_ptr + insert(patch12) + insert(patch13) ...
+//	<N x T> from_t73_ptr + insert(patch12) + insert(patch13) ...
 //
 // which produces a single v128.load + N_patches replace_lane instructions
-// instead of N individual byte loads + N replace_lane ops.
+// instead of N individual element loads + N replace_lane ops.
 //
 // Guards: WASM + SPMD loops present + dest is local *ssa.Alloc + val is a
-// *ssa.UnOp{MUL, srcPtr} + srcPtr points to [N]byte with N*1 <= 16 bytes.
-// N == 0 is excluded (zero-length types are handled elsewhere).
+// *ssa.UnOp{MUL, srcPtr} + srcPtr points to [N]T with N*sizeof(T) <= 16 bytes.
+// Zero-total-size arrays are excluded (zero-length types are handled elsewhere).
 //
 // Returns llvm.Value{} (nil) when the pattern does not match.
 func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value {
@@ -4803,7 +4810,7 @@ func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value 
 		b.spmdVecShadow.current[alloc] = load
 	}
 
-	// Pattern A: Store(alloc, *ptr) where ptr: *[N]byte.
+	// Pattern A: Store(alloc, *ptr) where ptr: *[N]T and N*sizeof(T) <= 16.
 	if unop, ok := instr.Val.(*ssa.UnOp); ok && unop.Op == token.MUL {
 		srcPtrType, ok := unop.X.Type().Underlying().(*types.Pointer)
 		if !ok {
@@ -4813,12 +4820,12 @@ func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value 
 		if !ok {
 			return llvm.Value{}
 		}
-		basic, ok := arr.Elem().Underlying().(*types.Basic)
-		if !ok || basic.Kind() != types.Uint8 {
-			return llvm.Value{}
-		}
+		// Allow any element type where the total array fits in v128 (16 bytes).
+		elemLLVM := b.getLLVMType(arr.Elem())
+		elemSize := b.targetData.TypeAllocSize(elemLLVM)
 		n := int(arr.Len())
-		if n == 0 || n > 16 {
+		totalSize := n * int(elemSize)
+		if totalSize == 0 || totalSize > 16 {
 			return llvm.Value{}
 		}
 		// Only promote if no other real instruction uses the dereference result;
@@ -4880,32 +4887,33 @@ func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value 
 			}
 		}
 
-		vecType := llvm.VectorType(b.ctx.Int8Type(), n)
+		vecType := llvm.VectorType(elemLLVM, n)
+		align := b.targetData.ABITypeAlignment(elemLLVM)
 		load := b.CreateLoad(vecType, srcPtr, "spmd.alloc.vec.copy")
-		load.SetAlignment(1)
+		load.SetAlignment(align)
 		registerShadow(load)
 		return load
 	}
 
 	// Pattern B: Store(alloc, Field(structVal, idx)) where structVal = *structPtr
-	// and the field type is [N]byte.
+	// and the field type is [N]T with N*sizeof(T) <= 16.
 	if field, ok := instr.Val.(*ssa.Field); ok {
 		// The field's parent must be a pointer dereference: structVal = *structPtr.
 		structUnop, ok := field.X.(*ssa.UnOp)
 		if !ok || structUnop.Op != token.MUL {
 			return llvm.Value{}
 		}
-		// Field type must be [N]byte with 1 <= N <= 16.
+		// Field type must be [N]T with N*sizeof(T) <= 16.
 		arr, ok := field.Type().Underlying().(*types.Array)
 		if !ok {
 			return llvm.Value{}
 		}
-		basic, ok := arr.Elem().Underlying().(*types.Basic)
-		if !ok || basic.Kind() != types.Uint8 {
-			return llvm.Value{}
-		}
+		// Allow any element type where the total array fits in v128 (16 bytes).
+		elemLLVM := b.getLLVMType(arr.Elem())
+		elemSize := b.targetData.TypeAllocSize(elemLLVM)
 		n := int(arr.Len())
-		if n == 0 || n > 16 {
+		totalSize := n * int(elemSize)
+		if totalSize == 0 || totalSize > 16 {
 			return llvm.Value{}
 		}
 		// Only promote if no other real instruction uses the Field result.
@@ -4961,16 +4969,17 @@ func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value 
 		}
 
 		// Compute a GEP into the struct to get a pointer to the field, then load
-		// <N x i8> directly — avoiding the aggregate alloca round-trip.
+		// <N x T> directly — avoiding the aggregate alloca round-trip.
 		structPtr := b.getValue(structSrcPtr, getPos(field))
 		structLLVMType := b.getLLVMType(structSrcPtr.Type().Underlying().(*types.Pointer).Elem())
 		fieldGEP := b.CreateGEP(structLLVMType, structPtr, []llvm.Value{
 			llvm.ConstInt(b.ctx.Int32Type(), 0, false),
 			llvm.ConstInt(b.ctx.Int32Type(), uint64(field.Field), false),
 		}, "spmd.field.ptr")
-		vecType := llvm.VectorType(b.ctx.Int8Type(), n)
+		vecType := llvm.VectorType(elemLLVM, n)
+		align := b.targetData.ABITypeAlignment(elemLLVM)
 		load := b.CreateLoad(vecType, fieldGEP, "spmd.alloc.vec.copy")
-		load.SetAlignment(1)
+		load.SetAlignment(align)
 		registerShadow(load)
 		return load
 	}
