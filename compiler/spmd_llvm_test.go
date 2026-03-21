@@ -6822,3 +6822,118 @@ func TestSPMDVecShadowForwarding(t *testing.T) {
 		}
 	})
 }
+
+// newTestCompilerContextRelaxed creates a compiler context with both +simd128 and
+// +relaxed-simd features enabled, for testing Relaxed SIMD intrinsics.
+func newTestCompilerContextRelaxed(t *testing.T) *compilerContext {
+	t.Helper()
+	target, err := llvm.GetTargetFromTriple("wasm32-unknown-wasi")
+	if err != nil {
+		t.Fatalf("failed to get WASM target: %v", err)
+	}
+	machine := target.CreateTargetMachine("wasm32-unknown-wasi", "", "+simd128,+relaxed-simd",
+		llvm.CodeGenLevelDefault, llvm.RelocDefault, llvm.CodeModelDefault)
+	config := &Config{
+		Triple:   "wasm32-unknown-wasi",
+		Features: "+simd128,+relaxed-simd",
+	}
+	return newCompilerContext("test", machine, config, false)
+}
+
+func TestSPMDHasRelaxedSIMD(t *testing.T) {
+	tests := []struct {
+		name     string
+		triple   string
+		features string
+		want     bool
+	}{
+		{"WASM with relaxed-simd", "wasm32-unknown-wasi", "+simd128,+relaxed-simd", true},
+		{"WASM without relaxed-simd", "wasm32-unknown-wasi", "+simd128", false},
+		{"WASM with relaxed-simd only", "wasm32-unknown-wasi", "+relaxed-simd", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, err := llvm.GetTargetFromTriple(tt.triple)
+			if err != nil {
+				t.Skipf("target %s not available: %v", tt.triple, err)
+			}
+			machine := target.CreateTargetMachine(tt.triple, "", tt.features,
+				llvm.CodeGenLevelDefault, llvm.RelocDefault, llvm.CodeModelDefault)
+			config := &Config{Triple: tt.triple, Features: tt.features}
+			c := newCompilerContext("test", machine, config, false)
+			defer c.dispose()
+			if got := c.spmdHasRelaxedSIMD(); got != tt.want {
+				t.Errorf("spmdHasRelaxedSIMD() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSPMDRelaxedDotI8x16Add(t *testing.T) {
+	c := newTestCompilerContextRelaxed(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+	v16i8 := llvm.VectorType(i8Type, 16)
+	v4i32 := llvm.VectorType(i32Type, 4)
+
+	aVec := llvm.Undef(v16i8)
+	bVec := llvm.Undef(v16i8)
+	accVec := llvm.Undef(v4i32)
+
+	result := b.spmdRelaxedDotI8x16Add(aVec, bVec, accVec)
+
+	// Result must be <4 x i32>.
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatalf("expected vector result, got %v", result.Type().TypeKind())
+	}
+	if result.Type().VectorSize() != 4 {
+		t.Errorf("expected 4-lane result, got %d", result.Type().VectorSize())
+	}
+	if result.Type().ElementType() != i32Type {
+		t.Errorf("expected i32 element type")
+	}
+
+	// Verify the intrinsic appears in the module IR.
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.wasm.relaxed.dot.i8x16.i7x16.add.signed") {
+		t.Error("expected llvm.wasm.relaxed.dot.i8x16.i7x16.add.signed in module IR")
+	}
+}
+
+func TestSPMDRelaxedSwizzleUsedWhenAvailable(t *testing.T) {
+	c := newTestCompilerContextRelaxed(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i8Type := c.ctx.Int8Type()
+	i32Type := c.ctx.Int32Type()
+
+	// Build a non-identity reversed index to avoid the identity-swizzle elision.
+	indexVec := llvm.Undef(llvm.VectorType(i32Type, 4))
+	for i := 0; i < 4; i++ {
+		idx := uint64(3 - i)
+		indexVec = b.CreateInsertElement(indexVec,
+			llvm.ConstInt(i32Type, idx, false),
+			llvm.ConstInt(i32Type, uint64(i), false), "")
+	}
+	arrayVal := llvm.ConstNull(llvm.ArrayType(i8Type, 16))
+
+	_, err := b.spmdSwizzleArrayBytes(arrayVal, indexVec, 16, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.wasm.relaxed.swizzle") {
+		t.Error("expected llvm.wasm.relaxed.swizzle in module IR when relaxed-simd is available")
+	}
+	if strings.Contains(modIR, "declare") && strings.Contains(modIR, "llvm.wasm.swizzle\"") {
+		// The non-relaxed variant should not be declared when relaxed is available.
+		t.Error("found llvm.wasm.swizzle (non-relaxed) in module IR, expected only relaxed variant")
+	}
+}

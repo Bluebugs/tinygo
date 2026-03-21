@@ -1904,6 +1904,32 @@ func (c *compilerContext) spmdIsWASM() bool {
 	return strings.HasPrefix(c.Triple, "wasm")
 }
 
+// spmdHasRelaxedSIMD returns true when the target has the WebAssembly
+// relaxed-simd feature enabled. Relaxed SIMD unlocks instructions like
+// i8x16.relaxed_swizzle (undefined out-of-range behaviour instead of zero)
+// and i32x4.relaxed_dot_i8x16_i7x16_add_s.
+func (c *compilerContext) spmdHasRelaxedSIMD() bool {
+	return c.spmdIsWASM() && strings.Contains(c.Features, "+relaxed-simd")
+}
+
+// spmdRelaxedDotI8x16Add emits an i32x4.relaxed_dot_i8x16_i7x16_add_s
+// intrinsic call: result[i] = sum(a[4i+j]*b[4i+j] for j=0..3) + acc[i].
+// The second operand (bVec) must hold signed 7-bit values [-64, 63].
+func (b *builder) spmdRelaxedDotI8x16Add(a, bVec, acc llvm.Value) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+	i32Type := b.ctx.Int32Type()
+	v16i8 := llvm.VectorType(i8Type, 16)
+	v4i32 := llvm.VectorType(i32Type, 4)
+
+	const intrinsicName = "llvm.wasm.relaxed.dot.i8x16.i7x16.add.signed"
+	fnType := llvm.FunctionType(v4i32, []llvm.Type{v16i8, v16i8, v4i32}, false)
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	return b.createCall(fnType, fn, []llvm.Value{a, bVec, acc}, "spmd.relaxed.dot")
+}
+
 // spmdIsConstAllOnesMask returns true if the mask is a compile-time constant
 // with all bits set (ConstAllOnes). When true, LLVM already optimizes
 // llvm.masked.load to a plain load, so cap-based optimization is unnecessary.
@@ -2390,6 +2416,34 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		// as constant shufflevector masks on all LLVM targets. Deferred to a future
 		// phase that can generate extractelement/insertelement sequences.
 		return llvm.Value{}, b.makeError(getPos(instr), "lanes.SwizzleWithin not yet implemented")
+
+	case name == "lanes.DotProductI8x16Add":
+		// lanes.DotProductI8x16Add(a, b [16]byte, acc [4]int) [4]int
+		// Maps to i32x4.relaxed_dot_i8x16_i7x16_add_s on WASM Relaxed SIMD.
+		if !b.spmdHasRelaxedSIMD() {
+			return llvm.Value{}, b.makeError(getPos(instr), "lanes.DotProductI8x16Add requires +relaxed-simd target feature")
+		}
+		pos := getPos(instr)
+		aVal := b.getValue(instr.Args[0], pos)
+		bVal := b.getValue(instr.Args[1], pos)
+		accVal := b.getValue(instr.Args[2], pos)
+
+		v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
+		v4i32 := llvm.VectorType(b.ctx.Int32Type(), 4)
+
+		// Bitcast from aggregate [16 x i8] to <16 x i8> if needed.
+		if aVal.Type().TypeKind() == llvm.ArrayTypeKind {
+			aVal = b.CreateBitCast(aVal, v16i8, "dot.a")
+		}
+		if bVal.Type().TypeKind() == llvm.ArrayTypeKind {
+			bVal = b.CreateBitCast(bVal, v16i8, "dot.b")
+		}
+		// Bitcast from aggregate [4 x i32] to <4 x i32> if needed.
+		if accVal.Type().TypeKind() == llvm.ArrayTypeKind {
+			accVal = b.CreateBitCast(accVal, v4i32, "dot.acc")
+		}
+
+		return b.spmdRelaxedDotI8x16Add(aVal, bVal, accVal), nil
 
 	default:
 		return llvm.Value{}, b.makeError(getPos(instr), "unsupported lanes builtin: "+name)
@@ -5229,9 +5283,13 @@ func (b *builder) spmdWasmSwizzle(tableBytes []byte, index llvm.Value, laneCount
 	if spmdIsIdentitySwizzleIndex(idxVec) {
 		result = tableVec
 	} else {
-		// Call @llvm.wasm.swizzle(<16 x i8>, <16 x i8>).
-		// Note: the intrinsic has no type suffix — always @llvm.wasm.swizzle.
+		// Call @llvm.wasm.swizzle or @llvm.wasm.relaxed.swizzle.
+		// The relaxed variant allows undefined behaviour for out-of-range indices,
+		// which LLVM may exploit for better codegen. Requires +relaxed-simd.
 		intrinsicName := "llvm.wasm.swizzle"
+		if b.spmdHasRelaxedSIMD() {
+			intrinsicName = "llvm.wasm.relaxed.swizzle"
+		}
 		fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
 		fn := b.mod.NamedFunction(intrinsicName)
 		if fn.IsNil() {
@@ -5433,8 +5491,11 @@ func (b *builder) spmdCoalescedGather(expr *ssa.IndexAddr, arrayPtr, index llvm.
 	isValid := b.CreateICmp(llvm.IntNE, validMaskVec, llvm.ConstNull(v16i8), "gather.valid")
 	mergedIdx := b.CreateSelect(isValid, indexed, invalidFill, "gather.merged.idx")
 
-	// Emit a single i8x16.swizzle for the whole group.
+	// Emit a single i8x16.swizzle (or relaxed variant) for the whole group.
 	intrinsicName := "llvm.wasm.swizzle"
+	if b.spmdHasRelaxedSIMD() {
+		intrinsicName = "llvm.wasm.relaxed.swizzle"
+	}
 	fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
 	fn := b.mod.NamedFunction(intrinsicName)
 	if fn.IsNil() {
@@ -5515,8 +5576,11 @@ func (b *builder) spmdSwizzleWithTable(tableVec, index llvm.Value, laneCount int
 	if spmdIsIdentitySwizzleIndex(idxVec) {
 		swizzled = tableVec
 	} else {
-		// Call @llvm.wasm.swizzle(<16 x i8>, <16 x i8>).
+		// Call @llvm.wasm.swizzle or @llvm.wasm.relaxed.swizzle.
 		intrinsicName := "llvm.wasm.swizzle"
+		if b.spmdHasRelaxedSIMD() {
+			intrinsicName = "llvm.wasm.relaxed.swizzle"
+		}
 		fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
 		fn := b.mod.NamedFunction(intrinsicName)
 		if fn.IsNil() {
