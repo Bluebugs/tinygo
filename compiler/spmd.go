@@ -2431,16 +2431,16 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
 		v4i32 := llvm.VectorType(b.ctx.Int32Type(), 4)
 
-		// Bitcast from aggregate [16 x i8] to <16 x i8> if needed.
+		// Convert aggregate [N x T] to <N x T> vector via ExtractValue+InsertElement.
+		// Direct bitcast between aggregate and vector types is illegal in LLVM IR.
 		if aVal.Type().TypeKind() == llvm.ArrayTypeKind {
-			aVal = b.CreateBitCast(aVal, v16i8, "dot.a")
+			aVal = b.spmdAggregateToVector(aVal, v16i8, 16, "dot.a")
 		}
 		if bVal.Type().TypeKind() == llvm.ArrayTypeKind {
-			bVal = b.CreateBitCast(bVal, v16i8, "dot.b")
+			bVal = b.spmdAggregateToVector(bVal, v16i8, 16, "dot.b")
 		}
-		// Bitcast from aggregate [4 x i32] to <4 x i32> if needed.
 		if accVal.Type().TypeKind() == llvm.ArrayTypeKind {
-			accVal = b.CreateBitCast(accVal, v4i32, "dot.acc")
+			accVal = b.spmdAggregateToVector(accVal, v4i32, 4, "dot.acc")
 		}
 
 		return b.spmdRelaxedDotI8x16Add(aVal, bVal, accVal), nil
@@ -5309,6 +5309,21 @@ func (b *builder) spmdWasmSwizzle(tableBytes []byte, index llvm.Value, laneCount
 	}
 
 	return result
+}
+
+// spmdAggregateToVector converts an aggregate [N x T] value to a <N x T> LLVM
+// vector using ExtractValue + InsertElement. Direct bitcast between aggregate
+// and vector types is illegal in LLVM IR, so this register-only sequence is
+// required. name is used as the InsertElement instruction name prefix.
+func (b *builder) spmdAggregateToVector(agg llvm.Value, vecType llvm.Type, n int, name string) llvm.Value {
+	i32Type := b.ctx.Int32Type()
+	vec := llvm.ConstNull(vecType)
+	for i := 0; i < n; i++ {
+		elem := b.CreateExtractValue(agg, i, "")
+		vec = b.CreateInsertElement(vec, elem,
+			llvm.ConstInt(i32Type, uint64(i), false), name)
+	}
+	return vec
 }
 
 // spmdSwizzleArrayBytes uses i8x16.swizzle to perform vectorized byte lookup

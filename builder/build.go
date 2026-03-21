@@ -890,6 +890,13 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 					args = append(args, "--asyncify")
 				}
 
+				// Enable relaxed SIMD feature in wasm-opt when the target uses it.
+				// wasm-opt 105 parses relaxed SIMD instructions only when explicitly
+				// enabled; without this flag it rejects the WASM binary at parse time.
+				if strings.Contains(config.Features(), "+relaxed-simd") {
+					args = append(args, "--enable-relaxed-simd")
+				}
+
 				inputFile := result.Binary
 				result.Binary = result.Executable + ".wasmopt"
 				args = append(args,
