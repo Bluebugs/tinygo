@@ -12,24 +12,31 @@ func TestFeaturesAutoSIMD128(t *testing.T) {
 		want         string
 	}{
 		{
-			name:         "SPMD+WASM adds simd128",
+			name:         "SPMD+WASM adds simd128 and relaxed-simd",
 			goExperiment: "spmd",
 			goarch:       "wasm",
-			want:         "+simd128",
+			want:         "+simd128,+relaxed-simd",
 		},
 		{
 			name:         "SPMD+WASM with existing features",
 			goExperiment: "spmd",
 			goarch:       "wasm",
 			features:     "+bulk-memory,+sign-ext",
-			want:         "+bulk-memory,+sign-ext,+simd128",
+			want:         "+bulk-memory,+sign-ext,+simd128,+relaxed-simd",
 		},
 		{
 			name:         "SPMD+WASM already has simd128",
 			goExperiment: "spmd",
 			goarch:       "wasm",
 			features:     "+bulk-memory,+simd128,+sign-ext",
-			want:         "+bulk-memory,+simd128,+sign-ext",
+			want:         "+bulk-memory,+simd128,+sign-ext,+relaxed-simd",
+		},
+		{
+			name:         "SPMD+WASM already has relaxed-simd",
+			goExperiment: "spmd",
+			goarch:       "wasm",
+			features:     "+bulk-memory,+simd128,+relaxed-simd",
+			want:         "+bulk-memory,+simd128,+relaxed-simd",
 		},
 		{
 			name:         "no SPMD does not add simd128",
@@ -51,7 +58,7 @@ func TestFeaturesAutoSIMD128(t *testing.T) {
 			goarch:       "wasm",
 			features:     "+bulk-memory",
 			llvmFeatures: "+sign-ext",
-			want:         "+bulk-memory,+sign-ext,+simd128",
+			want:         "+bulk-memory,+sign-ext,+simd128,+relaxed-simd",
 		},
 		{
 			name:         "SPMD+WASM llvm-features has simd128",
@@ -59,7 +66,7 @@ func TestFeaturesAutoSIMD128(t *testing.T) {
 			goarch:       "wasm",
 			features:     "+bulk-memory",
 			llvmFeatures: "+simd128",
-			want:         "+bulk-memory,+simd128",
+			want:         "+bulk-memory,+simd128,+relaxed-simd",
 		},
 		{
 			name:         "empty everything",
@@ -78,7 +85,7 @@ func TestFeaturesAutoSIMD128(t *testing.T) {
 			name:         "SPMD among multiple experiments",
 			goExperiment: "foo,spmd,bar",
 			goarch:       "wasm",
-			want:         "+simd128",
+			want:         "+simd128,+relaxed-simd",
 		},
 	}
 

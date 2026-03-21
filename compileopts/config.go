@@ -68,7 +68,7 @@ func (c *Config) Features() string {
 			features = features + "," + c.Options.LLVMFeatures
 		}
 	}
-	// Auto-enable SIMD128 for WASM targets when SPMD experiment is active.
+	// Auto-enable SIMD128 and relaxed-simd for WASM targets when SPMD experiment is active.
 	if hasExperiment(c.Options.GOExperiment, "spmd") && c.Target.GOARCH == "wasm" {
 		if !strings.Contains(features, "+simd128") {
 			if features == "" {
@@ -76,6 +76,9 @@ func (c *Config) Features() string {
 			} else {
 				features = features + ",+simd128"
 			}
+		}
+		if !strings.Contains(features, "+relaxed-simd") {
+			features = features + ",+relaxed-simd"
 		}
 	}
 	return features
