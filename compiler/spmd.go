@@ -395,6 +395,10 @@ func (b *builder) arrayToVector(arr llvm.Value, vecType llvm.Type) llvm.Value {
 // Used by MakeInterface to box lanes.Varying[T] vectors as [N]T arrays for interface packing.
 func (b *builder) vectorToArray(vec llvm.Value) llvm.Value {
 	vecType := vec.Type()
+	// Aggregate varying types (strings, structs) are already [N x T] arrays.
+	if vecType.TypeKind() == llvm.ArrayTypeKind {
+		return vec
+	}
 	n := vecType.VectorSize()
 	elemType := vecType.ElementType()
 	arrType := llvm.ArrayType(elemType, n)
@@ -2370,6 +2374,28 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		// lanes.Broadcast[T](value, lane) — extract element at lane index, splat to all lanes
 		vec := b.getValue(instr.Args[0], getPos(instr))
 		lane := b.getValue(instr.Args[1], getPos(instr))
+		if vec.Type().TypeKind() == llvm.ArrayTypeKind {
+			// Aggregate types use [N x T] arrays, not LLVM vectors.
+			// Extract via alloca + variable-index GEP, then fill all slots.
+			laneCount := vec.Type().ArrayLength()
+			elemType := vec.Type().ElementType()
+			alloca := b.CreateAlloca(vec.Type(), "broadcast.arr")
+			b.CreateStore(vec, alloca)
+			idx := lane
+			if idx.Type() != b.ctx.Int32Type() {
+				idx = b.CreateTrunc(idx, b.ctx.Int32Type(), "")
+			}
+			gep := b.CreateInBoundsGEP(vec.Type(), alloca, []llvm.Value{
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+				idx,
+			}, "broadcast.gep")
+			elem := b.CreateLoad(elemType, gep, "broadcast.elem")
+			result := llvm.Undef(vec.Type())
+			for i := 0; i < laneCount; i++ {
+				result = b.CreateInsertValue(result, elem, i, "")
+			}
+			return result, nil
+		}
 		elem := b.CreateExtractElement(vec, lane, "broadcast.elem")
 		return b.splatScalar(elem, vec.Type()), nil
 
