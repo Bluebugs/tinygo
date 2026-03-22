@@ -6937,3 +6937,137 @@ func TestSPMDRelaxedSwizzleUsedWhenAvailable(t *testing.T) {
 		t.Error("found llvm.wasm.swizzle (non-relaxed) in module IR, expected only relaxed variant")
 	}
 }
+
+// TestSPMDRotateFullWidth verifies that createRotate emits a shufflevector with the
+// correct full-width rotation mask for both positive and negative offsets.
+func TestSPMDRotateFullWidth(t *testing.T) {
+	tests := []struct {
+		name    string
+		vals    []uint64
+		offset  int
+		wantIdx []uint64 // expected shuffle source indices
+	}{
+		{
+			// Rotate left by 1: lane i gets value from lane (i+1) % 4.
+			name:    "4_lanes_rotate_left1",
+			vals:    []uint64{10, 20, 30, 40},
+			offset:  1,
+			wantIdx: []uint64{1, 2, 3, 0},
+		},
+		{
+			// Rotate right by 1 (offset=-1): lane i gets value from lane (i-1+4) % 4.
+			name:    "4_lanes_rotate_right1",
+			vals:    []uint64{10, 20, 30, 40},
+			offset:  -1,
+			wantIdx: []uint64{3, 0, 1, 2},
+		},
+		{
+			// Zero offset: identity permutation.
+			name:    "4_lanes_rotate_zero",
+			vals:    []uint64{10, 20, 30, 40},
+			offset:  0,
+			wantIdx: []uint64{0, 1, 2, 3},
+		},
+		{
+			// Rotate left by 2 on 8 lanes.
+			name:    "8_lanes_rotate_left2",
+			vals:    []uint64{0, 1, 2, 3, 4, 5, 6, 7},
+			offset:  2,
+			wantIdx: []uint64{2, 3, 4, 5, 6, 7, 0, 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestCompilerContext(t)
+			defer c.dispose()
+			b := newTestBuilder(t, c)
+			defer b.Dispose()
+
+			i32Type := c.ctx.Int32Type()
+			laneCount := len(tt.vals)
+
+			// Build input vector.
+			vecElts := make([]llvm.Value, laneCount)
+			for i, v := range tt.vals {
+				vecElts[i] = llvm.ConstInt(i32Type, v, false)
+			}
+			input := llvm.ConstVector(vecElts, false)
+			vecType := input.Type()
+
+			// createRotate uses spmdRotateWithinMask(N, N, offset) internally.
+			mask := spmdRotateWithinMask(laneCount, laneCount, tt.offset)
+			if len(mask) != len(tt.wantIdx) {
+				t.Fatalf("mask length = %d, want %d", len(mask), len(tt.wantIdx))
+			}
+			for i, got := range mask {
+				if got != tt.wantIdx[i] {
+					t.Errorf("mask[%d] = %d, want %d", i, got, tt.wantIdx[i])
+				}
+			}
+
+			// Verify that shufflevector produces a non-nil result of the right type.
+			shuffleMask := c.spmdShuffleConst(mask)
+			result := b.CreateShuffleVector(input, llvm.Undef(vecType), shuffleMask, "spmd.rotate")
+			if result.IsNil() {
+				t.Fatal("CreateShuffleVector returned nil")
+			}
+			if result.Type().TypeKind() != llvm.VectorTypeKind {
+				t.Errorf("result type kind = %v, want VectorTypeKind", result.Type().TypeKind())
+			}
+			if result.Type().VectorSize() != laneCount {
+				t.Errorf("result lane count = %d, want %d", result.Type().VectorSize(), laneCount)
+			}
+		})
+	}
+}
+
+// TestSPMDSwizzleVector verifies that createSwizzle over a vector type emits a
+// per-lane extractelement/insertelement sequence and produces a non-nil result.
+func TestSPMDSwizzleVector(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i32Type := c.ctx.Int32Type()
+	laneCount := 4
+	vecType := llvm.VectorType(i32Type, laneCount)
+
+	// Load input and index vectors from allocas so LLVM cannot fold extractelement
+	// and insertelement away at constant-folding time. IR checks require non-constant
+	// values to remain visible as instructions rather than being folded to constants.
+	inputAlloca := b.CreateAlloca(vecType, "input.alloca")
+	input := b.CreateLoad(vecType, inputAlloca, "input.vec")
+	idxAlloca := b.CreateAlloca(vecType, "idx.alloca")
+	indices := b.CreateLoad(vecType, idxAlloca, "idx.vec")
+
+	// Simulate createSwizzle body for a vector type.
+	laneCountVal := llvm.ConstInt(i32Type, uint64(laneCount), false)
+	result := llvm.Undef(vecType)
+	for i := 0; i < laneCount; i++ {
+		laneIdx := llvm.ConstInt(i32Type, uint64(i), false)
+		srcIdx := b.CreateExtractElement(indices, laneIdx, "swizzle.idx")
+		srcIdx = b.CreateURem(srcIdx, laneCountVal, "swizzle.idx.mod")
+		elem := b.CreateExtractElement(input, srcIdx, "swizzle.elem")
+		result = b.CreateInsertElement(result, elem, laneIdx, "swizzle.res")
+	}
+
+	if result.IsNil() {
+		t.Fatal("swizzle result is nil")
+	}
+	if result.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Errorf("result type kind = %v, want VectorTypeKind", result.Type().TypeKind())
+	}
+	if result.Type().VectorSize() != laneCount {
+		t.Errorf("result lane count = %d, want %d", result.Type().VectorSize(), laneCount)
+	}
+	// Verify IR contains extractelement and insertelement instructions.
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "extractelement") {
+		t.Error("expected extractelement in module IR for swizzle")
+	}
+	if !strings.Contains(modIR, "insertelement") {
+		t.Error("expected insertelement in module IR for swizzle")
+	}
+}

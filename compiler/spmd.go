@@ -2402,6 +2402,19 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		// Load as vector
 		return b.CreateLoad(vecType, ptr, "lanes.from"), nil
 
+	case strings.HasPrefix(name, "lanes.Rotate["):
+		// lanes.Rotate[T](value Varying[T], offset int) Varying[T]
+		// Full-width rotation: equivalent to RotateWithin with groupSize = laneCount.
+		// offset must be a compile-time constant.
+		return b.createRotate(instr)
+
+	case strings.HasPrefix(name, "lanes.Swizzle["):
+		// lanes.Swizzle[T](value Varying[T], indices Varying[int]) Varying[T]
+		// Full-width swizzle with runtime varying indices.
+		// Uses per-lane extractelement/insertelement since indices are not
+		// compile-time constants and cannot use shufflevector.
+		return b.createSwizzle(instr)
+
 	case strings.HasPrefix(name, "lanes.RotateWithin["):
 		return b.createRotateWithin(instr, name)
 
@@ -2516,6 +2529,103 @@ func spmdRotateWithinMask(totalLanes, groupSize, offset int) []uint64 {
 		mask[i] = uint64(group*groupSize + src)
 	}
 	return mask
+}
+
+// createRotate rotates all lanes of a vector by a compile-time constant offset.
+//
+// Positive offset rotates left (each lane i gets the value from lane (i+offset) % N).
+// Negative offset rotates right.
+//
+// Example: Rotate(<0,1,2,3>, offset=1) => <1,2,3,0>
+// Example: Rotate(<0,1,2,3>, offset=-1) => <3,0,1,2>
+func (b *builder) createRotate(instr *ssa.CallCommon) (llvm.Value, error) {
+	pos := getPos(instr)
+	value := b.getValue(instr.Args[0], pos)
+
+	offset, ok := spmdExtractIntConst(instr.Args[1])
+	if !ok {
+		return llvm.Value{}, b.makeError(pos, "lanes.Rotate: offset must be a compile-time constant")
+	}
+
+	vecType := value.Type()
+	totalLanes := vecType.VectorSize()
+	if totalLanes == 0 {
+		// Array aggregate type: fall back to extractvalue/insertvalue
+		totalLanes = vecType.ArrayLength()
+		off := int(offset)
+		result := llvm.Undef(vecType)
+		for i := 0; i < totalLanes; i++ {
+			srcIdx := ((i+off)%totalLanes + totalLanes) % totalLanes
+			elem := b.CreateExtractValue(value, srcIdx, "rotate.elem")
+			result = b.CreateInsertValue(result, elem, i, "rotate.res")
+		}
+		return result, nil
+	}
+
+	// Vector type: use shufflevector with a constant mask.
+	mask := spmdRotateWithinMask(totalLanes, totalLanes, int(offset))
+	shuffleMask := b.spmdShuffleConst(mask)
+	return b.CreateShuffleVector(value, llvm.Undef(vecType), shuffleMask, "spmd.rotate"), nil
+}
+
+// createSwizzle reorders lanes of a vector according to a runtime varying index vector.
+//
+// For lane i, the output is value[indices[i] % laneCount].
+// Since indices are runtime values, this cannot use shufflevector; it uses
+// per-lane extractelement/insertelement instead.
+//
+// Example: Swizzle(<10,20,30,40>, <3,0,2,1>) => <40,10,30,20>
+func (b *builder) createSwizzle(instr *ssa.CallCommon) (llvm.Value, error) {
+	pos := getPos(instr)
+	value := b.getValue(instr.Args[0], pos)
+	indices := b.getValue(instr.Args[1], pos)
+
+	i32Type := b.ctx.Int32Type()
+
+	if value.Type().TypeKind() == llvm.VectorTypeKind {
+		laneCount := value.Type().VectorSize()
+		laneCountVal := llvm.ConstInt(i32Type, uint64(laneCount), false)
+		result := llvm.Undef(value.Type())
+		for i := 0; i < laneCount; i++ {
+			laneIdx := llvm.ConstInt(i32Type, uint64(i), false)
+			// Extract the source index for this output lane.
+			srcIdx := b.CreateExtractElement(indices, laneIdx, "swizzle.idx")
+			// Ensure srcIdx is i32 (indices vector may be i64 on 64-bit targets).
+			if srcIdx.Type().IntTypeWidth() != 32 {
+				srcIdx = b.CreateTrunc(srcIdx, i32Type, "swizzle.idx.trunc")
+			}
+			// Wrap to valid range [0, laneCount).
+			srcIdx = b.CreateURem(srcIdx, laneCountVal, "swizzle.idx.mod")
+			elem := b.CreateExtractElement(value, srcIdx, "swizzle.elem")
+			result = b.CreateInsertElement(result, elem, laneIdx, "swizzle.res")
+		}
+		return result, nil
+	}
+
+	if value.Type().TypeKind() == llvm.ArrayTypeKind {
+		// Aggregate [N x T]: store to alloca so we can index with variable indices.
+		laneCount := value.Type().ArrayLength()
+		laneCountVal := llvm.ConstInt(i32Type, uint64(laneCount), false)
+		elemType := value.Type().ElementType()
+		alloca := b.CreateAlloca(value.Type(), "swizzle.arr")
+		b.CreateStore(value, alloca)
+		result := llvm.Undef(value.Type())
+		for i := 0; i < laneCount; i++ {
+			laneIdx := llvm.ConstInt(i32Type, uint64(i), false)
+			srcIdx := b.CreateExtractElement(indices, laneIdx, "swizzle.idx")
+			if srcIdx.Type().IntTypeWidth() != 32 {
+				srcIdx = b.CreateTrunc(srcIdx, i32Type, "swizzle.idx.trunc")
+			}
+			srcIdx = b.CreateURem(srcIdx, laneCountVal, "swizzle.idx.mod")
+			zero := llvm.ConstInt(i32Type, 0, false)
+			gep := b.CreateInBoundsGEP(value.Type(), alloca, []llvm.Value{zero, srcIdx}, "swizzle.gep")
+			elem := b.CreateLoad(elemType, gep, "swizzle.elem")
+			result = b.CreateInsertValue(result, elem, i, "swizzle.res")
+		}
+		return result, nil
+	}
+
+	return llvm.Value{}, b.makeError(pos, "lanes.Swizzle: unsupported value type")
 }
 
 // createShiftLeftWithin shifts values left within independent groups of groupSize lanes.
