@@ -734,6 +734,13 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 	if b.spmdInfo == nil {
 		return nil
 	}
+	// Scalar fallback: skip all SPMD loop setup. The go-for loop compiles
+	// as a regular for-range loop with no vectorization. The SSA may have
+	// SPMDLoad/SPMDStore/SPMDSelect instructions from predication, but
+	// with laneCount=1 and scalar types, these degenerate to plain ops.
+	if !b.simdEnabled {
+		return nil
+	}
 
 	state := &spmdLoopState{
 		activeLoops: make(map[ssa.Value]*spmdActiveLoop),
@@ -760,6 +767,12 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 	// unreachable body block.
 	for _, ssaLoop := range b.fn.SPMDLoops {
 		if !ssaLoop.IsPeeled {
+			continue
+		}
+		// Scalar fallback: skip peeled loop setup entirely. With laneCount=1,
+		// every iteration processes 1 element — no tail phase, no masking.
+		// The peeled blocks compile as plain scalar code via Pass 1/2.
+		if !b.simdEnabled {
 			continue
 		}
 
