@@ -54,6 +54,7 @@ type Options struct {
 	Programmer      string
 	OpenOCDCommands []string
 	LLVMFeatures    string
+	SIMD            string // -simd flag: "true" (default), "false" for scalar fallback
 	Monitor         bool
 	BaudRate        int
 	Timeout         time.Duration

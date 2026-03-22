@@ -69,7 +69,7 @@ func (c *Config) Features() string {
 		}
 	}
 	// Auto-enable SIMD128 and relaxed-simd for WASM targets when SPMD experiment is active.
-	if hasExperiment(c.Options.GOExperiment, "spmd") && c.Target.GOARCH == "wasm" {
+	if c.SIMDEnabled() {
 		if !strings.Contains(features, "+simd128") {
 			if features == "" {
 				features = "+simd128"
@@ -82,6 +82,16 @@ func (c *Config) Features() string {
 		}
 	}
 	return features
+}
+
+// SIMDEnabled returns whether SIMD code generation is enabled.
+// Returns false when -simd=false is passed explicitly.
+// Returns true by default for SPMD+WASM targets.
+func (c *Config) SIMDEnabled() bool {
+	if c.Options.SIMD == "false" {
+		return false
+	}
+	return hasExperiment(c.Options.GOExperiment, "spmd") && c.Target.GOARCH == "wasm"
 }
 
 // ABI returns the -mabi= flag for this target (like -mabi=lp64). A zero-length

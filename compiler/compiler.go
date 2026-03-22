@@ -53,6 +53,7 @@ type Config struct {
 	TinyGoVersion   string // for llvm.ident
 
 	// Various compiler options that determine how code is generated.
+	SIMDEnabled        bool   // false for scalar fallback mode (-simd=false)
 	Scheduler          string
 	AutomaticStackSize bool
 	DefaultStackSize   uint64
@@ -68,6 +69,7 @@ type Config struct {
 // must not contain function-dependent data such as an IR builder.
 type compilerContext struct {
 	*Config
+	simdEnabled      bool // mirrors Config.SIMDEnabled; false for scalar fallback mode
 	DumpSSA          bool
 	mod              llvm.Module
 	ctx              llvm.Context
@@ -101,6 +103,7 @@ type compilerContext struct {
 func newCompilerContext(moduleName string, machine llvm.TargetMachine, config *Config, dumpSSA bool) *compilerContext {
 	c := &compilerContext{
 		Config:        config,
+		simdEnabled:   config.SIMDEnabled,
 		DumpSSA:       dumpSSA,
 		difiles:       make(map[string]llvm.Metadata),
 		ditypes:       make(map[types.Type]llvm.Metadata),
@@ -531,6 +534,10 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 				return llvm.ArrayType(elemType, n)
 			default:
 				laneCount := c.spmdEffectiveLaneCount(typ, elemType)
+				// Scalar fallback: laneCount==1 means Varying[T] == T (no vector).
+				if laneCount <= 1 {
+					return elemType
+				}
 				return llvm.VectorType(elemType, laneCount)
 			}
 		}

@@ -269,7 +269,11 @@ func (c *compilerContext) hasSPMDCode() bool {
 
 // spmdLaneCount returns the number of SIMD lanes for a given LLVM element type.
 // For WASM SIMD128: 128 bits / element size in bits.
+// Returns 1 in scalar fallback mode (-simd=false).
 func (c *compilerContext) spmdLaneCount(elemType llvm.Type) int {
+	if !c.simdEnabled {
+		return 1
+	}
 	elemSize := c.targetData.TypeAllocSize(elemType)
 	if elemSize == 0 {
 		return 1
@@ -418,7 +422,7 @@ func (c *compilerContext) spmdBoxedVaryingGoType(spmdType *types.SPMDType, laneC
 	// Mask element type must match spmdMaskElemType: WASM uses 128/laneCount bits
 	// (2→int64, 4→int32, 8→int16, 16→int8), non-WASM uses int8 (for i1).
 	var maskElemGoType types.Type
-	if c.spmdIsWASM() {
+	if c.spmdUsesSIMD() {
 		switch 128 / laneCount {
 		case 64:
 			maskElemGoType = types.Typ[types.Int64]
@@ -600,7 +604,7 @@ func (c *compilerContext) createSPMDConst(expr *ssa.Const, spmdType *types.SPMDT
 	// all-zeros for false — matching comparison results (sext from i1).
 	// Using ConstAllOnes ensures correct bitwise-select behavior when the
 	// boolean is used as a select operand or mask input.
-	if c.spmdIsWASM() && expr.Value.Kind() == constant.Bool {
+	if c.spmdUsesSIMD() && expr.Value.Kind() == constant.Bool {
 		if basic, ok := spmdType.Elem().Underlying().(*types.Basic); ok && basic.Info()&types.IsBoolean != 0 {
 			if constant.BoolVal(expr.Value) {
 				return llvm.ConstAllOnes(vecType)
@@ -817,6 +821,11 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		} else {
 			elemType := b.getLLVMType(mainIterPhi.Type())
 			laneCount = b.spmdLaneCount(elemType)
+		}
+
+		// Scalar fallback: override to 1 lane when SIMD is disabled.
+		if !b.simdEnabled {
+			laneCount = 1
 		}
 
 		// On WASM, rangeindex loops with more than 4 lanes use a decomposed
@@ -1783,7 +1792,7 @@ func (b *builder) isBlockInSPMDBody(block *ssa.BasicBlock) *SPMDLoopInfo {
 // @llvm.wasm.anytrue LLVM intrinsic (single WASM instruction, no bitcast).
 // On other targets the mask is <N x i1>, so we bitcast to iN and compare != 0.
 func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
-	if b.spmdIsWASM() {
+	if b.spmdUsesSIMD() {
 		// Normalize <N x i1> to WASM mask format before calling the intrinsic.
 		// The llvm.wasm.anytrue intrinsic is registered by vector type; calling
 		// llvm.wasm.anytrue.v4i1 with a <4 x i1> argument creates a custom
@@ -1814,7 +1823,7 @@ func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
 // @llvm.wasm.alltrue LLVM intrinsic (single WASM instruction, no bitcast).
 // On other targets the mask is <N x i1>.
 func (b *builder) spmdVectorAllTrue(mask llvm.Value) llvm.Value {
-	if b.spmdIsWASM() {
+	if b.spmdUsesSIMD() {
 		// Normalize <N x i1> to WASM mask format before calling the intrinsic.
 		// See spmdVectorAnyTrue for the rationale.
 		laneCount := mask.Type().VectorSize()
@@ -1908,6 +1917,12 @@ func (c *compilerContext) spmdIsWASM() bool {
 	return strings.HasPrefix(c.Triple, "wasm")
 }
 
+// spmdUsesSIMD returns true when WASM SIMD instructions should be emitted.
+// Returns false in scalar fallback mode (-simd=false) even when spmdIsWASM() is true.
+func (c *compilerContext) spmdUsesSIMD() bool {
+	return c.spmdIsWASM() && c.simdEnabled
+}
+
 // spmdHasRelaxedSIMD returns true when the target has the WebAssembly
 // relaxed-simd feature enabled. Relaxed SIMD unlocks instructions like
 // i8x16.relaxed_swizzle (undefined out-of-range behaviour instead of zero)
@@ -1950,7 +1965,7 @@ func (b *builder) spmdIsConstAllOnesMask(mask llvm.Value) bool {
 // 128-bit v128 register: i32 for 4 lanes, i16 for 8, i8 for 16.
 // On other targets this is always i1 (native LLVM boolean vector element).
 func (c *compilerContext) spmdMaskElemType(laneCount int) llvm.Type {
-	if c.spmdIsWASM() {
+	if c.spmdUsesSIMD() {
 		return c.ctx.IntType(128 / laneCount) // 4→i32, 8→i16, 16→i8
 	}
 	return c.ctx.Int1Type()
@@ -1988,7 +2003,7 @@ func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
 // On non-WASM targets this is a no-op. LLVM's WASM backend folds sext(cmp)
 // into a single WASM comparison instruction, so there is no runtime cost.
 func (b *builder) spmdWrapMask(cmp llvm.Value, laneCount int) llvm.Value {
-	if !b.spmdIsWASM() {
+	if !b.spmdUsesSIMD() {
 		return cmp
 	}
 	maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
@@ -2012,7 +2027,7 @@ func (b *builder) spmdWrapMask(cmp llvm.Value, laneCount int) llvm.Value {
 // from Varying[mask] used with a 16-lane byte loop), spmdConvertMaskFormat
 // first reshapes the mask to <laneCount x i1> before any truncation.
 func (b *builder) spmdUnwrapMaskForIntrinsic(mask llvm.Value, laneCount int) llvm.Value {
-	if !b.spmdIsWASM() {
+	if !b.spmdUsesSIMD() {
 		return mask
 	}
 	i1MaskType := llvm.VectorType(b.ctx.Int1Type(), laneCount)
@@ -2040,7 +2055,7 @@ func (b *builder) spmdUnwrapMaskForIntrinsic(mask llvm.Value, laneCount int) llv
 // <4 x f32> data). For mismatched widths we fall back to truncating the mask
 // to <N x i1> and using LLVM's native CreateSelect.
 func (b *builder) spmdMaskSelect(mask, trueVal, falseVal llvm.Value) llvm.Value {
-	if !b.spmdIsWASM() {
+	if !b.spmdUsesSIMD() {
 		return b.CreateSelect(mask, trueVal, falseVal, "")
 	}
 
@@ -2080,7 +2095,7 @@ func (b *builder) spmdMaskSelect(mask, trueVal, falseVal llvm.Value) llvm.Value 
 // of whether the input is already <N x i1> or <N x i32> (WASM format).
 // Used by reduce.All/Count/FindFirstSet/Mask which need a compact bit representation.
 func (b *builder) spmdNormalizeBoolVecToI1(vec llvm.Value) llvm.Value {
-	if !b.spmdIsWASM() {
+	if !b.spmdUsesSIMD() {
 		return vec // already <N x i1>
 	}
 	// WASM: vec is <N x i32> (all-ones/all-zeros). Truncate to <N x i1>.
@@ -2097,8 +2112,8 @@ func (b *builder) spmdMatchMaskFormat(cond, refMask llvm.Value) llvm.Value {
 	if cond.Type() == refMask.Type() {
 		return cond
 	}
-	if !b.spmdIsWASM() {
-		return cond // non-WASM: masks are always <N x i1>, no conversion needed
+	if !b.spmdUsesSIMD() {
+		return cond // non-WASM-SIMD: masks are always <N x i1>, no conversion needed
 	}
 	condType := cond.Type()
 	if condType.TypeKind() != llvm.VectorTypeKind {
@@ -2336,6 +2351,30 @@ func spmdIsFloat(t types.Type) bool {
 // createLanesBuiltin handles interception of lanes.* function calls.
 // Returns the LLVM value result and nil error on success.
 func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	// Scalar fallback: with laneCount=1, lanes builtins degenerate to scalar ops.
+	if !b.simdEnabled {
+		switch {
+		case name == "lanes.Index":
+			elemType := b.getLLVMType(instr.Signature().Results().At(0).Type().(*types.SPMDType).Elem())
+			return llvm.ConstInt(elemType, 0, false), nil // single lane = index 0
+		case strings.HasPrefix(name, "lanes.Count["):
+			return llvm.ConstInt(b.intType, 1, false), nil // 1 lane
+		case strings.HasPrefix(name, "lanes.Broadcast["),
+			strings.HasPrefix(name, "lanes.Rotate["),
+			strings.HasPrefix(name, "lanes.Swizzle["),
+			strings.HasPrefix(name, "lanes.ShiftLeft["),
+			strings.HasPrefix(name, "lanes.ShiftRight["),
+			strings.HasPrefix(name, "lanes.From["),
+			strings.HasPrefix(name, "lanes.RotateWithin["),
+			strings.HasPrefix(name, "lanes.ShiftLeftWithin["),
+			strings.HasPrefix(name, "lanes.ShiftRightWithin["),
+			strings.HasPrefix(name, "lanes.SwizzleWithin["),
+			strings.HasPrefix(name, "lanes.DotProductI8x16Add["):
+			// Single lane: all cross-lane ops are identity.
+			return b.getValue(instr.Args[0], getPos(instr)), nil
+		}
+	}
+
 	switch {
 	case name == "lanes.Index":
 		// lanes.Index() returns <0, 1, 2, ..., N-1> as Varying[int]
@@ -2966,6 +3005,24 @@ func (b *builder) spmdMaskArithVec(vec, mask llvm.Value, identity llvm.Value) ll
 // createReduceBuiltin handles interception of reduce.* function calls.
 // Returns the LLVM value result and nil error on success.
 func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	// Scalar fallback: with laneCount=1, the input is a scalar (not a vector).
+	// Reduction of a single element is identity — return the value directly.
+	// Exception: reduce.From needs to wrap in a 1-element slice.
+	if !b.simdEnabled && !strings.HasPrefix(name, "reduce.From[") {
+		val := b.getValue(instr.Args[0], getPos(instr))
+		// Boolean reductions (Any, All) return the bool directly.
+		// Numeric reductions (Add, Mul, Min, Max) return the scalar.
+		// FindFirstSet returns 0 (only lane 0 exists).
+		// Count returns 1 if true, 0 if false.
+		if strings.HasPrefix(name, "reduce.FindFirstSet[") {
+			return llvm.ConstInt(b.intType, 0, false), nil
+		}
+		if strings.HasPrefix(name, "reduce.Count[") {
+			return b.CreateZExt(val, b.intType, ""), nil
+		}
+		return val, nil
+	}
+
 	switch {
 	case strings.HasPrefix(name, "reduce.Add["):
 		vec := b.getValue(instr.Args[0], getPos(instr))
@@ -3204,7 +3261,7 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		// / i64x2.bitmask intrinsic which extracts the high bit of each lane.
 		vec := b.getValue(instr.Args[0], getPos(instr))
 		masked := b.spmdMaskBoolVecForAny(vec, b.spmdGetReduceMask(instr))
-		if b.spmdIsWASM() {
+		if b.spmdUsesSIMD() {
 			// Ensure masked is in WASM mask format (<N x iW>, not <N x i1>).
 			// spmdMaskBoolVecForAny returns <N x i1>; sign-extend to WASM format.
 			if masked.Type().ElementType() == b.ctx.Int1Type() {
@@ -3371,7 +3428,7 @@ func (b *builder) spmdFullLoadWithSelect(vecType llvm.Type, ci *spmdContiguousIn
 // `<N x i32>` load to read N×4 bytes instead of N×1 bytes.
 // Returns the per-element memory width in bits (e.g., 8 for bool, 8 for uint8).
 func (b *builder) spmdNarrowLoadElemBits(ssaElemType types.Type, laneCount int) uint64 {
-	if !b.spmdIsWASM() {
+	if !b.spmdUsesSIMD() {
 		return 0
 	}
 	targetLLVMElem := b.getLLVMType(ssaElemType)
@@ -3435,7 +3492,7 @@ func (b *builder) spmdMaskedLoadNarrow(targetElemBits uint64, ptr llvm.Value, la
 // lower <4 x i8> vectors, so createConvert keeps byte values in <4 x i32> and
 // relies on the store path to pack them correctly.
 func (b *builder) spmdNarrowStoreElemBits(val llvm.Value, ssaElemType types.Type) uint64 {
-	if !b.spmdIsWASM() {
+	if !b.spmdUsesSIMD() {
 		return 0
 	}
 	if val.Type().TypeKind() != llvm.VectorTypeKind {
@@ -3528,7 +3585,7 @@ func (b *builder) spmdMaskedStore(val, ptr, mask llvm.Value) {
 	// WASM: sub-128-bit vectors (e.g., <4 x i8> = 32 bits) cannot be stored with a
 	// SIMD masked store intrinsic. Pack the sub-vector into a scalar integer and use
 	// a load-blend-store pattern instead.
-	if b.spmdIsWASM() {
+	if b.spmdUsesSIMD() {
 		vecBits := uint64(b.targetData.TypeAllocSize(vecType)) * 8
 		if vecBits < 128 {
 			scalarType := b.ctx.IntType(int(vecBits))
@@ -3599,7 +3656,7 @@ func (b *builder) spmdFullStoreWithBlend(val llvm.Value, ci *spmdContiguousInfo,
 	if b.spmdIsAllocaOrigin(ci) {
 		// WASM: sub-128-bit vectors (e.g., <4 x i8>) cannot use SIMD load/store.
 		// Pack to scalar, blend as integer, store back.
-		if b.spmdIsWASM() {
+		if b.spmdUsesSIMD() {
 			vecBits := uint64(b.targetData.TypeAllocSize(vecType)) * 8
 			if vecBits < 128 {
 				scalarType := b.ctx.IntType(int(vecBits))
@@ -3633,7 +3690,7 @@ func (b *builder) spmdFullStoreWithBlend(val llvm.Value, ci *spmdContiguousInfo,
 		// Shadow tracking is NOT updated here — this path targets SPMD loop output
 		// allocas, which are distinct from the byte-array copy allocas tracked by
 		// spmdVecShadow.
-		if b.spmdIsWASM() {
+		if b.spmdUsesSIMD() {
 			if alloc, ok := ci.ssaSource.(*ssa.Alloc); ok {
 				ptrType, ptrOK := alloc.Type().Underlying().(*types.Pointer)
 				if ptrOK {
@@ -4740,7 +4797,7 @@ func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.
 	}
 
 	// SPMD: on WASM, use i8x16.swizzle for const string lookups of <=16 bytes.
-	if b.spmdIsWASM() {
+	if b.spmdUsesSIMD() {
 		if constVal, ok := expr.X.(*ssa.Const); ok {
 			if constVal.Value != nil && constVal.Value.Kind() == constant.String {
 				strVal := constant.StringVal(constVal.Value)
@@ -4757,7 +4814,7 @@ func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.
 	// Each loaded i8 byte is zero-extended to the wider element type during insertion.
 	bufElemType := b.ctx.Int8Type()
 	resultElemType := bufElemType
-	if b.spmdIsWASM() {
+	if b.spmdUsesSIMD() {
 		vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(bufElemType, laneCount))) * 8
 		if vecBits < 128 {
 			resultElemType = b.spmdMaskElemType(laneCount)
@@ -4802,7 +4859,7 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 
 	// WASM fast paths.
 	elemType := arrayType.ElementType()
-	if b.spmdIsWASM() {
+	if b.spmdUsesSIMD() {
 		elemSize := b.targetData.TypeAllocSize(elemType)
 		totalSize := int(xType.Len()) * int(elemSize)
 
@@ -4900,7 +4957,7 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 	// Each loaded byte is zero-extended to the wider element type during insertion
 	// rather than after, so no intermediate sub-128-bit vector is ever created.
 	resultElemType := elemType
-	if b.spmdIsWASM() {
+	if b.spmdUsesSIMD() {
 		vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(elemType, laneCount))) * 8
 		if vecBits < 128 {
 			resultElemType = b.spmdMaskElemType(laneCount)
@@ -4947,7 +5004,7 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 //
 // Returns llvm.Value{} (nil) when the pattern does not match.
 func (b *builder) spmdPromoteByteArrayCopyToVector(instr *ssa.Store) llvm.Value {
-	if !b.spmdIsWASM() {
+	if !b.spmdUsesSIMD() {
 		return llvm.Value{}
 	}
 	// Destination must be a local stack alloc.
@@ -5742,7 +5799,7 @@ func (b *builder) spmdSwizzleWithTable(tableVec, index llvm.Value, laneCount int
 
 	// Determine result element type. On WASM, widen bytes to avoid sub-128-bit vectors.
 	resultElemType := i8Type
-	if b.spmdIsWASM() {
+	if b.spmdUsesSIMD() {
 		vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(i8Type, laneCount))) * 8
 		if vecBits < 128 {
 			resultElemType = b.spmdMaskElemType(laneCount)
@@ -6545,7 +6602,7 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 				elemType = b.ctx.Int8Type()
 			}
 			// WASM sub-128-bit widening.
-			if b.spmdIsWASM() {
+			if b.spmdUsesSIMD() {
 				vecBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8 * uint64(laneCount)
 				if vecBits < 128 {
 					elemType = b.spmdMaskElemType(laneCount)

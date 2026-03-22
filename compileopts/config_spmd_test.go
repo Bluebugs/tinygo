@@ -1,6 +1,9 @@
 package compileopts
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestFeaturesAutoSIMD128(t *testing.T) {
 	tests := []struct {
@@ -106,6 +109,45 @@ func TestFeaturesAutoSIMD128(t *testing.T) {
 				t.Errorf("Features() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSIMDDisabledSuppressesFeatures(t *testing.T) {
+	c := &Config{
+		Options: &Options{
+			GOExperiment: "spmd",
+			SIMD:         "false",
+		},
+		Target: &TargetSpec{GOARCH: "wasm"},
+	}
+	features := c.Features()
+	if strings.Contains(features, "+simd128") {
+		t.Errorf("expected no +simd128 with -simd=false, got: %s", features)
+	}
+}
+
+func TestSIMDDefaultEnabled(t *testing.T) {
+	c := &Config{
+		Options: &Options{GOExperiment: "spmd"},
+		Target:  &TargetSpec{GOARCH: "wasm"},
+	}
+	features := c.Features()
+	if !strings.Contains(features, "+simd128") {
+		t.Errorf("expected +simd128 by default with SPMD+WASM, got: %s", features)
+	}
+}
+
+func TestSIMDEnabledMethod(t *testing.T) {
+	c := &Config{
+		Options: &Options{GOExperiment: "spmd"},
+		Target:  &TargetSpec{GOARCH: "wasm"},
+	}
+	if !c.SIMDEnabled() {
+		t.Error("expected SIMDEnabled() == true for SPMD+WASM")
+	}
+	c.Options.SIMD = "false"
+	if c.SIMDEnabled() {
+		t.Error("expected SIMDEnabled() == false with -simd=false")
 	}
 }
 
