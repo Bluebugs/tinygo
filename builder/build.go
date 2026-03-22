@@ -230,7 +230,8 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 
 	// Load entire program AST into memory.
 	lprogram, err := loader.Load(config, pkgName, types.Config{
-		Sizes: compiler.Sizes(machine),
+		Sizes:            compiler.Sizes(machine),
+		SIMDRegisterSize: config.SIMDRegisterSize(),
 	})
 	if err != nil {
 		return BuildResult{}, err

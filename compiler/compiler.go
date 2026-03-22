@@ -4292,6 +4292,26 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 		return b.splatScalar(converted, vecType), nil
 	}
 
+	// MaskType conversions (scalar fallback path): bool → mask.
+	// In scalar mode, Varying[bool] = i1 and Varying[mask] = i32 (WASM) or i1 (non-WASM).
+	// The recursive call from the SPMDType section arrives here with typeFrom=bool, typeTo=mask.
+	if spmdtypes.IsMask(typeTo) {
+		maskLLVM := b.getLLVMType(typeTo)
+		if value.Type() == maskLLVM {
+			return value, nil
+		}
+		// Sign-extend i1 bool to mask width (i32 on WASM, i1 elsewhere).
+		if value.Type() == b.ctx.Int1Type() {
+			if maskLLVM == b.ctx.Int1Type() {
+				return value, nil
+			}
+			return b.CreateSExt(value, maskLLVM, ""), nil
+		}
+		// Truncate wider integer to bool width then extend.
+		i1 := b.CreateTrunc(value, b.ctx.Int1Type(), "")
+		return b.CreateSExt(i1, maskLLVM, ""), nil
+	}
+
 	// Conversion between unsafe.Pointer and uintptr.
 	isPtrFrom := isPointer(typeFrom.Underlying())
 	isPtrTo := isPointer(typeTo.Underlying())

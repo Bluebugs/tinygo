@@ -269,7 +269,8 @@ func (c *compilerContext) hasSPMDCode() bool {
 
 // spmdLaneCount returns the number of SIMD lanes for a given LLVM element type.
 // For WASM SIMD128: 128 bits / element size in bits.
-// Returns 1 in scalar fallback mode (-simd=false).
+// Returns 1 in scalar fallback mode (-simd=false) so that Varying[T] maps to
+// the scalar T LLVM type rather than a vector type.
 func (c *compilerContext) spmdLaneCount(elemType llvm.Type) int {
 	if !c.simdEnabled {
 		return 1
@@ -590,6 +591,8 @@ func (c *compilerContext) createSPMDConst(expr *ssa.Const, spmdType *types.SPMDT
 
 	// Varying[mask] element type (MaskType) has no scalar constant form.
 	// Generate all-ones (true) or all-zeros (false) mask vector directly.
+	// Handle before the scalar early-return since MaskType.Elem() is not
+	// a valid constant type for createConst.
 	if spmdtypes.IsMask(spmdType.Elem()) {
 		if expr.Value.Kind() != constant.Bool {
 			panic(fmt.Sprintf("createSPMDConst: Varying[mask] constant has unexpected kind %v", expr.Value.Kind()))
@@ -598,6 +601,12 @@ func (c *compilerContext) createSPMDConst(expr *ssa.Const, spmdType *types.SPMDT
 			return llvm.ConstAllOnes(vecType)
 		}
 		return llvm.ConstNull(vecType)
+	}
+
+	// Scalar fallback: laneCount=1, vecType is scalar T. Create scalar constant directly.
+	if !c.simdEnabled {
+		scalarConst := ssa.NewConst(expr.Value, spmdType.Elem())
+		return c.createConst(scalarConst, pos)
 	}
 
 	// Varying[bool] constants use the WASM mask format: all-ones for true,
@@ -734,13 +743,6 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 	if b.spmdInfo == nil {
 		return nil
 	}
-	// Scalar fallback: skip all SPMD loop setup. The go-for loop compiles
-	// as a regular for-range loop with no vectorization. The SSA may have
-	// SPMDLoad/SPMDStore/SPMDSelect instructions from predication, but
-	// with laneCount=1 and scalar types, these degenerate to plain ops.
-	if !b.simdEnabled {
-		return nil
-	}
 
 	state := &spmdLoopState{
 		activeLoops: make(map[ssa.Value]*spmdActiveLoop),
@@ -769,13 +771,6 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		if !ssaLoop.IsPeeled {
 			continue
 		}
-		// Scalar fallback: skip peeled loop setup entirely. With laneCount=1,
-		// every iteration processes 1 element — no tail phase, no masking.
-		// The peeled blocks compile as plain scalar code via Pass 1/2.
-		if !b.simdEnabled {
-			continue
-		}
-
 		mainIterPhi := ssaLoop.MainIterPhi
 		if mainIterPhi == nil {
 			continue
@@ -837,6 +832,9 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		}
 
 		// Scalar fallback: override to 1 lane when SIMD is disabled.
+		// The type checker sets LaneCount=1 for rangeint (via spmdLaneCount
+		// returning 1), but for rangeindex the heuristic may compute laneCount>1
+		// — the simdEnabled check ensures we stay scalar.
 		if !b.simdEnabled {
 			laneCount = 1
 		}
@@ -991,6 +989,12 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		elemType := b.getLLVMType(iterPhi.Type())
 		laneCount := b.spmdLaneCount(elemType)
 
+		// Scalar fallback: with laneCount=1 there is no vectorization. Skip
+		// SPMD loop registration so the loop executes as a plain scalar loop.
+		if laneCount <= 1 {
+			continue
+		}
+
 		// Create the active loop entry.
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
@@ -1114,6 +1118,12 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		// a wider lane count, prefer the type checker's value (index is decomposable).
 		if loopInfo != nil && int(loopInfo.LaneCount) > laneCount {
 			laneCount = int(loopInfo.LaneCount)
+		}
+
+		// Scalar fallback: with laneCount=1 there is no vectorization. Skip
+		// SPMD loop registration so the loop executes as a plain scalar loop.
+		if !b.simdEnabled {
+			continue
 		}
 
 		// On WASM with laneCount > 4, a naive <laneCount x i32> index vector would
@@ -1805,6 +1815,14 @@ func (b *builder) isBlockInSPMDBody(block *ssa.BasicBlock) *SPMDLoopInfo {
 // @llvm.wasm.anytrue LLVM intrinsic (single WASM instruction, no bitcast).
 // On other targets the mask is <N x i1>, so we bitcast to iN and compare != 0.
 func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
+	// Scalar fallback: mask is a scalar integer (i1 or i32). Non-zero = any true.
+	if mask.Type().TypeKind() != llvm.VectorTypeKind {
+		if mask.Type() == b.ctx.Int1Type() {
+			return mask
+		}
+		zero := llvm.ConstNull(mask.Type())
+		return b.CreateICmp(llvm.IntNE, mask, zero, "")
+	}
 	if b.spmdUsesSIMD() {
 		// Normalize <N x i1> to WASM mask format before calling the intrinsic.
 		// The llvm.wasm.anytrue intrinsic is registered by vector type; calling
@@ -1836,6 +1854,14 @@ func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
 // @llvm.wasm.alltrue LLVM intrinsic (single WASM instruction, no bitcast).
 // On other targets the mask is <N x i1>.
 func (b *builder) spmdVectorAllTrue(mask llvm.Value) llvm.Value {
+	// Scalar fallback: mask is a scalar integer (i1 or i32). All-true = non-zero.
+	if mask.Type().TypeKind() != llvm.VectorTypeKind {
+		if mask.Type() == b.ctx.Int1Type() {
+			return mask
+		}
+		zero := llvm.ConstNull(mask.Type())
+		return b.CreateICmp(llvm.IntNE, mask, zero, "")
+	}
 	if b.spmdUsesSIMD() {
 		// Normalize <N x i1> to WASM mask format before calling the intrinsic.
 		// See spmdVectorAnyTrue for the rationale.
@@ -2005,6 +2031,12 @@ func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
 			// Found a varying parameter. Compute lane count respecting constraints.
 			elemType := c.getLLVMType(spmdType.Elem())
 			laneCount := c.spmdEffectiveLaneCount(spmdType, elemType)
+			// Scalar fallback: laneCount=1 means no SIMD. Return scalar mask (i32 on
+			// WASM, i1 elsewhere) instead of <1 x maskElem> which LLVM rejects as a
+			// branch condition.
+			if laneCount <= 1 {
+				return c.getLLVMType(spmdtypes.NewVaryingMask())
+			}
 			return llvm.VectorType(c.spmdMaskElemType(laneCount), laneCount)
 		}
 	}
@@ -2372,12 +2404,22 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 			return llvm.ConstInt(elemType, 0, false), nil // single lane = index 0
 		case strings.HasPrefix(name, "lanes.Count["):
 			return llvm.ConstInt(b.intType, 1, false), nil // 1 lane
+		case strings.HasPrefix(name, "lanes.From["):
+			// lanes.From[T](data []T) in scalar mode: load element 0 from the slice.
+			// The result type is Varying[T] = T in scalar mode.
+			slice := b.getValue(instr.Args[0], getPos(instr))
+			resultSSAType := instr.Signature().Results().At(0).Type().(*types.SPMDType)
+			elemType := b.getLLVMType(resultSSAType.Elem())
+			ptr := b.CreateExtractValue(slice, 0, "lanes.from.ptr")
+			gep := b.CreateInBoundsGEP(elemType, ptr, []llvm.Value{
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+			}, "lanes.from.gep")
+			return b.CreateLoad(elemType, gep, "lanes.from.val"), nil
 		case strings.HasPrefix(name, "lanes.Broadcast["),
 			strings.HasPrefix(name, "lanes.Rotate["),
 			strings.HasPrefix(name, "lanes.Swizzle["),
 			strings.HasPrefix(name, "lanes.ShiftLeft["),
 			strings.HasPrefix(name, "lanes.ShiftRight["),
-			strings.HasPrefix(name, "lanes.From["),
 			strings.HasPrefix(name, "lanes.RotateWithin["),
 			strings.HasPrefix(name, "lanes.ShiftLeftWithin["),
 			strings.HasPrefix(name, "lanes.ShiftRightWithin["),
@@ -3020,9 +3062,28 @@ func (b *builder) spmdMaskArithVec(vec, mask llvm.Value, identity llvm.Value) ll
 func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
 	// Scalar fallback: with laneCount=1, the input is a scalar (not a vector).
 	// Reduction of a single element is identity — return the value directly.
-	// Exception: reduce.From needs to wrap in a 1-element slice.
-	if !b.simdEnabled && !strings.HasPrefix(name, "reduce.From[") {
+	// reduce.From wraps the scalar in a 1-element stack slice.
+	if !b.simdEnabled {
 		val := b.getValue(instr.Args[0], getPos(instr))
+		if strings.HasPrefix(name, "reduce.From[") {
+			// Build a 1-element []T slice from the scalar value.
+			elemType := val.Type()
+			arrType := llvm.ArrayType(elemType, 1)
+			alloca := b.CreateAlloca(arrType, "reduce.from.scalar")
+			gep := b.CreateInBoundsGEP(arrType, alloca, []llvm.Value{
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+			}, "")
+			b.CreateStore(val, gep)
+			ptr := b.CreateBitCast(alloca, b.dataPtrType, "")
+			lenVal := llvm.ConstInt(b.uintptrType, 1, false)
+			sliceType := b.getLLVMType(instr.Signature().Results().At(0).Type())
+			slice := llvm.Undef(sliceType)
+			slice = b.CreateInsertValue(slice, ptr, 0, "")
+			slice = b.CreateInsertValue(slice, lenVal, 1, "")
+			slice = b.CreateInsertValue(slice, lenVal, 2, "") // cap = len
+			return slice, nil
+		}
 		// Boolean reductions (Any, All) return the bool directly.
 		// Numeric reductions (Add, Mul, Min, Max) return the scalar.
 		// FindFirstSet returns 0 (only lane 0 exists).
@@ -6393,6 +6454,18 @@ func (b *builder) spmdWidenMaskToOperandLanes(mask llvm.Value, targetLanes int) 
 // width mismatches internally (falls back to trunc+CreateSelect on WASM
 // when bitwise select conditions are not met).
 func (b *builder) createSPMDSelect(instr *ssa.SPMDSelect) llvm.Value {
+	// Scalar fallback: plain select on scalar bool mask.
+	if !b.simdEnabled {
+		mask := b.getValue(instr.Mask, token.NoPos)
+		x := b.getValue(instr.X, token.NoPos)
+		y := b.getValue(instr.Y, token.NoPos)
+		// Mask is scalar i32 (0 or -1) or i1. Truncate to i1 for select.
+		if mask.Type() != b.ctx.Int1Type() {
+			mask = b.CreateICmp(llvm.IntNE, mask, llvm.ConstNull(mask.Type()), "")
+		}
+		return b.CreateSelect(mask, x, y, "")
+	}
+
 	mask := b.getValue(instr.Mask, token.NoPos)
 	x := b.getValue(instr.X, token.NoPos)
 	y := b.getValue(instr.Y, token.NoPos)
@@ -6538,6 +6611,13 @@ func (b *builder) spmdPerLaneGather(elemType llvm.Type, ptrs, mask llvm.Value, l
 // unconditionally) and inactive-lane results are zeroed via mask-select.
 // For vector addresses (varying pointers), a masked gather is used.
 func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
+	// Scalar fallback: plain load, no masking.
+	if !b.simdEnabled {
+		addr := b.getValue(instr.Addr, instr.Pos())
+		resultType := b.getLLVMType(instr.Type())
+		return b.CreateLoad(resultType, addr, "")
+	}
+
 	addr := b.getValue(instr.Addr, instr.Pos())
 	mask := b.getValue(instr.Mask, instr.Pos())
 
@@ -6702,6 +6782,14 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 // handles mask unwrapping internally. For vector addresses (varying pointers),
 // a masked scatter is used; spmdMaskedScatter handles mask unwrapping internally.
 func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
+	// Scalar fallback: plain store, no masking.
+	if !b.simdEnabled {
+		val := b.getValue(instr.Val, instr.Pos())
+		addr := b.getValue(instr.Addr, instr.Pos())
+		b.CreateStore(val, addr)
+		return
+	}
+
 	// SPMD: interleaved stride-S store handling.
 	// First S-1 remainders save their values; last remainder emits interleaved stores.
 	if b.spmdInterleavedStores != nil {

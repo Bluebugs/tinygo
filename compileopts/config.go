@@ -94,6 +94,19 @@ func (c *Config) SIMDEnabled() bool {
 	return hasExperiment(c.Options.GOExperiment, "spmd") && c.Target.GOARCH == "wasm"
 }
 
+// SIMDRegisterSize returns the SIMD register width in bytes for the current target.
+// Returns 1 when SIMD is disabled (-simd=false) to force laneCount=1 in the type checker.
+// Returns 16 by default (128-bit SIMD for WASM SIMD128, SSE, NEON).
+func (c *Config) SIMDRegisterSize() int64 {
+	if c.Options.SIMD == "false" {
+		return 1
+	}
+	if c.SIMDEnabled() {
+		return 16 // WASM SIMD128 = 128 bits = 16 bytes
+	}
+	return 16 // default for non-WASM targets
+}
+
 // ABI returns the -mabi= flag for this target (like -mabi=lp64). A zero-length
 // string is returned if the target doesn't specify an ABI.
 func (c *Config) ABI() string {
