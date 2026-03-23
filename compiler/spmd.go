@@ -3094,6 +3094,10 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		if strings.HasPrefix(name, "reduce.Count[") {
 			return b.CreateZExt(val, b.intType, ""), nil
 		}
+		// reduce.Mask returns int bitmask — single lane = bit 0.
+		if name == "reduce.Mask" {
+			return b.CreateZExt(val, b.intType, ""), nil
+		}
 		return val, nil
 	}
 
