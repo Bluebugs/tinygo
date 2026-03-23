@@ -372,7 +372,13 @@ func (b *builder) spmdConvertScalarToElem(scalar llvm.Value, elemType llvm.Type,
 }
 
 // splatScalar broadcasts a scalar value to fill all lanes of a vector type.
+// In scalar fallback mode (laneCount=1), vecType is a plain scalar type rather
+// than a vector, so there is nothing to broadcast — return the scalar directly.
 func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
+	if vecType.TypeKind() != llvm.VectorTypeKind {
+		// Scalar fallback: vecType is scalar T (laneCount=1). No splat needed.
+		return scalar
+	}
 	undef := llvm.Undef(vecType)
 	zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
 	ins := b.CreateInsertElement(undef, scalar, zero, "")
@@ -383,7 +389,17 @@ func (b *builder) splatScalar(scalar llvm.Value, vecType llvm.Type) llvm.Value {
 // arrayToVector converts an LLVM [N x T] array value to a <M x T> vector
 // by extracting each element and inserting it into a vector. If arrayLen < M,
 // the remaining lanes are zero-initialized (safe padding for partial arrays).
+// In scalar fallback mode (laneCount=1), vecType is a plain scalar type rather
+// than a vector; extract element 0 from the array and return it as a scalar.
 func (b *builder) arrayToVector(arr llvm.Value, vecType llvm.Type) llvm.Value {
+	if vecType.TypeKind() != llvm.VectorTypeKind {
+		// Scalar fallback: vecType is scalar T (laneCount=1).
+		// Extract the single element from the [1 x T] array.
+		if arr.Type().ArrayLength() > 0 {
+			return b.CreateExtractValue(arr, 0, "")
+		}
+		return llvm.ConstNull(vecType)
+	}
 	n := vecType.VectorSize()
 	arrayLen := arr.Type().ArrayLength()
 	vec := llvm.ConstNull(vecType) // zero-init instead of Undef for safe padding
