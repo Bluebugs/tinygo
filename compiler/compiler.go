@@ -3254,11 +3254,17 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		// SPMD: convert vector to struct{[N]T, [N]int32} before boxing.
 		// Embeds both the value array and the per-block condition mask.
 		if spmdType, ok := expr.X.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
-			// Derive lane count from the actual LLVM value's vector size.
-			// This handles mixed-width contexts (e.g., Varying[float64] created
-			// in a 4-lane int loop) where spmdEffectiveLaneCount would give the
-			// canonical count but the actual vector may be wider.
-			laneCount := val.Type().VectorSize()
+			// Derive lane count from the actual LLVM value's type.
+			// Scalar fallback: laneCount=1, value is scalar T (not vector).
+			var laneCount int
+			switch val.Type().TypeKind() {
+			case llvm.VectorTypeKind:
+				laneCount = val.Type().VectorSize()
+			case llvm.ArrayTypeKind:
+				laneCount = val.Type().ArrayLength()
+			default:
+				laneCount = 1 // scalar fallback
+			}
 
 			// Convert value vector to array.
 			valArr := b.vectorToArray(val)
@@ -4289,6 +4295,10 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 			return llvm.Value{}, err
 		}
 		vecType := b.getLLVMType(typeTo)
+		// Scalar fallback: vecType is scalar T, no splat needed.
+		if vecType.TypeKind() != llvm.VectorTypeKind {
+			return converted, nil
+		}
 		return b.splatScalar(converted, vecType), nil
 	}
 

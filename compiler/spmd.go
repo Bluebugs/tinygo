@@ -404,6 +404,13 @@ func (b *builder) vectorToArray(vec llvm.Value) llvm.Value {
 	if vecType.TypeKind() == llvm.ArrayTypeKind {
 		return vec
 	}
+	// Scalar fallback: laneCount=1 produces scalar T, not <1 x T>.
+	// Wrap into [1 x T] for interface boxing.
+	if vecType.TypeKind() != llvm.VectorTypeKind {
+		arrType := llvm.ArrayType(vecType, 1)
+		arr := llvm.Undef(arrType)
+		return b.CreateInsertValue(arr, vec, 0, "")
+	}
 	n := vecType.VectorSize()
 	elemType := vecType.ElementType()
 	arrType := llvm.ArrayType(elemType, n)
