@@ -2446,10 +2446,34 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 			strings.HasPrefix(name, "lanes.RotateWithin["),
 			strings.HasPrefix(name, "lanes.ShiftLeftWithin["),
 			strings.HasPrefix(name, "lanes.ShiftRightWithin["),
-			strings.HasPrefix(name, "lanes.SwizzleWithin["),
-			strings.HasPrefix(name, "lanes.DotProductI8x16Add["):
+			strings.HasPrefix(name, "lanes.SwizzleWithin["):
 			// Single lane: all cross-lane ops are identity.
 			return b.getValue(instr.Args[0], getPos(instr)), nil
+		case name == "lanes.DotProductI8x16Add":
+			// Scalar fallback for DotProductI8x16Add(a, b [16]byte, acc [4]int) [4]int.
+			// acc[i] += sum(int8(a[i*4+j]) * int8(b[i*4+j]) for j in 0..3)
+			pos := getPos(instr)
+			aVal := b.getValue(instr.Args[0], pos)  // [16 x i8]
+			bVal := b.getValue(instr.Args[1], pos)  // [16 x i8]
+			acc := b.getValue(instr.Args[2], pos)   // [4 x i32]
+			i32Type := b.ctx.Int32Type()
+			for i := 0; i < 4; i++ {
+				sum := llvm.ConstInt(i32Type, 0, false)
+				for j := 0; j < 4; j++ {
+					idx := i*4 + j
+					aElem := b.CreateExtractValue(aVal, idx, "")
+					bElem := b.CreateExtractValue(bVal, idx, "")
+					// Sign-extend i8 to i32 for signed multiply.
+					aExt := b.CreateSExt(aElem, i32Type, "")
+					bExt := b.CreateSExt(bElem, i32Type, "")
+					prod := b.CreateMul(aExt, bExt, "")
+					sum = b.CreateAdd(sum, prod, "")
+				}
+				accElem := b.CreateExtractValue(acc, i, "")
+				accElem = b.CreateAdd(accElem, sum, "")
+				acc = b.CreateInsertValue(acc, accElem, i, "")
+			}
+			return acc, nil
 		}
 	}
 
@@ -3109,12 +3133,12 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 		}
 		// Boolean reductions (Any, All) return the bool directly.
 		// Numeric reductions (Add, Mul, Min, Max) return the scalar.
-		// FindFirstSet returns 0 (only lane 0 exists).
+		// FindFirstSet returns 0 (only lane 0 exists, always index 0).
 		// Count returns 1 if true, 0 if false.
-		if strings.HasPrefix(name, "reduce.FindFirstSet[") {
+		if name == "reduce.FindFirstSet" {
 			return llvm.ConstInt(b.intType, 0, false), nil
 		}
-		if strings.HasPrefix(name, "reduce.Count[") {
+		if name == "reduce.Count" {
 			return b.CreateZExt(val, b.intType, ""), nil
 		}
 		// reduce.Mask returns int bitmask — single lane = bit 0.
