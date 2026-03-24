@@ -6538,6 +6538,20 @@ func (b *builder) createSPMDSelect(instr *ssa.SPMDSelect) llvm.Value {
 	// Broadcast scalar operands to vector when needed (e.g., uniform constants).
 	x, y = b.spmdBroadcastMatch(x, y, isBoolOrMask)
 
+	// When both operands are scalar but the mask is a vector (produced by the
+	// store-merge optimisation where uniform values like clamp bounds are
+	// selected per-lane), splat both to a vector of the mask's lane count.
+	// spmdBroadcastMatch only handles the one-scalar/one-vector case; we must
+	// handle the all-scalar case separately.
+	if x.Type().TypeKind() != llvm.VectorTypeKind &&
+		y.Type().TypeKind() != llvm.VectorTypeKind &&
+		mask.Type().TypeKind() == llvm.VectorTypeKind {
+		laneCount := mask.Type().VectorSize()
+		vecType := llvm.VectorType(x.Type(), laneCount)
+		x = b.splatScalar(x, vecType)
+		y = b.splatScalar(y, vecType)
+	}
+
 	// Handle lane count mismatch between mask and operands. This occurs when a
 	// Varying[bool] accumulator (16 lanes on WASM128) is used inside a 4-lane
 	// int32 go for loop — the loop mask has 4 lanes but the bool operands have 16.
