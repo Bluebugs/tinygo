@@ -69,7 +69,8 @@ func (c *Config) Features() string {
 		}
 	}
 	// Auto-enable SIMD128 and relaxed-simd for WASM targets when SPMD experiment is active.
-	if c.SIMDEnabled() {
+	// x86 targets already have SSE2/AVX features in their JSON and need no injection.
+	if c.SIMDEnabled() && c.Target.GOARCH == "wasm" {
 		if !strings.Contains(features, "+simd128") {
 			if features == "" {
 				features = "+simd128"
@@ -86,12 +87,19 @@ func (c *Config) Features() string {
 
 // SIMDEnabled returns whether SIMD code generation is enabled.
 // Returns false when -simd=false is passed explicitly.
-// Returns true by default for SPMD+WASM targets.
+// Returns true by default for SPMD+WASM and SPMD+x86-64 targets.
 func (c *Config) SIMDEnabled() bool {
 	if c.Options.SIMD == "false" {
 		return false
 	}
-	return hasExperiment(c.Options.GOExperiment, "spmd") && c.Target.GOARCH == "wasm"
+	if !hasExperiment(c.Options.GOExperiment, "spmd") {
+		return false
+	}
+	switch c.Target.GOARCH {
+	case "wasm", "amd64":
+		return true
+	}
+	return false
 }
 
 // SIMDRegisterSize returns the SIMD register width in bytes for the current target.

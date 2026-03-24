@@ -1,0 +1,13 @@
+{
+	"llvm-target": "x86_64-unknown-linux-musleabihf",
+	"cpu": "x86-64-v3",
+	"features": "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+popcnt,+avx,+avx2,+x87",
+	"build-tags": ["linux", "amd64"],
+	"goos": "linux",
+	"goarch": "amd64",
+	"gc": "boehm",
+	"scheduler": "threads",
+	"linker": "ld.lld",
+	"rtlib": "compiler-rt",
+	"libc": "musl"
+}

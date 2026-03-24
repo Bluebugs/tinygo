@@ -1979,10 +1979,28 @@ func (c *compilerContext) spmdIsWASM() bool {
 	return strings.HasPrefix(c.Triple, "wasm")
 }
 
-// spmdUsesSIMD returns true when WASM SIMD instructions should be emitted.
-// Returns false in scalar fallback mode (-simd=false) even when spmdIsWASM() is true.
+// spmdIsX86 returns true when the compiler target is an x86 or x86-64 target.
+func (c *compilerContext) spmdIsX86() bool {
+	return strings.HasPrefix(c.Triple, "x86_64") || strings.HasPrefix(c.Triple, "i386")
+}
+
+// spmdHasSSSE3 returns true when the target is x86 with SSSE3 enabled.
+// SSSE3 provides pshufb (i8x16.swizzle equivalent) used for fast byte permutation.
+func (c *compilerContext) spmdHasSSSE3() bool {
+	return c.spmdIsX86() && strings.Contains(c.Features, "+ssse3")
+}
+
+// spmdUsesSIMD returns true when SIMD vector instructions should be emitted.
+// Returns false in scalar fallback mode (-simd=false).
+// WASM requires the -simd flag to be explicitly enabled; x86-64 has SSE2 as baseline.
 func (c *compilerContext) spmdUsesSIMD() bool {
-	return c.spmdIsWASM() && c.simdEnabled
+	if c.spmdIsWASM() {
+		return c.simdEnabled
+	}
+	if c.spmdIsX86() {
+		return c.simdEnabled // SSE2 is baseline for x86-64
+	}
+	return false
 }
 
 // spmdHasRelaxedSIMD returns true when the target has the WebAssembly

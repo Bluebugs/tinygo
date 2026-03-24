@@ -28,8 +28,9 @@ func newTestCompilerContext(t *testing.T) *compilerContext {
 	machine := target.CreateTargetMachine("wasm32-unknown-wasi", "", "+simd128",
 		llvm.CodeGenLevelDefault, llvm.RelocDefault, llvm.CodeModelDefault)
 	config := &Config{
-		Triple:   "wasm32-unknown-wasi",
-		Features: "+simd128",
+		Triple:      "wasm32-unknown-wasi",
+		Features:    "+simd128",
+		SIMDEnabled: true,
 	}
 	return newCompilerContext("test", machine, config, false)
 }
