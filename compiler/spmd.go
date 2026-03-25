@@ -7235,6 +7235,41 @@ func (b *builder) createSPMDExtractMask(instr *ssa.SPMDExtractMask) llvm.Value {
 	return b.arrayToVector(maskArr, maskVecType)
 }
 
+// createSPMDVectorFromMemoryMasked emits the overread+mask sequence that loads
+// a 16-byte vector from dataPtr and zeroes bytes at index >= length. This is
+// the safe path used on WASM (guard zone guarantees no trap) and as the slow
+// path on x86 when the pointer is within 16 bytes of a page boundary.
+//
+// Sequence: raw load → index const → splat(len) → icmp ult → sext → and.
+// The caller guarantees length <= lanes <= 16.
+func (b *builder) createSPMDVectorFromMemoryMasked(dataPtr, length llvm.Value, lanes int) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+	vecType := llvm.VectorType(i8Type, lanes)
+
+	// Load lanes bytes. On WASM the 16-byte guard zone ensures no trap; on
+	// x86 the caller already checked the page boundary.
+	rawLoad := b.CreateLoad(vecType, dataPtr, "vfm.raw")
+	rawLoad.SetAlignment(1)
+
+	// Build lane index constant [0, 1, ..., lanes-1].
+	indices := make([]llvm.Value, lanes)
+	for i := 0; i < lanes; i++ {
+		indices[i] = llvm.ConstInt(i8Type, uint64(i), false)
+	}
+	indicesVec := llvm.ConstVector(indices, false)
+
+	// Splat length as i8. Values 0-16 always fit without truncation hazard.
+	lenI8 := b.CreateTrunc(length, i8Type, "vfm.len.i8")
+	lenSplat := b.splatScalar(lenI8, vecType)
+
+	// icmp ult + sext: active lanes get 0xFF, inactive lanes get 0x00.
+	// LLVM may combine sext+and into v128.andnot or v128.bitselect.
+	mask := b.CreateICmp(llvm.IntULT, indicesVec, lenSplat, "vfm.mask")
+	maskExt := b.CreateSExt(mask, vecType, "vfm.mask.ext")
+
+	return b.CreateAnd(rawLoad, maskExt, "vfm.masked")
+}
+
 // createSPMDVectorFromMemory lowers an SSA SPMDVectorFromMemory instruction to
 // LLVM IR. It loads elements from a string or slice source into a vector,
 // zeroing lanes whose index >= len(src).
@@ -7242,12 +7277,12 @@ func (b *builder) createSPMDExtractMask(instr *ssa.SPMDExtractMask) llvm.Value {
 // The source (instr.Ptr) is a string or []byte header, NOT a raw pointer.
 // Field 0 is the data pointer, field 1 is the length.
 //
-// Strategy: overread 16 bytes directly from the source pointer (safe due to
-// the 16-byte SIMD guard zone reserved at the top of WASM linear memory — see
-// arch_tinygowasm.go), then AND with a lane-index mask to zero bytes beyond
-// length. This replaces the previous memset+memcpy+v128.load bounce buffer
-// with ~5 instructions (v128.load + index const + splat + i8x16.lt_u + v128.and).
-// The caller guarantees length <= lanes <= 16.
+// On x86-64 a page-safe fast path emits a single vmovdqu when the pointer is
+// not within the last 16 bytes of a 4096-byte page (covers ~99.6% of cases).
+// Garbage bytes beyond len(src) are acceptable because callers use scalar
+// bitmask trimming, not zero-padding, to discard inactive lanes.
+// The WASM path (and the x86 slow path) use createSPMDVectorFromMemoryMasked
+// which overreads and ANDs with a lane-index mask.
 func (b *builder) createSPMDVectorFromMemory(instr *ssa.SPMDVectorFromMemory) llvm.Value {
 	src := b.getValue(instr.Ptr, instr.Pos())
 	length := b.getValue(instr.Len, instr.Pos())
@@ -7255,34 +7290,49 @@ func (b *builder) createSPMDVectorFromMemory(instr *ssa.SPMDVectorFromMemory) ll
 	lanes := instr.Lanes
 	dataPtr := b.CreateExtractValue(src, 0, "vfm.ptr")
 
-	i8Type := b.ctx.Int8Type()
-	i8x16Type := llvm.VectorType(i8Type, lanes)
+	// x86-64 fast path: emit a single vmovdqu when the pointer cannot straddle
+	// a page boundary. Page safety: a 16-byte load starting at ptr is safe when
+	// (ptr & 0xFFF) <= 0xFF0. For the ~0.4% of pointers in the last 16 bytes of
+	// a page we fall through to the masked slow path.
+	if b.spmdIsX86() && lanes == 16 {
+		i8Type := b.ctx.Int8Type()
+		v16i8 := llvm.VectorType(i8Type, 16)
 
-	// Step 1: Load lanes bytes directly from source. Safe because the runtime
-	// reserves a 16-byte guard zone at the top of WASM linear memory so any
-	// heap pointer can be overread by up to 15 bytes without trapping.
-	rawLoad := b.CreateLoad(i8x16Type, dataPtr, "vfm.raw")
-	rawLoad.SetAlignment(1)
+		// Compute page offset and test whether we are near a page boundary.
+		ptrInt := b.CreatePtrToInt(dataPtr, b.uintptrType, "vfm.page.ptr")
+		pageOff := b.CreateAnd(ptrInt, llvm.ConstInt(b.uintptrType, 0xFFF, false), "vfm.page.off")
+		nearEnd := b.CreateICmp(llvm.IntUGT, pageOff, llvm.ConstInt(b.uintptrType, 0xFF0, false), "vfm.page.near")
 
-	// Step 2: Build lane index constant [0, 1, 2, ..., lanes-1].
-	indices := make([]llvm.Value, lanes)
-	for i := 0; i < lanes; i++ {
-		indices[i] = llvm.ConstInt(i8Type, uint64(i), false)
+		curBlock := b.GetInsertBlock()
+		fastBlock := b.ctx.AddBasicBlock(curBlock.Parent(), "vfm.fast")
+		slowBlock := b.ctx.AddBasicBlock(curBlock.Parent(), "vfm.slow")
+		mergeBlock := b.ctx.AddBasicBlock(curBlock.Parent(), "vfm.merge")
+
+		b.CreateCondBr(nearEnd, slowBlock, fastBlock)
+
+		// Fast path: raw unaligned load, no masking needed.
+		// Bytes beyond len(src) contain arbitrary data; callers discard them via
+		// the active-lane mask computed from the execution mask, not from the
+		// vector content itself.
+		b.SetInsertPointAtEnd(fastBlock)
+		fastLoad := b.CreateLoad(v16i8, dataPtr, "vfm.raw.fast")
+		fastLoad.SetAlignment(1)
+		b.CreateBr(mergeBlock)
+
+		// Slow path: overread + mask (identical to the WASM path).
+		b.SetInsertPointAtEnd(slowBlock)
+		slowResult := b.createSPMDVectorFromMemoryMasked(dataPtr, length, lanes)
+		slowBlock = b.GetInsertBlock() // createSPMDVectorFromMemoryMasked may not add blocks, but be safe
+		b.CreateBr(mergeBlock)
+
+		// Merge: pick the result from whichever path executed.
+		b.SetInsertPointAtEnd(mergeBlock)
+		phi := b.CreatePHI(v16i8, "vfm.result")
+		phi.AddIncoming([]llvm.Value{fastLoad, slowResult}, []llvm.BasicBlock{fastBlock, slowBlock})
+		return phi
 	}
-	indicesVec := llvm.ConstVector(indices, false)
 
-	// Step 3: Splat length as i8. The caller guarantees length <= lanes <= 16,
-	// so values 0-16 always fit in i8 with no truncation hazard.
-	lenI8 := b.CreateTrunc(length, i8Type, "vfm.len.i8")
-	lenSplat := b.splatScalar(lenI8, i8x16Type)
-
-	// Step 4: Compare index < length: produces <lanes x i1> (LLVM lowers to
-	// WASM i8x16.lt_u). Sign-extend to <lanes x i8> gives 0xFF (active) or
-	// 0x00 (inactive). LLVM may combine sext+and into v128.andnot or
-	// v128.bitselect — let the backend decide the optimal sequence.
-	mask := b.CreateICmp(llvm.IntULT, indicesVec, lenSplat, "vfm.mask")
-	maskExt := b.CreateSExt(mask, i8x16Type, "vfm.mask.ext")
-
-	// Step 5: AND to zero bytes beyond length.
-	return b.CreateAnd(rawLoad, maskExt, "vfm.masked")
+	// Non-x86 path (WASM and others): overread + mask, relying on the runtime
+	// guard zone or platform memory layout for safety.
+	return b.createSPMDVectorFromMemoryMasked(dataPtr, length, lanes)
 }
