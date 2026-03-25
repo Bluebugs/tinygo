@@ -68,8 +68,19 @@ func (c *Config) Features() string {
 			features = features + "," + c.Options.LLVMFeatures
 		}
 	}
-	// Auto-enable SIMD128 and relaxed-simd for WASM targets when SPMD experiment is active.
-	// x86 targets already have SSE2/AVX features in their JSON and need no injection.
+	// Auto-enable SIMD features for SPMD targets.
+	// x86: ensure +popcnt is present (needed for bits.OnesCount; without it LLVM
+	// generates a 16-instruction Hamming-weight bit trick instead of a single popcnt).
+	if c.SIMDEnabled() && c.Target.GOARCH == "amd64" {
+		if !strings.Contains(features, "+popcnt") {
+			if features == "" {
+				features = "+popcnt"
+			} else {
+				features = features + ",+popcnt"
+			}
+		}
+	}
+	// WASM: enable simd128 + relaxed-simd.
 	if c.SIMDEnabled() && c.Target.GOARCH == "wasm" {
 		if !strings.Contains(features, "+simd128") {
 			if features == "" {
