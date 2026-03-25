@@ -5187,8 +5187,9 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 					return load, nil
 				}
 			}
-			// Register-based: bitcast the aggregate to vector.
-			return b.CreateBitCast(collection, llvm.VectorType(elemType, laneCount), "spmd.identity.cast"), nil
+			// Register-based: convert aggregate to vector via ExtractValue+InsertElement.
+			// Direct bitcast between aggregate and vector types is illegal in LLVM IR.
+			return b.spmdAggregateToVector(collection, llvm.VectorType(elemType, laneCount), laneCount, "spmd.identity.cast"), nil
 		}
 
 		// i8x16.swizzle fast path: byte arrays ≤ 16 elements.

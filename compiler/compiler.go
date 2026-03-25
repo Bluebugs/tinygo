@@ -3095,12 +3095,14 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				return llvm.Value{}, b.makeError(expr.Pos(), "unsupported SPMD vector indexaddr type: "+ptrTyp.String())
 			}
 
-			// WASM swizzle fast path: for byte arrays ≤ 16 elements, load the whole
-			// array into a <16 x i8> register and use i8x16.swizzle instead of
-			// building a pointer vector for per-lane scatter/gather. The swizzle
-			// result is cached in spmdSwizzleResult; SPMDLoad returns it directly.
-			// No bounds check needed — swizzle returns 0 for indices >= 16.
-			if b.spmdIsWASM() && b.spmdSwizzleResult != nil {
+			// Swizzle fast path: for byte arrays ≤ 16 elements, load the whole
+			// array into a <16 x i8> register and use i8x16.swizzle (WASM) or
+			// pshufb (x86-64 SSSE3) instead of building a pointer vector for
+			// per-lane scatter/gather. The swizzle result is cached in
+			// spmdSwizzleResult; SPMDLoad returns it directly.
+			// No bounds check needed — both swizzle and pshufb return 0 for
+			// indices with bit 7 set (i.e., indices >= 128, including 0xFF).
+			if b.spmdUsesSIMD() && b.spmdSwizzleResult != nil {
 				if ptrTyp, ok := expr.X.Type().Underlying().(*types.Pointer); ok {
 					if arrTyp, ok := ptrTyp.Elem().Underlying().(*types.Array); ok {
 						if b.getLLVMType(arrTyp.Elem()) == b.ctx.Int8Type() && arrTyp.Len() <= 16 {
