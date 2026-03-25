@@ -1847,23 +1847,24 @@ func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
 		return b.CreateICmp(llvm.IntNE, mask, zero, "")
 	}
 	if b.spmdUsesSIMD() {
-		// Normalize <N x i1> to WASM mask format before calling the intrinsic.
+		// Normalize <N x i1> to mask format before calling the intrinsic.
 		// The llvm.wasm.anytrue intrinsic is registered by vector type; calling
 		// llvm.wasm.anytrue.v4i1 with a <4 x i1> argument creates a custom
 		// intrinsic call on a sub-128-bit type. The WASM backend's legalization
 		// does not know how to promote <4 x i1> arguments to custom intrinsics
 		// and crashes with "Do not know how to promote this operator's operand".
-		// Convert to WASM mask format (<N x iW>) first so we call
+		// Convert to mask format (<N x iW>) first so we call
 		// llvm.wasm.anytrue.v4i32 (or similar), which WASM can lower natively.
+		// On x86, spmdAnyTrue bitcasts to <16 x i8> internally via pmovmskb.
 		laneCount := mask.Type().VectorSize()
 		if mask.Type().ElementType() == b.ctx.Int1Type() {
 			mask = b.spmdWrapMask(mask, laneCount)
 		}
-		i32Result := b.spmdWasmAnyTrue(mask)
+		i32Result := b.spmdAnyTrue(mask)
 		zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
 		return b.CreateICmp(llvm.IntNE, i32Result, zero, "")
 	}
-	// Non-WASM: <N x i1> → iN bitcast, compare != 0.
+	// Non-SIMD: <N x i1> → iN bitcast, compare != 0.
 	vecSize := mask.Type().VectorSize()
 	intType := b.ctx.IntType(vecSize)
 	intVal := b.CreateBitCast(mask, intType, "")
@@ -1886,18 +1887,19 @@ func (b *builder) spmdVectorAllTrue(mask llvm.Value) llvm.Value {
 		return b.CreateICmp(llvm.IntNE, mask, zero, "")
 	}
 	if b.spmdUsesSIMD() {
-		// Normalize <N x i1> to WASM mask format before calling the intrinsic.
+		// Normalize <N x i1> to mask format before calling the intrinsic.
 		// See spmdVectorAnyTrue for the rationale.
+		// On x86, spmdAllTrue bitcasts to <16 x i8> internally via pmovmskb.
 		laneCount := mask.Type().VectorSize()
 		if mask.Type().ElementType() == b.ctx.Int1Type() {
 			mask = b.spmdWrapMask(mask, laneCount)
 		}
-		// Use native WASM i32x4.all_true instruction.
-		i32Result := b.spmdWasmAllTrue(mask)
+		// Use native all_true (WASM) or pmovmskb+icmp (x86).
+		i32Result := b.spmdAllTrue(mask)
 		zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
 		return b.CreateICmp(llvm.IntNE, i32Result, zero, "")
 	}
-	// Non-WASM: <N x i1> → iN bitcast, compare == all-ones.
+	// Non-SIMD: <N x i1> → iN bitcast, compare == all-ones.
 	vecSize := mask.Type().VectorSize()
 	intType := b.ctx.IntType(vecSize)
 	intVal := b.CreateBitCast(mask, intType, "")
@@ -2027,6 +2029,100 @@ func (b *builder) spmdRelaxedDotI8x16Add(a, bVec, acc llvm.Value) llvm.Value {
 		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
 	}
 	return b.createCall(fnType, fn, []llvm.Value{a, bVec, acc}, "spmd.relaxed.dot")
+}
+
+// spmdSwizzle emits a byte-permute (i8x16.swizzle equivalent) for the current target.
+// On WASM: llvm.wasm.swizzle or llvm.wasm.relaxed.swizzle.
+// On x86 with SSSE3: llvm.x86.ssse3.pshuf.b.128 (pshufb).
+// Fallback: per-lane extractelement/insertelement loop.
+// Both table and indices must be <16 x i8>. Returns <16 x i8>.
+func (b *builder) spmdSwizzle(table, indices llvm.Value) llvm.Value {
+	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
+	if b.spmdIsWASM() {
+		intrinsicName := "llvm.wasm.swizzle"
+		if b.spmdHasRelaxedSIMD() {
+			intrinsicName = "llvm.wasm.relaxed.swizzle"
+		}
+		fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
+		fn := b.mod.NamedFunction(intrinsicName)
+		if fn.IsNil() {
+			fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+		}
+		return b.createCall(fnType, fn, []llvm.Value{table, indices}, "spmd.swizzle")
+	}
+	if b.spmdHasSSSE3() {
+		return b.spmdX86Pshufb(table, indices)
+	}
+	return b.spmdSwizzleScalarFallback(table, indices)
+}
+
+// spmdSwizzleScalarFallback emits a per-lane byte-permute via extractelement/insertelement.
+// Used when neither WASM swizzle nor x86 pshufb is available.
+// Indices with value >= 16 or bit 7 set produce 0 (matching i8x16.swizzle semantics).
+func (b *builder) spmdSwizzleScalarFallback(table, indices llvm.Value) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+	i32Type := b.ctx.Int32Type()
+	v16i8 := llvm.VectorType(i8Type, 16)
+	result := llvm.ConstNull(v16i8)
+	for i := 0; i < 16; i++ {
+		laneConst := llvm.ConstInt(i32Type, uint64(i), false)
+		idx := b.CreateExtractElement(indices, laneConst, "")
+		// Indices >= 16 or with bit 7 set produce 0 per swizzle semantics.
+		oob := b.CreateICmp(llvm.IntUGE, idx, llvm.ConstInt(i8Type, 16, false), "")
+		elem := b.CreateExtractElement(table, idx, "")
+		elem = b.CreateSelect(oob, llvm.ConstInt(i8Type, 0, false), elem, "")
+		result = b.CreateInsertElement(result, elem, laneConst, "")
+	}
+	return result
+}
+
+// spmdBitmask extracts the MSB of each byte lane into a scalar i32 bitmask.
+// On WASM: llvm.wasm.bitmask on the vector in WASM mask format.
+// On x86: pmovmskb after bitcasting to <16 x i8>.
+func (b *builder) spmdBitmask(vec llvm.Value) llvm.Value {
+	if b.spmdIsWASM() {
+		return b.spmdWasmBitmask(vec)
+	}
+	// x86: pmovmskb requires <16 x i8>; bitcast from wider mask formats.
+	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
+	if vec.Type() != v16i8 {
+		vec = b.CreateBitCast(vec, v16i8, "bitmask.cast")
+	}
+	return b.spmdX86Pmovmskb(vec)
+}
+
+// spmdAnyTrue tests if any lane in the vector is nonzero.
+// On WASM: llvm.wasm.anytrue returning i32 (0 or 1).
+// On x86: pmovmskb + icmp ne 0, returning i32.
+func (b *builder) spmdAnyTrue(vec llvm.Value) llvm.Value {
+	if b.spmdIsWASM() {
+		return b.spmdWasmAnyTrue(vec)
+	}
+	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
+	if vec.Type() != v16i8 {
+		vec = b.CreateBitCast(vec, v16i8, "anytrue.cast")
+	}
+	mask := b.spmdX86Pmovmskb(vec)
+	zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+	ne := b.CreateICmp(llvm.IntNE, mask, zero, "anytrue")
+	return b.CreateZExt(ne, b.ctx.Int32Type(), "anytrue.i32")
+}
+
+// spmdAllTrue tests if all lanes in the vector are nonzero.
+// On WASM: llvm.wasm.alltrue returning i32 (0 or 1).
+// On x86: pmovmskb + icmp eq 0xFFFF, returning i32.
+func (b *builder) spmdAllTrue(vec llvm.Value) llvm.Value {
+	if b.spmdIsWASM() {
+		return b.spmdWasmAllTrue(vec)
+	}
+	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
+	if vec.Type() != v16i8 {
+		vec = b.CreateBitCast(vec, v16i8, "alltrue.cast")
+	}
+	mask := b.spmdX86Pmovmskb(vec)
+	allOnes := llvm.ConstInt(b.ctx.Int32Type(), 0xFFFF, false)
+	eq := b.CreateICmp(llvm.IntEQ, mask, allOnes, "alltrue")
+	return b.CreateZExt(eq, b.ctx.Int32Type(), "alltrue.i32")
 }
 
 // spmdIsConstAllOnesMask returns true if the mask is a compile-time constant
@@ -2617,10 +2713,8 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 
 	case name == "lanes.DotProductI8x16Add":
 		// lanes.DotProductI8x16Add(a, b [16]byte, acc [4]int) [4]int
-		// Maps to i32x4.relaxed_dot_i8x16_i7x16_add_s on WASM Relaxed SIMD.
-		if !b.spmdHasRelaxedSIMD() {
-			return llvm.Value{}, b.makeError(getPos(instr), "lanes.DotProductI8x16Add requires +relaxed-simd target feature")
-		}
+		// Maps to i32x4.relaxed_dot_i8x16_i7x16_add_s on WASM Relaxed SIMD,
+		// or pmaddubsw + pmaddwd on x86 with SSSE3.
 		pos := getPos(instr)
 		aVal := b.getValue(instr.Args[0], pos)
 		bVal := b.getValue(instr.Args[1], pos)
@@ -2629,7 +2723,7 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
 		v4i32 := llvm.VectorType(b.ctx.Int32Type(), 4)
 
-		// Convert aggregate [N x T] to <N x T> vector via ExtractValue+InsertElement.
+		// Convert a and b aggregates to <16 x i8> vectors.
 		// Direct bitcast between aggregate and vector types is illegal in LLVM IR.
 		if aVal.Type().TypeKind() == llvm.ArrayTypeKind {
 			aVal = b.spmdAggregateToVector(aVal, v16i8, 16, "dot.a")
@@ -2637,11 +2731,70 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		if bVal.Type().TypeKind() == llvm.ArrayTypeKind {
 			bVal = b.spmdAggregateToVector(bVal, v16i8, 16, "dot.b")
 		}
+
+		// Determine the native result type from the function's return type.
+		// On WASM32 int=i32; on x86-64 int=i64. The computation is always i32,
+		// so we must adapt: truncate acc elements to i32, compute, then sign-extend.
+		resultGoType := instr.Signature().Results().At(0).Type()
+		resultLLVMType := b.getLLVMType(resultGoType) // [4 x i32] on WASM32, [4 x i64] on x86-64
+		accElemType := b.intType                       // i32 on WASM32, i64 on x86-64
+
+		// Convert acc to <4 x i32> for the computation.
+		var accI32 llvm.Value
 		if accVal.Type().TypeKind() == llvm.ArrayTypeKind {
-			accVal = b.spmdAggregateToVector(accVal, v4i32, 4, "dot.acc")
+			if accElemType == b.ctx.Int32Type() {
+				// WASM32: [4 x i32] aggregate → <4 x i32> vector.
+				accI32 = b.spmdAggregateToVector(accVal, v4i32, 4, "dot.acc")
+			} else {
+				// x86-64: [4 x i64] aggregate; extract and truncate each element to i32.
+				accI32 = llvm.ConstNull(v4i32)
+				for i := 0; i < 4; i++ {
+					elem := b.CreateExtractValue(accVal, i, "dot.acc.elem")
+					elem32 := b.CreateTrunc(elem, b.ctx.Int32Type(), "dot.acc.trunc")
+					accI32 = b.CreateInsertElement(accI32, elem32,
+						llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false), "dot.acc.i32")
+				}
+			}
+		} else if accVal.Type().TypeKind() == llvm.VectorTypeKind && accVal.Type().ElementType() != b.ctx.Int32Type() {
+			// Varying acc (already a vector) with non-i32 elements: trunc to i32.
+			accI32 = b.CreateTrunc(accVal, v4i32, "dot.acc.trunc")
+		} else {
+			accI32 = accVal
 		}
 
-		return b.spmdRelaxedDotI8x16Add(aVal, bVal, accVal), nil
+		var result llvm.Value
+		if b.spmdIsWASM() && b.spmdHasRelaxedSIMD() {
+			result = b.spmdRelaxedDotI8x16Add(aVal, bVal, accI32)
+		} else if b.spmdHasSSSE3() {
+			// x86: pmaddubsw(a_u8, b_i8) → <8 x i16>, then pmaddwd(result, ones) → <4 x i32>.
+			// Weight 100 (as used in the IPv4 parser) fits in u8 without decomposition.
+			halfResult := b.spmdX86Pmaddubsw(aVal, bVal) // <8 x i16>
+			i16Type := b.ctx.Int16Type()
+			ones := llvm.ConstVector([]llvm.Value{
+				llvm.ConstInt(i16Type, 1, false), llvm.ConstInt(i16Type, 1, false),
+				llvm.ConstInt(i16Type, 1, false), llvm.ConstInt(i16Type, 1, false),
+				llvm.ConstInt(i16Type, 1, false), llvm.ConstInt(i16Type, 1, false),
+				llvm.ConstInt(i16Type, 1, false), llvm.ConstInt(i16Type, 1, false),
+			}, false)
+			result = b.spmdX86Pmaddwd(halfResult, ones) // <4 x i32>
+			result = b.CreateAdd(result, accI32, "dot.add.acc")
+		} else {
+			return llvm.Value{}, b.makeError(pos, "lanes.DotProductI8x16Add requires WASM +relaxed-simd or x86 +ssse3")
+		}
+
+		// On x86-64 (int=i64), sign-extend the <4 x i32> result back to [4 x i64].
+		if accElemType != b.ctx.Int32Type() {
+			// Convert <4 x i32> → [4 x i64]: extract each lane, sext, insert into aggregate.
+			finalResult := llvm.Undef(resultLLVMType)
+			for i := 0; i < 4; i++ {
+				elem := b.CreateExtractElement(result,
+					llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false), "dot.res.elem")
+				elem64 := b.CreateSExt(elem, accElemType, "dot.res.sext")
+				finalResult = b.CreateInsertValue(finalResult, elem64, i, "dot.res")
+			}
+			return finalResult, nil
+		}
+		return result, nil
 
 	default:
 		return llvm.Value{}, b.makeError(getPos(instr), "unsupported lanes builtin: "+name)
@@ -3412,10 +3565,11 @@ func (b *builder) createReduceBuiltin(instr *ssa.CallCommon, name string) (llvm.
 				maskType := llvm.VectorType(b.spmdMaskElemType(laneCount), laneCount)
 				masked = b.CreateSExt(masked, maskType, "")
 			}
-			// llvm.wasm.bitmask extracts the high bit of each lane element
-			// into a scalar i32 bitmask. For all-ones mask elements (e.g.,
-			// 0xFF or 0xFFFFFFFF), the high bit is 1; for all-zeros, it's 0.
-			result := b.spmdWasmBitmask(masked)
+			// spmdBitmask extracts the high bit of each lane element into a
+			// scalar i32 bitmask. For all-ones mask elements (e.g., 0xFF or
+			// 0xFFFFFFFF), the high bit is 1; for all-zeros, it's 0.
+			// Dispatches to llvm.wasm.bitmask on WASM or pmovmskb on x86.
+			result := b.spmdBitmask(masked)
 			return b.createZExtOrTrunc(result, b.intType), nil
 		}
 		i1Vec := b.spmdNormalizeBoolVecToI1(masked)
@@ -5619,19 +5773,8 @@ func (b *builder) spmdWasmSwizzle(tableBytes []byte, index llvm.Value, laneCount
 	if spmdIsIdentitySwizzleIndex(idxVec) {
 		result = tableVec
 	} else {
-		// Call @llvm.wasm.swizzle or @llvm.wasm.relaxed.swizzle.
-		// The relaxed variant allows undefined behaviour for out-of-range indices,
-		// which LLVM may exploit for better codegen. Requires +relaxed-simd.
-		intrinsicName := "llvm.wasm.swizzle"
-		if b.spmdHasRelaxedSIMD() {
-			intrinsicName = "llvm.wasm.relaxed.swizzle"
-		}
-		fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
-		fn := b.mod.NamedFunction(intrinsicName)
-		if fn.IsNil() {
-			fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
-		}
-		result = b.createCall(fnType, fn, []llvm.Value{tableVec, idxVec}, "spmd.swizzle")
+		// Dispatch to the appropriate swizzle implementation for the target.
+		result = b.spmdSwizzle(tableVec, idxVec)
 	}
 
 	// If laneCount < 16, extract the first laneCount lanes.
@@ -5842,17 +5985,8 @@ func (b *builder) spmdCoalescedGather(expr *ssa.IndexAddr, arrayPtr, index llvm.
 	isValid := b.CreateICmp(llvm.IntNE, validMaskVec, llvm.ConstNull(v16i8), "gather.valid")
 	mergedIdx := b.CreateSelect(isValid, indexed, invalidFill, "gather.merged.idx")
 
-	// Emit a single i8x16.swizzle (or relaxed variant) for the whole group.
-	intrinsicName := "llvm.wasm.swizzle"
-	if b.spmdHasRelaxedSIMD() {
-		intrinsicName = "llvm.wasm.relaxed.swizzle"
-	}
-	fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
-	fn := b.mod.NamedFunction(intrinsicName)
-	if fn.IsNil() {
-		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
-	}
-	merged := b.createCall(fnType, fn, []llvm.Value{tableVec, mergedIdx}, "gather.swizzle")
+	// Emit a single swizzle for the whole group, dispatched to target.
+	merged := b.spmdSwizzle(tableVec, mergedIdx)
 
 	// Cache the merged result for the remaining members under the same mask context.
 	b.spmdGatherCache[cacheKey] = merged
@@ -5916,7 +6050,6 @@ func (b *builder) spmdExtractGatherColumn(merged llvm.Value, memberPos, laneCoun
 func (b *builder) spmdSwizzleWithTable(tableVec, index llvm.Value, laneCount int) (llvm.Value, error) {
 	i8Type := b.ctx.Int8Type()
 	i32Type := b.ctx.Int32Type()
-	v16i8 := llvm.VectorType(i8Type, 16)
 
 	// Prepare index as <16 x i8>.
 	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount)
@@ -5927,17 +6060,8 @@ func (b *builder) spmdSwizzleWithTable(tableVec, index llvm.Value, laneCount int
 	if spmdIsIdentitySwizzleIndex(idxVec) {
 		swizzled = tableVec
 	} else {
-		// Call @llvm.wasm.swizzle or @llvm.wasm.relaxed.swizzle.
-		intrinsicName := "llvm.wasm.swizzle"
-		if b.spmdHasRelaxedSIMD() {
-			intrinsicName = "llvm.wasm.relaxed.swizzle"
-		}
-		fnType := llvm.FunctionType(v16i8, []llvm.Type{v16i8, v16i8}, false)
-		fn := b.mod.NamedFunction(intrinsicName)
-		if fn.IsNil() {
-			fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
-		}
-		swizzled = b.createCall(fnType, fn, []llvm.Value{tableVec, idxVec}, "spmd.swizzle")
+		// Dispatch to the appropriate swizzle implementation for the target.
+		swizzled = b.spmdSwizzle(tableVec, idxVec)
 	}
 
 	// Determine result element type. On WASM, widen bytes to avoid sub-128-bit vectors.

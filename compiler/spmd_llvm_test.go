@@ -7072,3 +7072,225 @@ func TestSPMDSwizzleVector(t *testing.T) {
 		t.Error("expected insertelement in module IR for swizzle")
 	}
 }
+
+// newTestCompilerContextX86 creates a minimal compiler context for testing x86 SPMD functionality.
+func newTestCompilerContextX86(t *testing.T) *compilerContext {
+	t.Helper()
+	target, err := llvm.GetTargetFromTriple("x86_64-unknown-linux-gnu")
+	if err != nil {
+		t.Fatalf("failed to get x86_64 target: %v", err)
+	}
+	machine := target.CreateTargetMachine("x86_64-unknown-linux-gnu", "", "+ssse3,+sse4.2",
+		llvm.CodeGenLevelDefault, llvm.RelocDefault, llvm.CodeModelDefault)
+	config := &Config{
+		Triple:      "x86_64-unknown-linux-gnu",
+		Features:    "+ssse3,+sse4.2",
+		SIMDEnabled: true,
+	}
+	return newCompilerContext("test", machine, config, false)
+}
+
+// TestSPMDX86Pshufb verifies that spmdX86Pshufb emits the correct intrinsic call.
+func TestSPMDX86Pshufb(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	v16i8 := llvm.VectorType(c.ctx.Int8Type(), 16)
+	tableAlloca := b.CreateAlloca(v16i8, "table.alloca")
+	table := b.CreateLoad(v16i8, tableAlloca, "table")
+	idxAlloca := b.CreateAlloca(v16i8, "idx.alloca")
+	indices := b.CreateLoad(v16i8, idxAlloca, "idx")
+
+	result := b.spmdX86Pshufb(table, indices)
+
+	if result.IsNil() {
+		t.Fatal("spmdX86Pshufb result is nil")
+	}
+	if result.Type() != v16i8 {
+		t.Errorf("result type = %v, want <16 x i8>", result.Type())
+	}
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.x86.ssse3.pshuf.b.128") {
+		t.Error("expected llvm.x86.ssse3.pshuf.b.128 in module IR")
+	}
+}
+
+// TestSPMDX86Pmovmskb verifies that spmdX86Pmovmskb emits the correct intrinsic call.
+func TestSPMDX86Pmovmskb(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	v16i8 := llvm.VectorType(c.ctx.Int8Type(), 16)
+	vecAlloca := b.CreateAlloca(v16i8, "vec.alloca")
+	vec := b.CreateLoad(v16i8, vecAlloca, "vec")
+
+	result := b.spmdX86Pmovmskb(vec)
+
+	if result.IsNil() {
+		t.Fatal("spmdX86Pmovmskb result is nil")
+	}
+	if result.Type() != c.ctx.Int32Type() {
+		t.Errorf("result type = %v, want i32", result.Type())
+	}
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.x86.sse2.pmovmskb.128") {
+		t.Error("expected llvm.x86.sse2.pmovmskb.128 in module IR")
+	}
+}
+
+// TestSPMDX86Pmaddubsw verifies that spmdX86Pmaddubsw emits the correct intrinsic call.
+func TestSPMDX86Pmaddubsw(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	v16i8 := llvm.VectorType(c.ctx.Int8Type(), 16)
+	v8i16 := llvm.VectorType(c.ctx.Int16Type(), 8)
+	aAlloca := b.CreateAlloca(v16i8, "a.alloca")
+	a := b.CreateLoad(v16i8, aAlloca, "a")
+	bAlloca := b.CreateAlloca(v16i8, "b.alloca")
+	bVec := b.CreateLoad(v16i8, bAlloca, "b")
+
+	result := b.spmdX86Pmaddubsw(a, bVec)
+
+	if result.IsNil() {
+		t.Fatal("spmdX86Pmaddubsw result is nil")
+	}
+	if result.Type() != v8i16 {
+		t.Errorf("result type = %v, want <8 x i16>", result.Type())
+	}
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.x86.ssse3.pmadd.ub.sw.128") {
+		t.Error("expected llvm.x86.ssse3.pmadd.ub.sw.128 in module IR")
+	}
+}
+
+// TestSPMDX86Pmaddwd verifies that spmdX86Pmaddwd emits the correct intrinsic call.
+func TestSPMDX86Pmaddwd(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	v8i16 := llvm.VectorType(c.ctx.Int16Type(), 8)
+	v4i32 := llvm.VectorType(c.ctx.Int32Type(), 4)
+	aAlloca := b.CreateAlloca(v8i16, "a.alloca")
+	a := b.CreateLoad(v8i16, aAlloca, "a")
+	bAlloca := b.CreateAlloca(v8i16, "b.alloca")
+	bVec := b.CreateLoad(v8i16, bAlloca, "b")
+
+	result := b.spmdX86Pmaddwd(a, bVec)
+
+	if result.IsNil() {
+		t.Fatal("spmdX86Pmaddwd result is nil")
+	}
+	if result.Type() != v4i32 {
+		t.Errorf("result type = %v, want <4 x i32>", result.Type())
+	}
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.x86.sse2.pmadd.wd") {
+		t.Error("expected llvm.x86.sse2.pmadd.wd in module IR")
+	}
+}
+
+// TestSPMDSwizzleDispatch verifies that spmdSwizzle dispatches to the correct
+// implementation based on the target: pshufb on x86-SSSE3, wasm.swizzle on WASM.
+func TestSPMDSwizzleDispatch(t *testing.T) {
+	t.Run("x86_ssse3", func(t *testing.T) {
+		c := newTestCompilerContextX86(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		v16i8 := llvm.VectorType(c.ctx.Int8Type(), 16)
+		tableAlloca := b.CreateAlloca(v16i8, "table.alloca")
+		table := b.CreateLoad(v16i8, tableAlloca, "table")
+		idxAlloca := b.CreateAlloca(v16i8, "idx.alloca")
+		indices := b.CreateLoad(v16i8, idxAlloca, "idx")
+
+		result := b.spmdSwizzle(table, indices)
+		if result.IsNil() {
+			t.Fatal("spmdSwizzle result is nil on x86")
+		}
+		if result.Type() != v16i8 {
+			t.Errorf("result type = %v, want <16 x i8>", result.Type())
+		}
+		modIR := b.mod.String()
+		if !strings.Contains(modIR, "llvm.x86.ssse3.pshuf.b.128") {
+			t.Error("expected pshufb intrinsic on x86+ssse3")
+		}
+	})
+
+	t.Run("wasm_simd128", func(t *testing.T) {
+		c := newTestCompilerContext(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		v16i8 := llvm.VectorType(c.ctx.Int8Type(), 16)
+		tableAlloca := b.CreateAlloca(v16i8, "table.alloca")
+		table := b.CreateLoad(v16i8, tableAlloca, "table")
+		idxAlloca := b.CreateAlloca(v16i8, "idx.alloca")
+		indices := b.CreateLoad(v16i8, idxAlloca, "idx")
+
+		result := b.spmdSwizzle(table, indices)
+		if result.IsNil() {
+			t.Fatal("spmdSwizzle result is nil on WASM")
+		}
+		modIR := b.mod.String()
+		if !strings.Contains(modIR, "llvm.wasm.swizzle") {
+			t.Error("expected wasm.swizzle intrinsic on WASM")
+		}
+	})
+}
+
+// TestSPMDBitmaskDispatch verifies that spmdBitmask dispatches correctly.
+func TestSPMDBitmaskDispatch(t *testing.T) {
+	t.Run("x86", func(t *testing.T) {
+		c := newTestCompilerContextX86(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		v4i32 := llvm.VectorType(c.ctx.Int32Type(), 4)
+		vecAlloca := b.CreateAlloca(v4i32, "vec.alloca")
+		vec := b.CreateLoad(v4i32, vecAlloca, "vec")
+
+		result := b.spmdBitmask(vec)
+		if result.IsNil() {
+			t.Fatal("spmdBitmask result is nil on x86")
+		}
+		if result.Type() != c.ctx.Int32Type() {
+			t.Errorf("result type = %v, want i32", result.Type())
+		}
+		modIR := b.mod.String()
+		if !strings.Contains(modIR, "llvm.x86.sse2.pmovmskb.128") {
+			t.Error("expected pmovmskb intrinsic on x86")
+		}
+	})
+
+	t.Run("wasm", func(t *testing.T) {
+		c := newTestCompilerContext(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		v4i32 := llvm.VectorType(c.ctx.Int32Type(), 4)
+		vecAlloca := b.CreateAlloca(v4i32, "vec.alloca")
+		vec := b.CreateLoad(v4i32, vecAlloca, "vec")
+
+		result := b.spmdBitmask(vec)
+		if result.IsNil() {
+			t.Fatal("spmdBitmask result is nil on WASM")
+		}
+		modIR := b.mod.String()
+		if !strings.Contains(modIR, "llvm.wasm.bitmask") {
+			t.Error("expected wasm.bitmask intrinsic on WASM")
+		}
+	})
+}
