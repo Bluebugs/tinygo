@@ -3774,7 +3774,18 @@ func (b *builder) spmdMaskedLoadNarrow(targetElemBits uint64, ptr llvm.Value, la
 		shift := llvm.ConstInt(scalarType, uint64(lane)*targetElemBits, false)
 		elem := b.CreateLShr(packed, shift, "")
 		elem = b.CreateAnd(elem, elemMask, "")
-		elem = b.CreateZExt(elem, wideElemType, "")
+		// Adapt elem to wideElemType. The packed scalar may be wider than
+		// wideElemType (e.g., scalarType=i64 for 4×uint16=64 bits, but
+		// wideElemType=i32 for 4 lanes on WASM). After the AND, elem holds at
+		// most targetElemBits significant bits, so truncation is value-preserving.
+		// When narrower, ZExt; when wider, Trunc (the AND already zeroed the high bits).
+		scalarBitWidth := uint64(scalarType.IntTypeWidth())
+		wideBitWidth := uint64(wideElemType.IntTypeWidth())
+		if scalarBitWidth < wideBitWidth {
+			elem = b.CreateZExt(elem, wideElemType, "")
+		} else if scalarBitWidth > wideBitWidth {
+			elem = b.CreateTrunc(elem, wideElemType, "")
+		}
 		laneIdx := llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false)
 		result = b.CreateInsertElement(result, elem, laneIdx, "")
 	}
@@ -5165,6 +5176,15 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 		// index, the per-lane gather would just return each element in order.
 		// Skip the gather and load the array directly as a <N x T> vector.
 		if totalSize <= 16 && int64(xType.Len()) == int64(laneCount) && b.spmdIsLoopLaneIndex(index, expr.Index) {
+			// Determine result element type: widen sub-128-bit vectors to avoid
+			// WASM lowering failures (e.g., <4 x i8>=32-bit or <4 x i16>=64-bit).
+			// Matches the same widening logic used in the GEP fallback path below.
+			resultElemType := elemType
+			vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(elemType, laneCount))) * 8
+			if vecBits < 128 {
+				resultElemType = b.spmdMaskElemType(laneCount)
+			}
+
 			if unop, ok := expr.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
 				// Shadow vector bypass: when the alloca has a tracked shadow (kept
 				// in sync by insertelement on scalar stores), return it directly
@@ -5172,7 +5192,10 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 				// that LLVM decomposes into per-lane loads.
 				if alloc, ok := unop.X.(*ssa.Alloc); ok && b.spmdVecShadow != nil {
 					if shadow, ok := b.spmdVecShadow.current[alloc]; ok {
-						return shadow, nil
+						if shadow.Type() == llvm.VectorType(resultElemType, laneCount) {
+							return shadow, nil
+						}
+						// Shadow has different element width; fall through to load path.
 					}
 				}
 
@@ -5186,10 +5209,38 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 					load.SetAlignment(align)
 					return load, nil
 				}
+				// Sub-128-bit: load per-lane via GEP+load and zero-extend to resultElemType.
+				// We cannot load the entire array as a v128 (it would read garbage padding),
+				// and sub-128-bit LLVM vector types cannot be lowered on WASM.
+				arrayLoadType := collection.Type()
+				result := llvm.Undef(llvm.VectorType(resultElemType, laneCount))
+				zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+				for lane := 0; lane < laneCount; lane++ {
+					laneConst := llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false)
+					ptr := b.CreateInBoundsGEP(arrayLoadType, srcPtr, []llvm.Value{zero, laneConst}, "spmd.identity.gep")
+					val := b.CreateLoad(elemType, ptr, "spmd.identity.lane")
+					if resultElemType != elemType {
+						val = b.CreateZExt(val, resultElemType, "")
+					}
+					result = b.CreateInsertElement(result, val, laneConst, "")
+				}
+				return result, nil
 			}
-			// Register-based: convert aggregate to vector via ExtractValue+InsertElement.
-			// Direct bitcast between aggregate and vector types is illegal in LLVM IR.
-			return b.spmdAggregateToVector(collection, llvm.VectorType(elemType, laneCount), laneCount, "spmd.identity.cast"), nil
+			// Register-based: convert aggregate to vector via ExtractValue+InsertElement,
+			// then zero-extend to resultElemType if widening is required.
+			rawVec := b.spmdAggregateToVector(collection, llvm.VectorType(elemType, laneCount), laneCount, "spmd.identity.cast")
+			if resultElemType != elemType {
+				// Widen each element from elemType to resultElemType.
+				result := llvm.Undef(llvm.VectorType(resultElemType, laneCount))
+				for lane := 0; lane < laneCount; lane++ {
+					laneConst := llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false)
+					val := b.CreateExtractElement(rawVec, laneConst, "")
+					val = b.CreateZExt(val, resultElemType, "")
+					result = b.CreateInsertElement(result, val, laneConst, "")
+				}
+				return result, nil
+			}
+			return rawVec, nil
 		}
 
 		// i8x16.swizzle fast path: byte arrays ≤ 16 elements.
