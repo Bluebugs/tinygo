@@ -362,6 +362,19 @@ func spmdRangeIndexArrayLenCap(boundValue ssa.Value, bodyBlock *ssa.BasicBlock, 
 // not trace through ChangeType chains. This is sufficient for the common range-over-slice
 // pattern where go/ssa uses incrBinOp directly as the IndexAddr index.
 func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.BasicBlock, incrBinOp *ssa.BinOp) int {
+	// Strategy 0: boundValue has array type (pre-peeling, before BoundValue is
+	// replaced with a typed int constant). For "go for i, v := range arr" where
+	// arr is [N]T, BoundValue.Type() = [N]T. Extract N (array length) and T
+	// (element type) directly. This is the most reliable strategy.
+	if arrType, ok := boundValue.Type().Underlying().(*types.Array); ok {
+		elemLLVM := b.getLLVMType(arrType.Elem())
+		laneCount := b.spmdLaneCount(elemLLVM)
+		if arrayLen := arrType.Len(); arrayLen > 0 && int64(laneCount) > arrayLen {
+			laneCount = int(arrayLen)
+		}
+		return laneCount
+	}
+
 	// Strategy 1: if boundValue is a call to builtin len, extract the slice element type.
 	if call, ok := boundValue.(*ssa.Call); ok {
 		if builtin, ok := call.Call.Value.(*ssa.Builtin); ok && builtin.Name() == "len" {
@@ -373,6 +386,11 @@ func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.B
 				}
 			}
 		}
+	}
+
+	if bodyBlock == nil {
+		// Fallback: use the iterator type (int → 4 lanes on wasm32).
+		return b.spmdLaneCount(b.getLLVMType(incrBinOp.Type()))
 	}
 
 	// Strategy 2: scan the body block for an Index or IndexAddr whose index
@@ -433,6 +451,32 @@ func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.B
 			}
 			return laneCount
 		}
+	}
+
+	// Strategy 3: post-predication scan for SPMDLoad whose Source retains the
+	// original array/slice pointer type. Mirrors spmdRangeIndexArrayLenCap Strategy 3.
+	for _, instr := range bodyBlock.Instrs {
+		v, ok := instr.(*ssa.SPMDLoad)
+		if !ok || !v.Contiguous || v.Source == nil {
+			continue
+		}
+		srcType := v.Source.Type().Underlying()
+		if ptrType, ok := srcType.(*types.Pointer); ok {
+			if arrType, ok := ptrType.Elem().Underlying().(*types.Array); ok {
+				elemLLVM := b.getLLVMType(arrType.Elem())
+				laneCount := b.spmdLaneCount(elemLLVM)
+				if arrayLen := arrType.Len(); arrayLen > 0 && int64(laneCount) > arrayLen {
+					laneCount = int(arrayLen)
+				}
+				return laneCount
+			}
+			if sliceType, ok := ptrType.Elem().Underlying().(*types.Slice); ok {
+				elemLLVM := b.getLLVMType(sliceType.Elem())
+				return b.spmdLaneCount(elemLLVM)
+			}
+		}
+		// SPMDLoad over slice (Source.Type() = []T pointer) — no cap needed.
+		return b.spmdLaneCount(b.getLLVMType(incrBinOp.Type()))
 	}
 
 	// Fallback: use the iterator type (int → 4 lanes on wasm32).
@@ -933,20 +977,29 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		var laneCount int
 		if ssaLoop.IsRangeIndex {
 			laneCount = b.spmdRangeIndexLaneCount(ssaLoop.BoundValue, ssaLoop.MainBodyBlock, mainIncrBinOp)
-			// If the heuristic fell back to iterator type (4 lanes) but the type
-			// checker computed a wider lane count (e.g., 16 for byte arrays),
-			// prefer the type checker's value. The index is decomposable so its
-			// int size should not limit the lane count.
-			// Exception: for fixed-size arrays the type checker does not account
-			// for array length (e.g., [4]uint16 → LaneCount=8 but only 4 elements
-			// exist). Cap the override against the array length so we never exceed it.
-			if ssaLoop.LaneCount > laneCount {
+			// Only use the type checker's LaneCount when the heuristic fell back to
+			// the iterator type (indicating it found no reliable element type info).
+			// When the heuristic found the correct value (Strategies 0-3), it may
+			// already account for array-length capping; overriding it with the type
+			// checker's wider value (which ignores array length) would cause OOB access.
+			// Compare against the fallback to detect whether the heuristic succeeded.
+			iterFallback := b.spmdLaneCount(b.getLLVMType(mainIncrBinOp.Type()))
+			if ssaLoop.LaneCount > laneCount && laneCount == iterFallback {
+				// Heuristic fell back to iterator type; try the type checker's value.
+				// Cap against the array length so we never exceed it for fixed-size arrays
+				// (e.g., [4]uint16 → LaneCount=8 but only 4 elements exist).
 				arrayLenCap := spmdRangeIndexArrayLenCap(ssaLoop.BoundValue, ssaLoop.MainBodyBlock, mainIncrBinOp)
 				if arrayLenCap < 0 || ssaLoop.LaneCount <= int(arrayLenCap) {
+					// No cap needed, or type checker is within array bounds: use it.
 					laneCount = ssaLoop.LaneCount
+				} else if int(arrayLenCap) > laneCount {
+					// Type checker exceeds the array length, and iterator fallback is
+					// narrower than array length (e.g., [4]uint16 on x86-64: checker=8,
+					// array len=4, iterator fallback=2). Use array length as the lane count.
+					laneCount = int(arrayLenCap)
 				}
-				// If ssaLoop.LaneCount > arrayLenCap, keep the capped value from
-				// spmdRangeIndexLaneCount (already correct).
+				// If ssaLoop.LaneCount > arrayLenCap and heuristic already at or
+				// above arrayLenCap, keep the heuristic value (already correct).
 			}
 		} else {
 			elemType := b.getLLVMType(mainIterPhi.Type())
@@ -1253,24 +1306,32 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		// Compute lane count from the slice element type (if available) for optimal
 		// SIMD width. For []byte slices this yields 16 lanes instead of 4.
 		laneCount := b.spmdRangeIndexLaneCount(boundValue, block, incrBinOp)
-		// If the heuristic fell back to iterator type but the type checker computed
-		// a wider lane count, prefer the type checker's value (index is decomposable).
-		// Exception: for fixed-size arrays the type checker does not account for
-		// array length (e.g., [4]uint16 → LaneCount=8 but only 4 elements exist).
-		// Use ssaLoop.BoundValue which retains the original [N]T array type (before
-		// predication converts IndexAddr+Load into SPMDLoad, losing the array type).
-		if loopInfo != nil && int(loopInfo.LaneCount) > laneCount {
+		// Only use the type checker's LaneCount when the heuristic fell back to
+		// the iterator type (indicating it found no reliable element type info).
+		// When the heuristic found the correct value (Strategies 0-3), it may already
+		// account for array-length capping; overriding with the type checker's wider
+		// value (which ignores array length) would cause OOB access.
+		// Compare against the fallback to detect whether the heuristic succeeded.
+		iterFallback := b.spmdLaneCount(b.getLLVMType(incrBinOp.Type()))
+		if loopInfo != nil && int(loopInfo.LaneCount) > laneCount && laneCount == iterFallback {
+			// Heuristic fell back to iterator type; try type checker's value.
 			// Scan the body block directly for array type info. This works even after
 			// predication replaces IndexAddr+Load with SPMDLoad (Strategy 3 in
-			// spmdRangeIndexArrayLenCap uses SPMDLoad.Source which retains the array type).
+			// spmdRangeIndexArrayLenCap uses SPMDLoad.Source which retains array type).
 			// Do NOT use ssaLoop.BoundValue here: comment-based ssaLoop matching may
 			// return a wrong loop (same "rangeindex.body" comment for multiple loops).
 			arrayLenCap := spmdRangeIndexArrayLenCap(boundValue, block, incrBinOp)
 			if arrayLenCap < 0 || int(loopInfo.LaneCount) <= int(arrayLenCap) {
+				// No cap needed, or type checker is within array bounds: use it.
 				laneCount = int(loopInfo.LaneCount)
+			} else if int(arrayLenCap) > laneCount {
+				// Type checker exceeds array length, and iterator fallback is narrower
+				// than array length (e.g., [4]uint16 on x86-64: checker=8, cap=4,
+				// fallback=2). Use array length as the correct lane count.
+				laneCount = int(arrayLenCap)
 			}
-			// If loopInfo.LaneCount > arrayLenCap, keep the capped value from
-			// spmdRangeIndexLaneCount (already correct).
+			// If loopInfo.LaneCount > arrayLenCap and heuristic already at or
+			// above arrayLenCap, keep the heuristic value (already correct).
 		}
 
 		// Scalar fallback: with laneCount=1 there is no vectorization. Skip
@@ -1372,6 +1433,21 @@ func (c *compilerContext) spmdLaneOffsetConst(laneCount int, elemType llvm.Type)
 	return llvm.ConstVector(elts, false)
 }
 
+// spmdBoundScalar returns the integer scalar bound for a SPMD loop.
+// For peeled rangeindex loops, loop.boundValue is the original range expression
+// (e.g., the array value [4]uint16) rather than an integer length. In that case
+// we extract the array length directly from the type as a constant. For all other
+// cases we call getValue and the result is already an integer.
+// The returned value has LLVM integer type compatible with intType (may differ in
+// width — caller must extend or truncate as needed).
+func (b *builder) spmdBoundScalar(loop *spmdActiveLoop, intType llvm.Type) llvm.Value {
+	if arrType, ok := loop.boundValue.Type().Underlying().(*types.Array); ok {
+		// Peeled rangeindex over [N]T: bound is the array length as a constant.
+		return llvm.ConstInt(intType, uint64(arrType.Len()), false)
+	}
+	return b.getValue(loop.boundValue, token.NoPos)
+}
+
 // emitSPMDBodyPrologue emits the lane indices and tail mask after phi compilation.
 // This transforms the scalar loop iterator into a vector of lane indices, and
 // computes a per-lane bounds check mask.
@@ -1433,10 +1509,15 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 				loop.tailMask = llvm.ConstAllOnes(maskType)
 			} else {
 				// Tail mask via <N x i8> comparison: offset < clamp(bound - base).
-				boundScalar := b.getValue(loop.boundValue, token.NoPos)
+				i32Type := b.ctx.Int32Type()
+				boundScalar := b.spmdBoundScalar(loop, i32Type)
+				// Ensure boundScalar is i32 for the sub/clamp arithmetic.
+				if boundScalar.Type() != i32Type {
+					boundScalar = b.CreateTrunc(boundScalar, i32Type, "spmd.bound.narrow")
+				}
 				diff := b.CreateSub(boundScalar, scalarPhi, "spmd.diff")
-				zero32 := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
-				lcConst := llvm.ConstInt(b.ctx.Int32Type(), uint64(laneCount), false)
+				zero32 := llvm.ConstInt(i32Type, 0, false)
+				lcConst := llvm.ConstInt(i32Type, uint64(laneCount), false)
 				diffClamped := b.CreateSelect(
 					b.CreateICmp(llvm.IntSGT, diff, lcConst, ""),
 					lcConst, diff, "spmd.diff.clamped")
@@ -1456,6 +1537,19 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 
 		// Non-decomposed peeled path: full <laneCount x elemType> lane indices.
 		elemType := scalarPhi.Type()
+		// Narrow the index element type when it would produce a vector wider than
+		// 128 bits. For example, range over [4]uint16 with int index on x86-64:
+		// laneCount=4, elemType=i64 → <4 x i64>=256 bits, too wide. Truncate to i32
+		// → <4 x i32>=128 bits.
+		elemBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8
+		if uint64(loop.laneCount)*elemBits > 128 {
+			narrowBits := uint64(128) / uint64(loop.laneCount)
+			elemType = b.ctx.IntType(int(narrowBits))
+			scalarPhi = b.CreateTrunc(scalarPhi, elemType, "spmd.iter.narrow")
+			// Update scalarIterVal to the narrowed scalar so contiguous detection
+			// and GEP index extension (extendInteger) use the correct value.
+			loop.scalarIterVal = scalarPhi
+		}
 		vecType := llvm.VectorType(elemType, loop.laneCount)
 		iterVec := b.splatScalar(scalarPhi, vecType)
 		offsetVec := b.spmdLaneOffsetConst(loop.laneCount, elemType)
@@ -1466,9 +1560,31 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 			// Main body: all-ones mask (all lanes active).
 			maskType := llvm.VectorType(b.spmdMaskElemType(loop.laneCount), loop.laneCount)
 			loop.tailMask = llvm.ConstAllOnes(maskType)
+
+			// Peeled rangeindex: the incrBinOp (mainIterPhi + laneCount) is compiled
+			// inside this body block where spmdValueOverride makes it produce a vector.
+			// But it is also the phi back-edge and must stay scalar for LLVM phi validity.
+			// Pre-compute the scalar next-iteration value and register it in
+			// spmdPeeledScalarIncr so the phi resolution loop can use it instead.
+			if loop.incrBinOp != nil {
+				laneCountScalar := llvm.ConstInt(elemType, uint64(loop.laneCount), false)
+				scalarIncr := b.CreateAdd(scalarPhi, laneCountScalar, "spmd.iter.incr")
+				if b.spmdPeeledScalarIncr == nil {
+					b.spmdPeeledScalarIncr = make(map[ssa.Value]llvm.Value)
+				}
+				b.spmdPeeledScalarIncr[loop.incrBinOp] = scalarIncr
+			}
 		} else {
 			// Tail body: compute tail mask (laneIndices < bound).
-			boundScalar := b.getValue(loop.boundValue, token.NoPos)
+			boundScalar := b.spmdBoundScalar(loop, elemType)
+			// Narrow or extend bound to match the (possibly narrowed) elemType.
+			if boundScalar.Type() != elemType {
+				if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(elemType) {
+					boundScalar = b.CreateTrunc(boundScalar, elemType, "spmd.bound.narrow")
+				} else {
+					boundScalar = b.CreateZExt(boundScalar, elemType, "spmd.bound.zext")
+				}
+			}
 			boundVec := b.splatScalar(boundScalar, vecType)
 			tailMaskI1 := b.CreateICmp(llvm.IntSLT, laneIndices, boundVec, "spmd.tail.mask")
 			loop.tailMask = b.spmdWrapMask(tailMaskI1, loop.laneCount)
@@ -1517,12 +1633,17 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 		// Compute tail mask using <N x i8> comparison to stay within 128-bit registers.
 		// diff = bound - base (scalar i32); clamp to [0, laneCount]; truncate to i8.
 		// Then compare: offset < clamp(diff) using unsigned <N x i8> comparison.
-		boundScalar := b.getValue(loop.boundValue, token.NoPos)
+		i32Type := b.ctx.Int32Type()
+		boundScalar := b.spmdBoundScalar(loop, i32Type)
+		// Ensure boundScalar is i32 for the sub/clamp arithmetic.
+		if boundScalar.Type() != i32Type {
+			boundScalar = b.CreateTrunc(boundScalar, i32Type, "spmd.bound.narrow")
+		}
 		diff := b.CreateSub(boundScalar, scalarPhi, "spmd.diff")
 
 		// Clamp diff to [0, laneCount]: max(0, min(laneCount, diff)).
-		zero32 := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
-		lcConst := llvm.ConstInt(b.ctx.Int32Type(), uint64(laneCount), false)
+		zero32 := llvm.ConstInt(i32Type, 0, false)
+		lcConst := llvm.ConstInt(i32Type, uint64(laneCount), false)
 		// min(laneCount, diff): if diff > laneCount, use laneCount
 		diffClamped := b.CreateSelect(
 			b.CreateICmp(llvm.IntSGT, diff, lcConst, ""),
@@ -1553,6 +1674,20 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	// Get element type from the scalar phi (e.g., i32 for int on WASM).
 	elemType := scalarPhi.Type()
 
+	// Narrow the index element type when it would produce a vector wider than
+	// 128 bits. For example, range over [4]uint16 with int index on x86-64:
+	// laneCount=4, elemType=i64 → <4 x i64>=256 bits, too wide. Truncate to i32
+	// → <4 x i32>=128 bits.
+	elemBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8
+	if uint64(loop.laneCount)*elemBits > 128 {
+		narrowBits := uint64(128) / uint64(loop.laneCount)
+		elemType = b.ctx.IntType(int(narrowBits))
+		scalarPhi = b.CreateTrunc(scalarPhi, elemType, "spmd.iter.narrow")
+		// Update scalarIterVal to the narrowed scalar so contiguous detection
+		// and GEP index extension (extendInteger) use the correct value.
+		loop.scalarIterVal = scalarPhi
+	}
+
 	// Create vector type for the lane count.
 	vecType := llvm.VectorType(elemType, loop.laneCount)
 
@@ -1566,7 +1701,15 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
 
 	// Get the bound value and splat it.
-	boundScalar := b.getValue(loop.boundValue, token.NoPos)
+	boundScalar := b.spmdBoundScalar(loop, elemType)
+	// Narrow or extend bound to match the (possibly narrowed) elemType.
+	if boundScalar.Type() != elemType {
+		if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(elemType) {
+			boundScalar = b.CreateTrunc(boundScalar, elemType, "spmd.bound.narrow")
+		} else {
+			boundScalar = b.CreateZExt(boundScalar, elemType, "spmd.bound.zext")
+		}
+	}
 	boundVec := b.splatScalar(boundScalar, vecType)
 
 	// Compute tail mask: laneIndices < bound (per-lane comparison).

@@ -197,6 +197,13 @@ type builder struct {
 	// spmd.break.mask phi for that loop. Used for early-exit in SPMD function bodies.
 	// Non-nil only when fn.SPMDRegularBreaks is populated and spmdFuncIsBody is true.
 	spmdBreakMaskBackEdges map[int]ssa.Value
+	// spmdPeeledScalarIncr maps the incrBinOp SSA value of a peeled rangeindex loop to
+	// the scalar LLVM value representing "next loop start = scalarIterVal + laneCount".
+	// Used during phi resolution to supply the correct scalar back-edge value for the
+	// loop phi, which would otherwise resolve to a vector (because incrBinOp is compiled
+	// inside the body block where spmdValueOverride is active). This map is never cleared
+	// between blocks (unlike spmdValueOverride) so it is always accessible at phi resolution.
+	spmdPeeledScalarIncr map[ssa.Value]llvm.Value
 	// spmdVecShadow tracks shadow vector values for allocas promoted by
 	// spmdPromoteByteArrayCopyToVector. Nil when no such alloca exists.
 	spmdVecShadow *spmdVecShadowState
@@ -1659,6 +1666,15 @@ func (b *builder) createFunction() {
 		block := phi.ssa.Block()
 		for i, edge := range phi.ssa.Edges {
 			llvmVal := b.getValue(edge, getPos(phi.ssa))
+			// SPMD: for peeled rangeindex loops, the incrBinOp (mainIterPhi + laneCount)
+			// is compiled inside the body block where spmdValueOverride makes it produce a
+			// vector. The loop phi back-edge expects a scalar. Use the pre-computed scalar
+			// increment value stored during emitSPMDBodyPrologue instead.
+			if b.spmdPeeledScalarIncr != nil {
+				if scalarIncr, ok := b.spmdPeeledScalarIncr[edge]; ok {
+					llvmVal = scalarIncr
+				}
+			}
 			llvmVal = b.spmdRangeIndexInitOverride(phi.ssa, i, llvmVal)
 			// SPMD: reconcile Varying[bool] mask format mismatches. A phi may
 			// carry type <16 x i1> (from getLLVMType on Varying[bool]) while an
@@ -2603,11 +2619,14 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					if !loop.scalarIterVal.IsNil() {
 						x = loop.scalarIterVal
 					}
-					// For SSA-peeled loops, Y is already laneCount in the SSA.
-					// Only override Y for non-peeled loops.
-					if !loop.isPeeled {
-						y = llvm.ConstInt(x.Type(), uint64(loop.laneCount), false)
-					}
+					// Override Y to match X's (possibly narrowed) type. For non-peeled
+					// loops, X is the scalar iter value and Y must be set explicitly.
+					// For peeled loops, Y is already the correct laneCount constant in
+					// the SSA, but its Go type (int → i64 on x86-64) may not match the
+					// narrowed X type (i32 after truncation for wide-int platforms).
+					// Always recompute Y from X's actual LLVM type to ensure type
+					// consistency in CreateAdd and produce a scalar result for the phi.
+					y = llvm.ConstInt(x.Type(), uint64(loop.laneCount), false)
 				}
 			}
 		}
@@ -2716,6 +2735,17 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					// the source directly so all downstream comparisons and arithmetic
 					// operate on the WASM-legal wider representation. spmdBroadcastMatch
 					// will resize constants to match at comparison sites.
+					changeTypeResult = x
+				} else if x.Type().VectorSize() == llvmType.VectorSize() &&
+					x.Type().ElementType().TypeKind() == llvm.IntegerTypeKind &&
+					llvmType.ElementType().TypeKind() == llvm.IntegerTypeKind &&
+					x.Type().ElementType() != llvmType.ElementType() {
+					// SPMD: same lane count but different integer element widths. This
+					// arises when the loop iterator is narrowed (e.g., <4 x i32> instead
+					// of <4 x i64> for [4]uint16 on x86-64) and a changetype tries to
+					// widen it to the declared Varying[int] type (<4 x i64>). The narrowed
+					// value is correct for all downstream SIMD operations; using it as-is
+					// avoids an invalid bitcast between differently-sized vector types.
 					changeTypeResult = x
 				} else {
 					changeTypeResult = b.CreateBitCast(x, llvmType, "changetype.vec")
