@@ -288,10 +288,75 @@ func (c *compilerContext) spmdEffectiveLaneCount(spmdType *types.SPMDType, elemL
 	return c.spmdLaneCount(elemLLVM)
 }
 
+// spmdRangeIndexArrayLenCap returns the fixed array length if the rangeindex
+// loop iterates over a fixed-size array, or -1 for slices/unknown.
+//
+// Used to cap lane count for rangeindex loops over fixed-size arrays: the SIMD
+// width may exceed the array length (e.g., [4]uint16: 128/16=8 lanes but only 4
+// elements), which would cause out-of-bounds access at lanes 4-7.
+//
+// Detection strategy (in order):
+//  1. BoundValue has array type [N]T (pre-peel case, before BoundValue updated).
+//  2. Body block contains an IndexAddr over *[N]T (non-predicated body).
+//  3. Body block contains an SPMDLoad with Contiguous Source of type *[N]T
+//     (post-predication: IndexAddr+Load was replaced with SPMDLoad, but Source
+//     retains the original IndexAddr.X pointer with type *[N]T).
+func spmdRangeIndexArrayLenCap(boundValue ssa.Value, bodyBlock *ssa.BasicBlock, incrBinOp *ssa.BinOp) int64 {
+	// Strategy 1: BoundValue has array type — set before predication.
+	if arrType, ok := boundValue.Type().Underlying().(*types.Array); ok {
+		return arrType.Len()
+	}
+
+	if bodyBlock == nil {
+		return -1
+	}
+
+	for _, instr := range bodyBlock.Instrs {
+		switch v := instr.(type) {
+		case *ssa.Index:
+			// Strategy 2: raw Index (array value access, e.g. arr[i] where arr is [N]T).
+			// For array value access (not pointer), X.Type() is directly [N]T.
+			if arrType, ok := v.X.Type().Underlying().(*types.Array); ok {
+				return arrType.Len()
+			}
+			// Found Index over string/slice — no cap needed.
+			return -1
+		case *ssa.IndexAddr:
+			// Strategy 2b: raw IndexAddr still present (non-predicated body with pointer access).
+			if ptrType, ok := v.X.Type().Underlying().(*types.Pointer); ok {
+				if arrType, ok := ptrType.Elem().Underlying().(*types.Array); ok {
+					return arrType.Len()
+				}
+			}
+			// Found IndexAddr over slice — no cap needed.
+			return -1
+		case *ssa.SPMDLoad:
+			// Strategy 3: post-predication, Source = IndexAddr.X retains the
+			// original array pointer type.
+			if !v.Contiguous || v.Source == nil {
+				continue
+			}
+			if ptrType, ok := v.Source.Type().Underlying().(*types.Pointer); ok {
+				if arrType, ok := ptrType.Elem().Underlying().(*types.Array); ok {
+					return arrType.Len()
+				}
+			}
+			// Found SPMDLoad over slice — no cap needed.
+			return -1
+		}
+	}
+	return -1
+}
+
 // spmdRangeIndexLaneCount computes the lane count for a range-over-slice SPMD loop
 // by examining the slice element type instead of the iterator's int type.
 // For []byte slices, this yields 128/8=16 lanes (native v128) instead of 128/32=4.
 // Falls back to the iterator type when no slice element type can be determined.
+//
+// For fixed-length arrays, the lane count is capped at the array length to prevent
+// OOB access. For example, [4]uint16 has elem size 2 → 8 lanes from SIMD width, but
+// only 4 elements exist, so laneCount is capped to 4 → <4 x i16> = 64-bit vector.
+// The sub-128-bit widening in spmdMaskElemType handles the resulting narrow vector.
 //
 // Strategy 2 (IndexAddr scan) requires the index to be exactly incrBinOp — it does
 // not trace through ChangeType chains. This is sufficient for the common range-over-slice
@@ -310,18 +375,28 @@ func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.B
 		}
 	}
 
-	// Strategy 2: scan the body block for an IndexAddr whose index traces back
-	// to incrBinOp, and extract the element type from its base.
+	// Strategy 2: scan the body block for an Index or IndexAddr whose index
+	// traces back to incrBinOp, and extract the element type from its base.
+	//
+	// Two access patterns:
+	//   - *ssa.Index: x[i] where x is an array VALUE (e.g. [4]uint16); X.Type() = [N]T.
+	//   - *ssa.IndexAddr: &x[i] where x is a slice or *array; X.Type() = []T or *[N]T.
 	//
 	// In SPMD context, the index may be wrapped in a ChangeType to lanes.Varying[int],
 	// so we unwrap ChangeType chains before comparing.
 	for _, instr := range bodyBlock.Instrs {
-		ia, ok := instr.(*ssa.IndexAddr)
-		if !ok {
+		var xVal ssa.Value
+		var idxVal ssa.Value
+		switch v := instr.(type) {
+		case *ssa.Index:
+			xVal, idxVal = v.X, v.Index
+		case *ssa.IndexAddr:
+			xVal, idxVal = v.X, v.Index
+		default:
 			continue
 		}
 		// Unwrap ChangeType chains from the index (SPMD wraps int → Varying[int]).
-		idx := ia.Index
+		idx := idxVal
 		for ct, ok := idx.(*ssa.ChangeType); ok; ct, ok = idx.(*ssa.ChangeType) {
 			idx = ct.X
 		}
@@ -331,16 +406,32 @@ func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.B
 		}
 		// Determine element type to compute lane count.
 		var elemType types.Type
-		if sliceType, ok := ia.X.Type().Underlying().(*types.Slice); ok {
+		var arrayLen int64 = -1 // -1 means no cap (slice or unknown)
+		xType := xVal.Type().Underlying()
+		if arrType, ok := xType.(*types.Array); ok {
+			// *ssa.Index with array value: X.Type() = [N]T.
+			elemType = arrType.Elem()
+			arrayLen = arrType.Len()
+		} else if sliceType, ok := xType.(*types.Slice); ok {
+			// *ssa.IndexAddr with slice: X.Type() = []T.
 			elemType = sliceType.Elem()
-		} else if ptrType, ok := ia.X.Type().Underlying().(*types.Pointer); ok {
+		} else if ptrType, ok := xType.(*types.Pointer); ok {
 			if arrType, ok := ptrType.Elem().Underlying().(*types.Array); ok {
+				// *ssa.IndexAddr with *[N]T.
 				elemType = arrType.Elem()
+				arrayLen = arrType.Len()
 			}
 		}
 		if elemType != nil {
 			elemLLVM := b.getLLVMType(elemType)
-			return b.spmdLaneCount(elemLLVM)
+			laneCount := b.spmdLaneCount(elemLLVM)
+			// Cap lane count at array length for fixed-size arrays.
+			// Prevents OOB access when simd_width/elem_size > array_length
+			// (e.g., [4]uint16: 128/16=8 lanes but only 4 elements exist).
+			if arrayLen > 0 && int64(laneCount) > arrayLen {
+				laneCount = int(arrayLen)
+			}
+			return laneCount
 		}
 	}
 
@@ -846,8 +937,16 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			// checker computed a wider lane count (e.g., 16 for byte arrays),
 			// prefer the type checker's value. The index is decomposable so its
 			// int size should not limit the lane count.
+			// Exception: for fixed-size arrays the type checker does not account
+			// for array length (e.g., [4]uint16 → LaneCount=8 but only 4 elements
+			// exist). Cap the override against the array length so we never exceed it.
 			if ssaLoop.LaneCount > laneCount {
-				laneCount = ssaLoop.LaneCount
+				arrayLenCap := spmdRangeIndexArrayLenCap(ssaLoop.BoundValue, ssaLoop.MainBodyBlock, mainIncrBinOp)
+				if arrayLenCap < 0 || ssaLoop.LaneCount <= int(arrayLenCap) {
+					laneCount = ssaLoop.LaneCount
+				}
+				// If ssaLoop.LaneCount > arrayLenCap, keep the capped value from
+				// spmdRangeIndexLaneCount (already correct).
 			}
 		} else {
 			elemType := b.getLLVMType(mainIterPhi.Type())
@@ -1134,27 +1233,9 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			continue
 		}
 
-		// Compute lane count from the slice element type (if available) for optimal
-		// SIMD width. For []byte slices this yields 16 lanes instead of 4.
-		laneCount := b.spmdRangeIndexLaneCount(boundValue, block, incrBinOp)
-		// If the heuristic fell back to iterator type but the type checker computed
-		// a wider lane count, prefer the type checker's value (index is decomposable).
-		if loopInfo != nil && int(loopInfo.LaneCount) > laneCount {
-			laneCount = int(loopInfo.LaneCount)
-		}
-
-		// Scalar fallback: with laneCount=1 there is no vectorization. Skip
-		// SPMD loop registration so the loop executes as a plain scalar loop.
-		if !b.simdEnabled {
-			continue
-		}
-
-		// On WASM with laneCount > 4, a naive <laneCount x i32> index vector would
-		// be wider than 128 bits (e.g., <16 x i32> is 512-bit). Use decomposed
-		// representation (scalar base + <N x i8> offset) to stay within 128 bits.
-		isDecomposed := b.spmdIsWASM() && laneCount > 4
-
 		// Find matching x-tools-spmd SPMDLoopInfo for non-peeled rangeindex loops.
+		// Do this BEFORE computing lane count so we can use ssaLoop.BoundValue
+		// (which retains the original array type [N]T) for the array-length cap.
 		// This enables TailMask registration so SSA-level masked loads use the
 		// correct tail mask instead of all-ones.
 		// Match by BodyBlock pointer first, then fall back to comment matching
@@ -1168,6 +1249,40 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 				}
 			}
 		}
+
+		// Compute lane count from the slice element type (if available) for optimal
+		// SIMD width. For []byte slices this yields 16 lanes instead of 4.
+		laneCount := b.spmdRangeIndexLaneCount(boundValue, block, incrBinOp)
+		// If the heuristic fell back to iterator type but the type checker computed
+		// a wider lane count, prefer the type checker's value (index is decomposable).
+		// Exception: for fixed-size arrays the type checker does not account for
+		// array length (e.g., [4]uint16 → LaneCount=8 but only 4 elements exist).
+		// Use ssaLoop.BoundValue which retains the original [N]T array type (before
+		// predication converts IndexAddr+Load into SPMDLoad, losing the array type).
+		if loopInfo != nil && int(loopInfo.LaneCount) > laneCount {
+			// Scan the body block directly for array type info. This works even after
+			// predication replaces IndexAddr+Load with SPMDLoad (Strategy 3 in
+			// spmdRangeIndexArrayLenCap uses SPMDLoad.Source which retains the array type).
+			// Do NOT use ssaLoop.BoundValue here: comment-based ssaLoop matching may
+			// return a wrong loop (same "rangeindex.body" comment for multiple loops).
+			arrayLenCap := spmdRangeIndexArrayLenCap(boundValue, block, incrBinOp)
+			if arrayLenCap < 0 || int(loopInfo.LaneCount) <= int(arrayLenCap) {
+				laneCount = int(loopInfo.LaneCount)
+			}
+			// If loopInfo.LaneCount > arrayLenCap, keep the capped value from
+			// spmdRangeIndexLaneCount (already correct).
+		}
+
+		// Scalar fallback: with laneCount=1 there is no vectorization. Skip
+		// SPMD loop registration so the loop executes as a plain scalar loop.
+		if !b.simdEnabled {
+			continue
+		}
+
+		// On WASM with laneCount > 4, a naive <laneCount x i32> index vector would
+		// be wider than 128 bits (e.g., <16 x i32> is 512-bit). Use decomposed
+		// representation (scalar base + <N x i8> offset) to stay within 128 bits.
+		isDecomposed := b.spmdIsWASM() && laneCount > 4
 
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
