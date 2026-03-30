@@ -2575,7 +2575,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				result, isMaterialized := b.spmdDecomposedBinOp(expr, decompX, true)
 				if !isMaterialized {
 					// Comparison or materialized value: wrap mask if needed and return.
-					if b.spmdIsWASM() &&
+					if b.spmdUsesSIMD() &&
 						result.Type().TypeKind() == llvm.VectorTypeKind &&
 						result.Type().ElementType() == b.ctx.Int1Type() {
 						result = b.spmdWrapMask(result, result.Type().VectorSize())
@@ -2595,7 +2595,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			if decompY, ok := b.spmdDecomposed[expr.Y]; ok {
 				result, isMaterialized := b.spmdDecomposedBinOp(expr, decompY, false)
 				if !isMaterialized {
-					if b.spmdIsWASM() &&
+					if b.spmdUsesSIMD() &&
 						result.Type().TypeKind() == llvm.VectorTypeKind &&
 						result.Type().ElementType() == b.ctx.Int1Type() {
 						result = b.spmdWrapMask(result, result.Type().VectorSize())
@@ -2634,13 +2634,14 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		if err != nil {
 			return result, err
 		}
-		// SPMD: on WASM, sign-extend <N x i1> comparison results to <N x i32>.
-		// LLVM's WASM backend folds sext(cmp) into the comparison instruction (no
-		// runtime cost), and downstream uses (bitselect mask, any_true)
-		// work directly on <N x i32> without additional conversions.
+		// SPMD: sign-extend <N x i1> comparison results to <N x i32> (or the
+		// platform mask element type). LLVM folds sext(cmp) into the comparison
+		// instruction (no runtime cost), and downstream uses (select mask, any_true)
+		// work directly on the widened format without additional conversions.
+		// Applies to all SIMD-enabled targets (WASM and x86-64), not just WASM.
 		// Note: UnOp NOT on Varying[bool] (token.NOT case in createUnOp) is not yet
 		// wrapped here — that is a known gap for future work.
-		if b.spmdIsWASM() &&
+		if b.spmdUsesSIMD() &&
 			result.Type().TypeKind() == llvm.VectorTypeKind &&
 			result.Type().ElementType() == b.ctx.Int1Type() {
 			laneCount := result.Type().VectorSize()
@@ -4255,14 +4256,14 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 				// value is <16 x i8>. Using getLLVMType(typeTo) would convert to the
 				// wrong lane count.
 				//
-				// On WASM, if the source is already a WASM mask format integer vector
-				// (<N x iW> where iW is i8, i16, or i32), return it as-is. The lane
-				// count must match the enclosing SPMD loop context, not the hardcoded
-				// 4-lane MaskType. Converting bool→mask is a type annotation only.
-				if b.spmdIsWASM() && value.Type().TypeKind() == llvm.VectorTypeKind {
+				// On SIMD targets (WASM and x86), if the source is already in the
+				// widened mask format (<N x iW> where iW != i1), return it as-is.
+				// The lane count must match the enclosing SPMD loop context, not the
+				// hardcoded 4-lane MaskType. Converting bool→mask is a type annotation only.
+				if b.spmdUsesSIMD() && value.Type().TypeKind() == llvm.VectorTypeKind {
 					srcElem := value.Type().ElementType()
 					if srcElem != b.ctx.Int1Type() {
-						// Already in WASM mask format. Return as-is.
+						// Already in widened SIMD mask format. Return as-is.
 						return value, nil
 					}
 					// Source is <N x i1>; widen to WASM format for the same lane count.

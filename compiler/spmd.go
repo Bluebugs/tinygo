@@ -2421,7 +2421,7 @@ func (c *compilerContext) spmdMaskType(fn *ssa.Function) llvm.Type {
 }
 
 // spmdMaskTypeFromSig returns the LLVM mask type for an SPMD signature's implicit mask parameter.
-// On WASM the mask is <N x i32>; on other targets it is <N x i1>.
+// On SIMD targets the mask is <N x iW> (e.g., <4 x i32>); on non-SIMD targets it is <N x i1>.
 // N is determined by the first varying parameter's element type.
 // Returns zero-value llvm.Type{} if the signature has no varying parameters.
 func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
@@ -2447,10 +2447,10 @@ func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
 	return llvm.Type{} // No varying parameters
 }
 
-// spmdWrapMask sign-extends an <N x i1> comparison result to the WASM mask type
+// spmdWrapMask sign-extends an <N x i1> comparison result to the SIMD mask type
 // (e.g., <4 x i32> for 4 lanes, <8 x i16> for 8 lanes, <16 x i8> for 16 lanes).
-// On non-WASM targets this is a no-op. LLVM's WASM backend folds sext(cmp)
-// into a single WASM comparison instruction, so there is no runtime cost.
+// On non-SIMD targets this is a no-op. LLVM folds sext(cmp) into the comparison
+// instruction on both WASM and x86, so there is no runtime cost.
 func (b *builder) spmdWrapMask(cmp llvm.Value, laneCount int) llvm.Value {
 	if !b.spmdUsesSIMD() {
 		return cmp
