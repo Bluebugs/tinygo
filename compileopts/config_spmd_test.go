@@ -151,6 +151,56 @@ func TestSIMDEnabledMethod(t *testing.T) {
 	}
 }
 
+func TestSIMDRegisterSizeAVX2(t *testing.T) {
+	c := &Config{
+		Target:  &TargetSpec{GOARCH: "amd64"},
+		Options: &Options{GOExperiment: "spmd", LLVMFeatures: "+ssse3,+sse4.2,+avx2"},
+	}
+	if got := c.SIMDRegisterSize(); got != 32 {
+		t.Errorf("SIMDRegisterSize() = %d, want 32 for AVX2", got)
+	}
+}
+
+func TestSIMDRegisterSizeAVX512(t *testing.T) {
+	c := &Config{
+		Target:  &TargetSpec{GOARCH: "amd64"},
+		Options: &Options{GOExperiment: "spmd", LLVMFeatures: "+avx512f"},
+	}
+	if got := c.SIMDRegisterSize(); got != 64 {
+		t.Errorf("SIMDRegisterSize() = %d, want 64 for AVX-512", got)
+	}
+}
+
+func TestSIMDRegisterSizeSSEDefault(t *testing.T) {
+	c := &Config{
+		Target:  &TargetSpec{GOARCH: "amd64"},
+		Options: &Options{GOExperiment: "spmd", LLVMFeatures: "+ssse3"},
+	}
+	if got := c.SIMDRegisterSize(); got != 16 {
+		t.Errorf("SIMDRegisterSize() = %d, want 16 for SSE", got)
+	}
+}
+
+func TestSIMDRegisterSizeWASM(t *testing.T) {
+	c := &Config{
+		Target:  &TargetSpec{GOARCH: "wasm"},
+		Options: &Options{GOExperiment: "spmd"},
+	}
+	if got := c.SIMDRegisterSize(); got != 16 {
+		t.Errorf("SIMDRegisterSize() = %d, want 16 for WASM", got)
+	}
+}
+
+func TestSIMDRegisterSizeScalar(t *testing.T) {
+	c := &Config{
+		Target:  &TargetSpec{GOARCH: "amd64"},
+		Options: &Options{GOExperiment: "spmd", SIMD: "false", LLVMFeatures: "+avx2"},
+	}
+	if got := c.SIMDRegisterSize(); got != 1 {
+		t.Errorf("SIMDRegisterSize() = %d, want 1 for scalar mode", got)
+	}
+}
+
 func TestGOExperiment(t *testing.T) {
 	c := &Config{
 		Options: &Options{GOExperiment: "spmd"},

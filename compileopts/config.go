@@ -115,15 +115,27 @@ func (c *Config) SIMDEnabled() bool {
 
 // SIMDRegisterSize returns the SIMD register width in bytes for the current target.
 // Returns 1 when SIMD is disabled (-simd=false) to force laneCount=1 in the type checker.
-// Returns 16 by default (128-bit SIMD for WASM SIMD128, SSE, NEON).
+// Detects AVX-512 (64 bytes), AVX2 (32 bytes), or defaults to 128-bit (16 bytes).
 func (c *Config) SIMDRegisterSize() int64 {
 	if c.Options.SIMD == "false" {
 		return 1
 	}
-	if c.SIMDEnabled() {
-		return 16 // WASM SIMD128 = 128 bits = 16 bytes
+	if !c.SIMDEnabled() {
+		return 16
 	}
-	return 16 // default for non-WASM targets
+	// WASM always uses 128-bit SIMD.
+	if c.Target.GOARCH == "wasm" {
+		return 16
+	}
+	// x86-64: detect wider SIMD from features.
+	features := c.Features()
+	if strings.Contains(features, "+avx512f") {
+		return 64
+	}
+	if strings.Contains(features, "+avx2") {
+		return 32
+	}
+	return 16 // SSE2/SSE4 baseline
 }
 
 // ABI returns the -mabi= flag for this target (like -mabi=lp64). A zero-length
