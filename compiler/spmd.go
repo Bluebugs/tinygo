@@ -267,8 +267,18 @@ func (c *compilerContext) hasSPMDCode() bool {
 	return c.spmdInfo != nil
 }
 
+// spmdRegisterBytes returns the SIMD register width in bytes.
+// 16 for SSE/WASM SIMD128, 32 for AVX2, 64 for AVX-512.
+// Defaults to 16 if not configured.
+func (c *compilerContext) spmdRegisterBytes() int {
+	if c.SIMDRegisterBytes > 0 {
+		return c.SIMDRegisterBytes
+	}
+	return 16
+}
+
 // spmdLaneCount returns the number of SIMD lanes for a given LLVM element type.
-// For WASM SIMD128: 128 bits / element size in bits.
+// Register width in bytes divided by element size in bytes.
 // Returns 1 in scalar fallback mode (-simd=false) so that Varying[T] maps to
 // the scalar T LLVM type rather than a vector type.
 func (c *compilerContext) spmdLaneCount(elemType llvm.Type) int {
@@ -279,7 +289,7 @@ func (c *compilerContext) spmdLaneCount(elemType llvm.Type) int {
 	if elemSize == 0 {
 		return 1
 	}
-	return 16 / int(elemSize) // 128-bit SIMD
+	return c.spmdRegisterBytes() / int(elemSize)
 }
 
 // spmdEffectiveLaneCount returns the lane count for an SPMDType derived from
@@ -578,11 +588,11 @@ func (b *builder) vectorToArray(vec llvm.Value) llvm.Value {
 // with its mask: struct{ Value [N]T; Mask [N]int32 }.
 func (c *compilerContext) spmdBoxedVaryingGoType(spmdType *types.SPMDType, laneCount int) *types.Struct {
 	arrayType := types.NewArray(spmdType.Elem(), int64(laneCount))
-	// Mask element type must match spmdMaskElemType: WASM uses 128/laneCount bits
-	// (2→int64, 4→int32, 8→int16, 16→int8), non-WASM uses int8 (for i1).
+	// Mask element type must match spmdMaskElemType: SIMD targets use regBits/laneCount
+	// bits per lane (2→int64, 4→int32, 8→int16, 16→int8), non-SIMD uses int8 (for i1).
 	var maskElemGoType types.Type
 	if c.spmdUsesSIMD() {
-		switch 128 / laneCount {
+		switch c.spmdRegisterBytes() * 8 / laneCount {
 		case 64:
 			maskElemGoType = types.Typ[types.Int64]
 		case 32:
@@ -2404,12 +2414,14 @@ func (b *builder) spmdIsConstAllOnesMask(mask llvm.Value) bool {
 }
 
 // spmdMaskElemType returns the LLVM element type for SPMD mask vectors.
-// On WASM targets, the mask element type is sized to keep the mask in a single
-// 128-bit v128 register: i32 for 4 lanes, i16 for 8, i8 for 16.
+// On SIMD targets, the mask element type is sized to fill the register:
+// regBits/laneCount bits per lane (e.g., 256-bit AVX2 with 8 lanes → i32,
+// 128-bit SIMD128 with 4 lanes → i32, 8 lanes → i16, 16 lanes → i8).
 // On other targets this is always i1 (native LLVM boolean vector element).
 func (c *compilerContext) spmdMaskElemType(laneCount int) llvm.Type {
 	if c.spmdUsesSIMD() {
-		return c.ctx.IntType(128 / laneCount) // 4→i32, 8→i16, 16→i8
+		regBits := c.spmdRegisterBytes() * 8
+		return c.ctx.IntType(regBits / laneCount)
 	}
 	return c.ctx.Int1Type()
 }

@@ -54,6 +54,7 @@ type Config struct {
 
 	// Various compiler options that determine how code is generated.
 	SIMDEnabled        bool   // false for scalar fallback mode (-simd=false)
+	SIMDRegisterBytes  int    // SIMD register width in bytes: 16 (SSE/WASM), 32 (AVX2), 64 (AVX-512)
 	Scheduler          string
 	AutomaticStackSize bool
 	DefaultStackSize   uint64

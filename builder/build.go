@@ -209,6 +209,7 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 		TinyGoVersion:   goenv.Version(),
 
 		SIMDEnabled:        config.SIMDEnabled(),
+		SIMDRegisterBytes:  int(config.SIMDRegisterSize()),
 		Scheduler:          config.Scheduler(),
 		AutomaticStackSize: config.AutomaticStackSize(),
 		DefaultStackSize:   config.StackSize(),

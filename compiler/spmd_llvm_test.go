@@ -7073,6 +7073,43 @@ func TestSPMDSwizzleVector(t *testing.T) {
 	}
 }
 
+func TestSPMDLaneCountAVX2(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	c.SIMDRegisterBytes = 32
+
+	i32 := c.ctx.Int32Type()
+	i16 := c.ctx.Int16Type()
+	i8 := c.ctx.Int8Type()
+
+	if lc := c.spmdLaneCount(i32); lc != 8 {
+		t.Errorf("spmdLaneCount(i32) = %d, want 8 for AVX2", lc)
+	}
+	if lc := c.spmdLaneCount(i16); lc != 16 {
+		t.Errorf("spmdLaneCount(i16) = %d, want 16 for AVX2", lc)
+	}
+	if lc := c.spmdLaneCount(i8); lc != 32 {
+		t.Errorf("spmdLaneCount(i8) = %d, want 32 for AVX2", lc)
+	}
+}
+
+func TestSPMDMaskElemTypeAVX2(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	c.SIMDRegisterBytes = 32
+
+	// 8 lanes on 256-bit → 256/8 = i32.
+	maskElem := c.spmdMaskElemType(8)
+	if maskElem != c.ctx.Int32Type() {
+		t.Errorf("spmdMaskElemType(8) on AVX2 = %v, want i32", maskElem)
+	}
+	// 16 lanes on 256-bit → 256/16 = i16.
+	maskElem16 := c.spmdMaskElemType(16)
+	if maskElem16 != c.ctx.Int16Type() {
+		t.Errorf("spmdMaskElemType(16) on AVX2 = %v, want i16", maskElem16)
+	}
+}
+
 // newTestCompilerContextX86 creates a minimal compiler context for testing x86 SPMD functionality.
 func newTestCompilerContextX86(t *testing.T) *compilerContext {
 	t.Helper()
