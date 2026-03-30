@@ -302,7 +302,7 @@ func (c *compilerContext) spmdEffectiveLaneCount(spmdType *types.SPMDType, elemL
 // loop iterates over a fixed-size array, or -1 for slices/unknown.
 //
 // Used to cap lane count for rangeindex loops over fixed-size arrays: the SIMD
-// width may exceed the array length (e.g., [4]uint16: 128/16=8 lanes but only 4
+// width may exceed the array length (e.g., [4]uint16: registerBits/16=8 lanes but only 4
 // elements), which would cause out-of-bounds access at lanes 4-7.
 //
 // Detection strategy (in order):
@@ -360,12 +360,12 @@ func spmdRangeIndexArrayLenCap(boundValue ssa.Value, bodyBlock *ssa.BasicBlock, 
 
 // spmdRangeIndexLaneCount computes the lane count for a range-over-slice SPMD loop
 // by examining the slice element type instead of the iterator's int type.
-// For []byte slices, this yields 128/8=16 lanes (native v128) instead of 128/32=4.
+// For []byte slices, this yields registerBits/8 lanes (native v128) instead of registerBits/32.
 // Falls back to the iterator type when no slice element type can be determined.
 //
 // For fixed-length arrays, the lane count is capped at the array length to prevent
-// OOB access. For example, [4]uint16 has elem size 2 → 8 lanes from SIMD width, but
-// only 4 elements exist, so laneCount is capped to 4 → <4 x i16> = 64-bit vector.
+// OOB access. For example, [4]uint16 has elem size 2 → registerBits/16 lanes from SIMD width,
+// but only 4 elements exist, so laneCount is capped to 4 → <4 x i16> = 64-bit vector.
 // The sub-128-bit widening in spmdMaskElemType handles the resulting narrow vector.
 //
 // Strategy 2 (IndexAddr scan) requires the index to be exactly incrBinOp — it does
@@ -455,7 +455,7 @@ func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.B
 			laneCount := b.spmdLaneCount(elemLLVM)
 			// Cap lane count at array length for fixed-size arrays.
 			// Prevents OOB access when simd_width/elem_size > array_length
-			// (e.g., [4]uint16: 128/16=8 lanes but only 4 elements exist).
+			// (e.g., [4]uint16: registerBits/16=8 lanes but only 4 elements exist).
 			if arrayLen > 0 && int64(laneCount) > arrayLen {
 				laneCount = int(arrayLen)
 			}
@@ -1548,17 +1548,18 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 		// Non-decomposed peeled path: full <laneCount x elemType> lane indices.
 		elemType := scalarPhi.Type()
 		// Narrow the index element type when it would produce a vector wider than
-		// 128 bits. For example, range over [4]uint16 with int index on x86-64:
-		// laneCount=4, elemType=i64 → <4 x i64>=256 bits, too wide. Truncate to i32
-		// → <4 x i32>=128 bits.
+		// the SIMD register width. For example, range over [4]uint16 with int index
+		// on x86-64: laneCount=4, elemType=i64 → <4 x i64>=256 bits, too wide.
+		// Truncate to i32 → <4 x i32>=128 bits (for 128-bit registers).
 		// Use separate narrowedElemType/narrowedPhi for vector construction so that
 		// loop.scalarIterVal (used by contiguous detection and extendInteger for GEP
 		// indexing) always keeps the original width.
 		narrowedElemType := elemType
 		narrowedPhi := scalarPhi
 		elemBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8
-		if uint64(loop.laneCount)*elemBits > 128 {
-			narrowBits := uint64(128) / uint64(loop.laneCount)
+		regBits := uint64(b.spmdRegisterBytes()) * 8
+		if uint64(loop.laneCount)*elemBits > regBits {
+			narrowBits := regBits / uint64(loop.laneCount)
 			narrowedElemType = b.ctx.IntType(int(narrowBits))
 			narrowedPhi = b.CreateTrunc(scalarPhi, narrowedElemType, "spmd.iter.narrow")
 			// Do NOT update loop.scalarIterVal — it must stay at the original width
@@ -1690,17 +1691,18 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	elemType := scalarPhi.Type()
 
 	// Narrow the index element type when it would produce a vector wider than
-	// 128 bits. For example, range over [4]uint16 with int index on x86-64:
-	// laneCount=4, elemType=i64 → <4 x i64>=256 bits, too wide. Truncate to i32
-	// → <4 x i32>=128 bits.
+	// the SIMD register width. For example, range over [4]uint16 with int index
+	// on x86-64: laneCount=4, elemType=i64 → <4 x i64>=256 bits, too wide.
+	// Truncate to i32 → <4 x i32>=128 bits (for 128-bit registers).
 	// Use separate narrowedElemType/narrowedPhi for vector construction so that
 	// loop.scalarIterVal (already set above) keeps the original width for use by
 	// spmdAnalyzeContiguousIndex and extendInteger in GEP indexing.
 	narrowedElemType := elemType
 	narrowedPhi := scalarPhi
 	elemBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8
-	if uint64(loop.laneCount)*elemBits > 128 {
-		narrowBits := uint64(128) / uint64(loop.laneCount)
+	regBits := uint64(b.spmdRegisterBytes()) * 8
+	if uint64(loop.laneCount)*elemBits > regBits {
+		narrowBits := regBits / uint64(loop.laneCount)
 		narrowedElemType = b.ctx.IntType(int(narrowBits))
 		narrowedPhi = b.CreateTrunc(scalarPhi, narrowedElemType, "spmd.iter.narrow")
 		// Do NOT update loop.scalarIterVal — it must stay at the original width
