@@ -12,6 +12,13 @@ func (p *Program) LoadSSA() *ssa.Program {
 	// a version with a fix for https://golang.org/issues/73594.
 	prog := ssa.NewProgram(p.fset /*ssa.SanityCheckFunctions|*/, ssa.BareInits|ssa.GlobalDebug|ssa.InstantiateGenerics)
 
+	// Propagate the SIMD register width so SSA-level helpers (lane count
+	// computation, gather stride, promote size check) use the same value as
+	// the type checker instead of the hardcoded 128-bit default.
+	if p.typeChecker.SIMDRegisterSize > 0 {
+		prog.SIMDRegisterBits = int(p.typeChecker.SIMDRegisterSize) * 8
+	}
+
 	for _, pkg := range p.sorted {
 		prog.CreatePackage(pkg.Pkg, pkg.Files, &pkg.info, true)
 	}
