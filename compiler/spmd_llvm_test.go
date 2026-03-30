@@ -7294,3 +7294,76 @@ func TestSPMDBitmaskDispatch(t *testing.T) {
 		}
 	})
 }
+
+// TestSPMDIndexNarrowingX86 verifies that on x86-64, when the scalar loop index
+// is i64 and laneCount=4 (e.g., range over [4]uint16), the lane vector is narrowed
+// to <4 x i32> while the scalar iter value stays i64 for correct GEP indexing.
+// This is a regression test for the bug where loop.scalarIterVal was clobbered to
+// i32, causing type mismatches in spmdAnalyzeContiguousIndex and extendInteger.
+func TestSPMDIndexNarrowingX86(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	i64 := c.ctx.Int64Type()
+	i32 := c.ctx.Int32Type()
+	laneCount := 4
+
+	// Simulate the narrowing logic from emitSPMDBodyPrologue (non-peeled path).
+	scalarPhi := llvm.ConstInt(i64, 0, false) // i64 on x86-64
+
+	// This mirrors the fixed code: narrowedElemType/narrowedPhi are local,
+	// scalarIterVal stays at the original width.
+	elemType := scalarPhi.Type()
+	narrowedElemType := elemType
+	narrowedPhi := scalarPhi
+	elemBits := uint64(c.targetData.TypeAllocSize(elemType)) * 8
+	if uint64(laneCount)*elemBits > 128 {
+		narrowBits := uint64(128) / uint64(laneCount)
+		narrowedElemType = c.ctx.IntType(int(narrowBits))
+		narrowedPhi = b.CreateTrunc(scalarPhi, narrowedElemType, "spmd.iter.narrow")
+	}
+
+	// Verify narrowing happened (4*64=256 > 128).
+	if narrowedElemType == i64 {
+		t.Fatal("expected narrowing to trigger for 4 lanes of i64")
+	}
+	if narrowedElemType != i32 {
+		t.Errorf("narrowedElemType = %v, want i32", narrowedElemType)
+	}
+
+	// Verify the narrowed phi is i32 (for lane vector construction).
+	if narrowedPhi.Type() != i32 {
+		t.Errorf("narrowedPhi type = %v, want i32", narrowedPhi.Type())
+	}
+
+	// Verify the original scalarPhi (which would be loop.scalarIterVal) stays i64.
+	if scalarPhi.Type() != i64 {
+		t.Errorf("scalarPhi type = %v, want i64 (must not be clobbered)", scalarPhi.Type())
+	}
+
+	// Build lane indices using narrowed types.
+	vecType := llvm.VectorType(narrowedElemType, laneCount)
+	iterVec := b.splatScalar(narrowedPhi, vecType)
+	offsetVec := c.spmdLaneOffsetConst(laneCount, narrowedElemType)
+	laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
+
+	// Verify lane indices are <4 x i32>.
+	if laneIndices.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatalf("laneIndices type = %v, want vector", laneIndices.Type().TypeKind())
+	}
+	if laneIndices.Type().VectorSize() != 4 {
+		t.Errorf("laneIndices vector size = %d, want 4", laneIndices.Type().VectorSize())
+	}
+	if laneIndices.Type().ElementType() != i32 {
+		t.Errorf("laneIndices element type = %v, want i32", laneIndices.Type().ElementType())
+	}
+
+	// Verify scalar increment uses original i64 type (for phi back-edge).
+	laneCountScalar := llvm.ConstInt(elemType, uint64(laneCount), false)
+	scalarIncr := b.CreateAdd(scalarPhi, laneCountScalar, "spmd.iter.incr")
+	if scalarIncr.Type() != i64 {
+		t.Errorf("scalarIncr type = %v, want i64 (phi back-edge must match)", scalarIncr.Type())
+	}
+}

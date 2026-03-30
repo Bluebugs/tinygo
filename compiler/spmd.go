@@ -1541,18 +1541,22 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 		// 128 bits. For example, range over [4]uint16 with int index on x86-64:
 		// laneCount=4, elemType=i64 → <4 x i64>=256 bits, too wide. Truncate to i32
 		// → <4 x i32>=128 bits.
+		// Use separate narrowedElemType/narrowedPhi for vector construction so that
+		// loop.scalarIterVal (used by contiguous detection and extendInteger for GEP
+		// indexing) always keeps the original width.
+		narrowedElemType := elemType
+		narrowedPhi := scalarPhi
 		elemBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8
 		if uint64(loop.laneCount)*elemBits > 128 {
 			narrowBits := uint64(128) / uint64(loop.laneCount)
-			elemType = b.ctx.IntType(int(narrowBits))
-			scalarPhi = b.CreateTrunc(scalarPhi, elemType, "spmd.iter.narrow")
-			// Update scalarIterVal to the narrowed scalar so contiguous detection
-			// and GEP index extension (extendInteger) use the correct value.
-			loop.scalarIterVal = scalarPhi
+			narrowedElemType = b.ctx.IntType(int(narrowBits))
+			narrowedPhi = b.CreateTrunc(scalarPhi, narrowedElemType, "spmd.iter.narrow")
+			// Do NOT update loop.scalarIterVal — it must stay at the original width
+			// so spmdAnalyzeContiguousIndex and extendInteger see the correct type.
 		}
-		vecType := llvm.VectorType(elemType, loop.laneCount)
-		iterVec := b.splatScalar(scalarPhi, vecType)
-		offsetVec := b.spmdLaneOffsetConst(loop.laneCount, elemType)
+		vecType := llvm.VectorType(narrowedElemType, loop.laneCount)
+		iterVec := b.splatScalar(narrowedPhi, vecType)
+		offsetVec := b.spmdLaneOffsetConst(loop.laneCount, narrowedElemType)
 		laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
 		loop.laneIndices = laneIndices
 
@@ -1566,6 +1570,7 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 			// But it is also the phi back-edge and must stay scalar for LLVM phi validity.
 			// Pre-compute the scalar next-iteration value and register it in
 			// spmdPeeledScalarIncr so the phi resolution loop can use it instead.
+			// Use the ORIGINAL elemType and scalarPhi so the phi back-edge type matches.
 			if loop.incrBinOp != nil {
 				laneCountScalar := llvm.ConstInt(elemType, uint64(loop.laneCount), false)
 				scalarIncr := b.CreateAdd(scalarPhi, laneCountScalar, "spmd.iter.incr")
@@ -1576,13 +1581,13 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 			}
 		} else {
 			// Tail body: compute tail mask (laneIndices < bound).
-			boundScalar := b.spmdBoundScalar(loop, elemType)
-			// Narrow or extend bound to match the (possibly narrowed) elemType.
-			if boundScalar.Type() != elemType {
-				if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(elemType) {
-					boundScalar = b.CreateTrunc(boundScalar, elemType, "spmd.bound.narrow")
+			boundScalar := b.spmdBoundScalar(loop, narrowedElemType)
+			// Narrow or extend bound to match the (possibly narrowed) narrowedElemType.
+			if boundScalar.Type() != narrowedElemType {
+				if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(narrowedElemType) {
+					boundScalar = b.CreateTrunc(boundScalar, narrowedElemType, "spmd.bound.narrow")
 				} else {
-					boundScalar = b.CreateZExt(boundScalar, elemType, "spmd.bound.zext")
+					boundScalar = b.CreateZExt(boundScalar, narrowedElemType, "spmd.bound.zext")
 				}
 			}
 			boundVec := b.splatScalar(boundScalar, vecType)
@@ -1678,36 +1683,40 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	// 128 bits. For example, range over [4]uint16 with int index on x86-64:
 	// laneCount=4, elemType=i64 → <4 x i64>=256 bits, too wide. Truncate to i32
 	// → <4 x i32>=128 bits.
+	// Use separate narrowedElemType/narrowedPhi for vector construction so that
+	// loop.scalarIterVal (already set above) keeps the original width for use by
+	// spmdAnalyzeContiguousIndex and extendInteger in GEP indexing.
+	narrowedElemType := elemType
+	narrowedPhi := scalarPhi
 	elemBits := uint64(b.targetData.TypeAllocSize(elemType)) * 8
 	if uint64(loop.laneCount)*elemBits > 128 {
 		narrowBits := uint64(128) / uint64(loop.laneCount)
-		elemType = b.ctx.IntType(int(narrowBits))
-		scalarPhi = b.CreateTrunc(scalarPhi, elemType, "spmd.iter.narrow")
-		// Update scalarIterVal to the narrowed scalar so contiguous detection
-		// and GEP index extension (extendInteger) use the correct value.
-		loop.scalarIterVal = scalarPhi
+		narrowedElemType = b.ctx.IntType(int(narrowBits))
+		narrowedPhi = b.CreateTrunc(scalarPhi, narrowedElemType, "spmd.iter.narrow")
+		// Do NOT update loop.scalarIterVal — it must stay at the original width
+		// so spmdAnalyzeContiguousIndex and extendInteger see the correct type.
 	}
 
 	// Create vector type for the lane count.
-	vecType := llvm.VectorType(elemType, loop.laneCount)
+	vecType := llvm.VectorType(narrowedElemType, loop.laneCount)
 
 	// Splat the scalar iterator across all lanes.
-	iterVec := b.splatScalar(scalarPhi, vecType)
+	iterVec := b.splatScalar(narrowedPhi, vecType)
 
 	// Create the offset constant <0, 1, 2, ..., laneCount-1>.
-	offsetVec := b.spmdLaneOffsetConst(loop.laneCount, elemType)
+	offsetVec := b.spmdLaneOffsetConst(loop.laneCount, narrowedElemType)
 
 	// Compute lane indices: <iter, iter+1, iter+2, ..., iter+laneCount-1>.
 	laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
 
 	// Get the bound value and splat it.
-	boundScalar := b.spmdBoundScalar(loop, elemType)
-	// Narrow or extend bound to match the (possibly narrowed) elemType.
-	if boundScalar.Type() != elemType {
-		if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(elemType) {
-			boundScalar = b.CreateTrunc(boundScalar, elemType, "spmd.bound.narrow")
+	boundScalar := b.spmdBoundScalar(loop, narrowedElemType)
+	// Narrow or extend bound to match the (possibly narrowed) narrowedElemType.
+	if boundScalar.Type() != narrowedElemType {
+		if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(narrowedElemType) {
+			boundScalar = b.CreateTrunc(boundScalar, narrowedElemType, "spmd.bound.narrow")
 		} else {
-			boundScalar = b.CreateZExt(boundScalar, elemType, "spmd.bound.zext")
+			boundScalar = b.CreateZExt(boundScalar, narrowedElemType, "spmd.bound.zext")
 		}
 	}
 	boundVec := b.splatScalar(boundScalar, vecType)
