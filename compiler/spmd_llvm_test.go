@@ -7404,3 +7404,127 @@ func TestSPMDIndexNarrowingX86(t *testing.T) {
 		t.Errorf("scalarIncr type = %v, want i64 (phi back-edge must match)", scalarIncr.Type())
 	}
 }
+
+// TestSPMDWrapMaskAVX2_8Wide verifies that spmdWrapMask produces a <8 x i32> mask
+// when SIMDRegisterBytes=32 and laneCount=8 (AVX2 with 8 i32 lanes).
+// 256 bits / 8 lanes = 32 bits per lane element.
+func TestSPMDWrapMaskAVX2_8Wide(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	c.SIMDRegisterBytes = 32
+	laneCount := 8
+
+	i1Vec := llvm.VectorType(c.ctx.Int1Type(), laneCount)
+	cmpAlloca := b.CreateAlloca(i1Vec, "cmp.alloca")
+	cmp := b.CreateLoad(i1Vec, cmpAlloca, "cmp")
+
+	mask := b.spmdWrapMask(cmp, laneCount)
+
+	if mask.Type().TypeKind() != llvm.VectorTypeKind {
+		t.Fatal("mask is not a vector")
+	}
+	if mask.Type().VectorSize() != 8 {
+		t.Errorf("mask lanes = %d, want 8", mask.Type().VectorSize())
+	}
+	if mask.Type().ElementType() != c.ctx.Int32Type() {
+		t.Errorf("mask elem = %v, want i32", mask.Type().ElementType())
+	}
+}
+
+// TestSPMDWrapMaskAVX2_16Wide verifies that spmdWrapMask produces a <16 x i16> mask
+// when SIMDRegisterBytes=32 and laneCount=16 (AVX2 with 16 i16 lanes).
+// 256 bits / 16 lanes = 16 bits per lane element.
+func TestSPMDWrapMaskAVX2_16Wide(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	c.SIMDRegisterBytes = 32
+	laneCount := 16
+
+	i1Vec := llvm.VectorType(c.ctx.Int1Type(), laneCount)
+	cmpAlloca := b.CreateAlloca(i1Vec, "cmp.alloca")
+	cmp := b.CreateLoad(i1Vec, cmpAlloca, "cmp")
+
+	mask := b.spmdWrapMask(cmp, laneCount)
+
+	if mask.Type().VectorSize() != 16 {
+		t.Errorf("mask lanes = %d, want 16", mask.Type().VectorSize())
+	}
+	if mask.Type().ElementType() != c.ctx.Int16Type() {
+		t.Errorf("mask elem = %v, want i16", mask.Type().ElementType())
+	}
+}
+
+// TestSPMDAnyTrueAVX2 verifies that spmdAnyTrue bitcasts to <32 x i8> and emits
+// the AVX2 pmovmskb intrinsic when SIMDRegisterBytes=32.
+func TestSPMDAnyTrueAVX2(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	c.SIMDRegisterBytes = 32
+
+	// A <8 x i32> mask (AVX2 8-lane i32 mask format).
+	v8i32 := llvm.VectorType(c.ctx.Int32Type(), 8)
+	vecAlloca := b.CreateAlloca(v8i32, "vec.alloca")
+	vec := b.CreateLoad(v8i32, vecAlloca, "vec")
+
+	result := b.spmdAnyTrue(vec)
+
+	if result.IsNil() {
+		t.Fatal("spmdAnyTrue result is nil")
+	}
+	if result.Type() != c.ctx.Int32Type() {
+		t.Errorf("result type = %v, want i32", result.Type())
+	}
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.x86.avx2.pmovmskb") {
+		t.Error("expected llvm.x86.avx2.pmovmskb intrinsic for AVX2 256-bit mask")
+	}
+	if strings.Contains(modIR, "llvm.x86.sse2.pmovmskb.128") {
+		t.Error("unexpected llvm.x86.sse2.pmovmskb.128 for AVX2 256-bit mask")
+	}
+}
+
+// TestSPMDAllTrueAVX2 verifies that spmdAllTrue bitcasts to <32 x i8>, emits the
+// AVX2 pmovmskb intrinsic, and does NOT use the SSE2 128-bit variant when
+// SIMDRegisterBytes=32.
+func TestSPMDAllTrueAVX2(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	c.SIMDRegisterBytes = 32
+
+	// A <8 x i32> mask (AVX2 8-lane i32 mask format).
+	v8i32 := llvm.VectorType(c.ctx.Int32Type(), 8)
+	vecAlloca := b.CreateAlloca(v8i32, "vec.alloca")
+	vec := b.CreateLoad(v8i32, vecAlloca, "vec")
+
+	result := b.spmdAllTrue(vec)
+
+	if result.IsNil() {
+		t.Fatal("spmdAllTrue result is nil")
+	}
+	if result.Type() != c.ctx.Int32Type() {
+		t.Errorf("result type = %v, want i32", result.Type())
+	}
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.x86.avx2.pmovmskb") {
+		t.Error("expected llvm.x86.avx2.pmovmskb intrinsic for AVX2 256-bit mask")
+	}
+	if strings.Contains(modIR, "llvm.x86.sse2.pmovmskb.128") {
+		t.Error("unexpected llvm.x86.sse2.pmovmskb.128 for AVX2 256-bit mask")
+	}
+	// The bitcast target must be <32 x i8> for 256-bit AVX2, not <16 x i8>.
+	if !strings.Contains(modIR, "<32 x i8>") {
+		t.Error("expected <32 x i8> bitcast target for 256-bit AVX2 register")
+	}
+}

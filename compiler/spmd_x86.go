@@ -15,16 +15,24 @@ func (b *builder) spmdX86Pshufb(table, indices llvm.Value) llvm.Value {
 	return b.createCall(fnType, fn, []llvm.Value{table, indices}, "x86.pshufb")
 }
 
-// spmdX86Pmovmskb emits llvm.x86.sse2.pmovmskb.128.
-// Extracts the MSB of each byte lane into a 16-bit scalar packed in i32.
-// Input: <16 x i8>. Output: i32 (only low 16 bits significant).
+// spmdX86Pmovmskb extracts the MSB of each byte lane into a scalar i32 bitmask.
+// For <16 x i8> (128-bit) emits llvm.x86.sse2.pmovmskb.128 (SSE2); low 16 bits
+// significant. For <32 x i8> (256-bit) emits llvm.x86.avx2.pmovmskb (AVX2); all
+// 32 bits significant. Input vector must already be the correct byte-element width.
 func (b *builder) spmdX86Pmovmskb(vec llvm.Value) llvm.Value {
 	i32Type := b.ctx.Int32Type()
-	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
-	fnType := llvm.FunctionType(i32Type, []llvm.Type{v16i8}, false)
-	fn := b.mod.NamedFunction("llvm.x86.sse2.pmovmskb.128")
+	vecType := vec.Type()
+	fnType := llvm.FunctionType(i32Type, []llvm.Type{vecType}, false)
+	var intrinsicName string
+	switch vecType.VectorSize() {
+	case 32:
+		intrinsicName = "llvm.x86.avx2.pmovmskb"
+	default: // 16 bytes (SSE2/128-bit)
+		intrinsicName = "llvm.x86.sse2.pmovmskb.128"
+	}
+	fn := b.mod.NamedFunction(intrinsicName)
 	if fn.IsNil() {
-		fn = llvm.AddFunction(b.mod, "llvm.x86.sse2.pmovmskb.128", fnType)
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
 	}
 	return b.createCall(fnType, fn, []llvm.Value{vec}, "x86.pmovmskb")
 }

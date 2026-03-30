@@ -2357,15 +2357,16 @@ func (b *builder) spmdSwizzleScalarFallback(table, indices llvm.Value) llvm.Valu
 
 // spmdBitmask extracts the MSB of each byte lane into a scalar i32 bitmask.
 // On WASM: llvm.wasm.bitmask on the vector in WASM mask format.
-// On x86: pmovmskb after bitcasting to <16 x i8>.
+// On x86: pmovmskb after bitcasting to <regBytes x i8> (16 for SSE2, 32 for AVX2).
 func (b *builder) spmdBitmask(vec llvm.Value) llvm.Value {
 	if b.spmdIsWASM() {
 		return b.spmdWasmBitmask(vec)
 	}
-	// x86: pmovmskb requires <16 x i8>; bitcast from wider mask formats.
-	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
-	if vec.Type() != v16i8 {
-		vec = b.CreateBitCast(vec, v16i8, "bitmask.cast")
+	// x86: pmovmskb requires the correct byte-element vector for the register width.
+	regBytes := b.spmdRegisterBytes()
+	viN8 := llvm.VectorType(b.ctx.Int8Type(), regBytes)
+	if vec.Type() != viN8 {
+		vec = b.CreateBitCast(vec, viN8, "bitmask.cast")
 	}
 	return b.spmdX86Pmovmskb(vec)
 }
@@ -2373,13 +2374,15 @@ func (b *builder) spmdBitmask(vec llvm.Value) llvm.Value {
 // spmdAnyTrue tests if any lane in the vector is nonzero.
 // On WASM: llvm.wasm.anytrue returning i32 (0 or 1).
 // On x86: pmovmskb + icmp ne 0, returning i32.
+// Supports 128-bit (SSE2, <16 x i8>) and 256-bit (AVX2, <32 x i8>) registers.
 func (b *builder) spmdAnyTrue(vec llvm.Value) llvm.Value {
 	if b.spmdIsWASM() {
 		return b.spmdWasmAnyTrue(vec)
 	}
-	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
-	if vec.Type() != v16i8 {
-		vec = b.CreateBitCast(vec, v16i8, "anytrue.cast")
+	regBytes := b.spmdRegisterBytes()
+	viN8 := llvm.VectorType(b.ctx.Int8Type(), regBytes)
+	if vec.Type() != viN8 {
+		vec = b.CreateBitCast(vec, viN8, "anytrue.cast")
 	}
 	mask := b.spmdX86Pmovmskb(vec)
 	zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
@@ -2389,17 +2392,21 @@ func (b *builder) spmdAnyTrue(vec llvm.Value) llvm.Value {
 
 // spmdAllTrue tests if all lanes in the vector are nonzero.
 // On WASM: llvm.wasm.alltrue returning i32 (0 or 1).
-// On x86: pmovmskb + icmp eq 0xFFFF, returning i32.
+// On x86: pmovmskb + icmp eq allOnesMask, returning i32.
+// allOnesMask is (1<<regBytes)-1: 0xFFFF for 128-bit (SSE2), 0xFFFFFFFF for 256-bit (AVX2).
 func (b *builder) spmdAllTrue(vec llvm.Value) llvm.Value {
 	if b.spmdIsWASM() {
 		return b.spmdWasmAllTrue(vec)
 	}
-	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
-	if vec.Type() != v16i8 {
-		vec = b.CreateBitCast(vec, v16i8, "alltrue.cast")
+	regBytes := b.spmdRegisterBytes()
+	viN8 := llvm.VectorType(b.ctx.Int8Type(), regBytes)
+	if vec.Type() != viN8 {
+		vec = b.CreateBitCast(vec, viN8, "alltrue.cast")
 	}
 	mask := b.spmdX86Pmovmskb(vec)
-	allOnes := llvm.ConstInt(b.ctx.Int32Type(), 0xFFFF, false)
+	// Each byte lane contributes one bit; all-ones means regBytes bits are set.
+	allOnesMask := uint64((1 << regBytes) - 1)
+	allOnes := llvm.ConstInt(b.ctx.Int32Type(), allOnesMask, false)
 	eq := b.CreateICmp(llvm.IntEQ, mask, allOnes, "alltrue")
 	return b.CreateZExt(eq, b.ctx.Int32Type(), "alltrue.i32")
 }
