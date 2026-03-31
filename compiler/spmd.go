@@ -4132,6 +4132,8 @@ func (b *builder) spmdFullLoadWithSelect(vecType llvm.Type, ci *spmdContiguousIn
 	// Full load path: plain v128.load + select.
 	b.SetInsertPointAtEnd(fullBB)
 	rawLoad := b.CreateLoad(vecType, ci.scalarPtr, "spmd.fullload.raw")
+	elemAlign := int(b.targetData.TypeAllocSize(vecType.ElementType()))
+	rawLoad.SetAlignment(elemAlign)
 	zeroinit := llvm.ConstNull(vecType)
 	fullResult := b.spmdMaskSelect(mask, rawLoad, zeroinit)
 	b.CreateBr(mergeBB)
@@ -4499,8 +4501,11 @@ func (b *builder) spmdFullStoreWithBlend(val llvm.Value, ci *spmdContiguousInfo,
 	// Blend path: load existing → select → store.
 	b.SetInsertPointAtEnd(blendBB)
 	oldVal := b.CreateLoad(vecType, ci.scalarPtr, "spmd.blend.old")
+	blendElemAlign := int(b.targetData.TypeAllocSize(vecType.ElementType()))
+	oldVal.SetAlignment(blendElemAlign)
 	blended := b.spmdMaskSelect(mask, val, oldVal)
-	b.CreateStore(blended, ci.scalarPtr)
+	st := b.CreateStore(blended, ci.scalarPtr)
+	st.SetAlignment(blendElemAlign)
 	b.CreateBr(mergeBB)
 
 	// Masked store path: existing scalarized fallback.
