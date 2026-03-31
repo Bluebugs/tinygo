@@ -4810,6 +4810,7 @@ func (b *builder) spmdShiftedLoad(info *spmdShiftedLoadInfo, mask llvm.Value) ll
 	// General case: load uniqueCount elements as a narrow vector, then shuffle.
 	loadVecType := llvm.VectorType(elemType, info.uniqueCount)
 	loaded := b.CreateLoad(loadVecType, info.scalarPtr, "shifted.narrow")
+	loaded.SetAlignment(1) // Element-aligned: source slice may not be vector-aligned.
 
 	// Build the shuffle mask constant vector.
 	maskElems := make([]llvm.Value, laneCount)
