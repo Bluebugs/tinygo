@@ -3076,14 +3076,44 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		return b.CreateLShr(value, shift, ""), nil
 
 	case strings.HasPrefix(name, "lanes.From["):
-		// lanes.From[T](data []T) — load N contiguous elements from slice as vector
-		// Extract pointer from the slice value (element 0 is the data pointer)
+		// lanes.From[T](data []T) — load N contiguous elements from slice as vector.
+		// Extract pointer from the slice value (element 0 is the data pointer).
 		sliceVal := b.getValue(instr.Args[0], getPos(instr))
 		ptr := b.CreateExtractValue(sliceVal, 0, "slice.ptr")
-		// Determine vector type from result SPMDType
+		// Determine vector type from result SPMDType.
 		resultType := instr.Signature().Results().At(0).Type()
 		vecType := b.getLLVMType(resultType)
-		// Load as vector
+		// Cap lane count to the SPMD context's effective lane count.
+		// In an SPMD function body, spmdFuncBodyLaneCount gives the minimum across
+		// all varying parameter/return types. In a go-for loop, the active loop's
+		// laneCount is authoritative. This prevents mixed-width mismatches where
+		// e.g. lanes.From[float32] produces 8 lanes but Varying[int] uses 4 on AVX2.
+		if spmdType, ok := resultType.(*types.SPMDType); ok && spmdType.IsVarying() {
+			effectiveLC := 0
+			if b.spmdFuncIsBody {
+				effectiveLC = b.spmdFuncBodyLaneCount()
+			}
+			if effectiveLC == 0 {
+				if activeLoop := b.spmdFindActiveLoopForBlock(b.currentBlock); activeLoop != nil {
+					effectiveLC = activeLoop.laneCount
+				}
+			}
+			// Also cap to slice length if known at compile time (e.g., lanes.From(literal_slice)).
+			if effectiveLC == 0 {
+				sliceLen := b.CreateExtractValue(sliceVal, 1, "slice.len")
+				if sliceLen.IsConstant() {
+					constLen := int(sliceLen.ZExtValue())
+					if constLen > 0 && constLen < vecType.VectorSize() {
+						effectiveLC = constLen
+					}
+				}
+			}
+			if effectiveLC > 0 && vecType.VectorSize() != effectiveLC {
+				elemType := b.getLLVMType(spmdType.Elem())
+				vecType = llvm.VectorType(elemType, effectiveLC)
+			}
+		}
+		// Load as vector.
 		return b.CreateLoad(vecType, ptr, "lanes.from"), nil
 
 	case strings.HasPrefix(name, "lanes.Rotate["):
