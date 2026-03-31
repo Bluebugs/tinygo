@@ -194,6 +194,7 @@ type builder struct {
 	spmdInterleavedAddrs  map[*ssa.IndexAddr]*spmdInterleavedStoreInfo  // IndexAddr → interleaved group info
 	spmdInterleavedValues map[*spmdInterleavedStoreGroup][]llvm.Value   // group → collected values (filled during codegen)
 	spmdFuncIsBody        bool                                          // true if entire function body is an SPMD region (varying params, no go-for loops)
+	spmdFuncMinLaneCount  int                                           // min lane count across all varying params+results in this SPMD function body; caps getLLVMType for Varying[T]
 	// spmdBreakMaskBackEdges maps a loop-block index to the SSA back-edge value of the
 	// spmd.break.mask phi for that loop. Used for early-exit in SPMD function bodies.
 	// Non-nil only when fn.SPMDRegularBreaks is populated and spmdFuncIsBody is true.
@@ -414,6 +415,23 @@ func (c *compilerContext) getRuntimeType(name string) types.Type {
 // getLLVMType(getRuntimeType(name)).
 func (c *compilerContext) getLLVMRuntimeType(name string) llvm.Type {
 	return c.getLLVMType(c.getRuntimeType(name))
+}
+
+// getLLVMType returns a LLVM type for a Go type in an SPMD function body context.
+// When spmdFuncMinLaneCount > 0, Varying[T] types are capped at the function's
+// minimum lane count so that all vector operations use a consistent width
+// (e.g., Varying[float32] → <4 x float> in a function where int gives 4 lanes).
+func (b *builder) getLLVMType(goType types.Type) llvm.Type {
+	if b.spmdFuncMinLaneCount > 0 {
+		if spmdType, ok := goType.(*types.SPMDType); ok && spmdType.IsVarying() {
+			elemType := b.compilerContext.getLLVMType(spmdType.Elem())
+			naturalLC := b.spmdLaneCount(elemType)
+			if naturalLC > 1 && b.spmdFuncMinLaneCount < naturalLC {
+				return llvm.VectorType(elemType, b.spmdFuncMinLaneCount)
+			}
+		}
+	}
+	return b.compilerContext.getLLVMType(goType)
 }
 
 // getLLVMType returns a LLVM type for a Go type. It doesn't recreate already
@@ -1478,6 +1496,11 @@ func (b *builder) createFunction() {
 	// linearization infrastructure is active for all blocks.
 	if b.spmdLoopState == nil && !b.spmdEntryMask.IsNil() {
 		b.spmdFuncIsBody = true
+		// Compute the minimum lane count across all varying params and results.
+		// On architectures where different types have different lane counts (e.g.,
+		// AVX2: float32=8 lanes, int=4 lanes), this caps Varying[T] inside the
+		// function body to the narrowest width, ensuring consistency across all ops.
+		b.spmdFuncMinLaneCount = b.spmdMinLaneCountForSig(b.fn.Signature)
 	}
 
 	// SPMD: for function bodies with varying breaks in regular for-loops, build
@@ -1696,6 +1719,30 @@ func (b *builder) createFunction() {
 					terminator := llvmBlock.LastInstruction()
 					b.SetInsertPointBefore(terminator)
 					llvmVal = b.spmdConvertMaskFormat(llvmVal, phi.llvm.Type())
+					b.SetInsertPointAtEnd(savedBlock)
+				}
+			}
+			// SPMD function body with mixed-width varying types (e.g., AVX2 where
+			// Varying[float32]=8 lanes but Varying[int]=4 lanes): the phi was created
+			// with the min-lane-count type (e.g., <4 x float>), but a back-edge value
+			// may have been computed as full-width (e.g., <8 x float>) because
+			// createSPMDConst uses compilerContext.getLLVMType which doesn't see
+			// spmdFuncMinLaneCount. Narrow/widen same-element-type vectors to match.
+			if b.spmdFuncIsBody && llvmVal.Type() != phi.llvm.Type() {
+				phiVK := phi.llvm.Type().TypeKind()
+				valVK := llvmVal.Type().TypeKind()
+				if phiVK == llvm.VectorTypeKind && valVK == llvm.VectorTypeKind &&
+					phi.llvm.Type().ElementType() == llvmVal.Type().ElementType() {
+					savedBlock := b.GetInsertBlock()
+					terminator := llvmBlock.LastInstruction()
+					b.SetInsertPointBefore(terminator)
+					dstLanes := phi.llvm.Type().VectorSize()
+					srcLanes := llvmVal.Type().VectorSize()
+					if srcLanes > dstLanes {
+						llvmVal = b.spmdNarrowVector(llvmVal, dstLanes)
+					} else {
+						llvmVal = b.spmdWidenVector(llvmVal, dstLanes)
+					}
 					b.SetInsertPointAtEnd(savedBlock)
 				}
 			}
@@ -2334,8 +2381,57 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 	// SPMD: insert execution mask as first argument for non-exported SPMD function calls.
 	if fn := instr.StaticCallee(); fn != nil {
 		if instr.SPMDMask != nil {
-			// SSA-level mask — use directly via getValue.
+			// SSA-level mask — use directly via getValue, then reconcile type.
+			// The mask may have been generated for the loop's lane count (e.g., 4 for
+			// int iter on AVX2) while the callee expects a different lane count (e.g.,
+			// 8 for Varying[float32] params). Convert to the callee's mask type.
 			mask := b.getValue(instr.SPMDMask, getPos(instr))
+			if calleeMaskType := b.spmdMaskType(fn); calleeMaskType != (llvm.Type{}) {
+				if mask.Type() != calleeMaskType {
+					mask = b.spmdConvertMaskFormat(mask, calleeMaskType)
+				}
+			}
+			// SPMD: reconcile Varying[T] argument lane counts with the callee's
+			// declared vector width. Since getLLVMFunctionType caps Varying[T]
+			// parameters to spmdMinLaneCountForSig, the callee may expect a narrower
+			// vector than the caller holds. Use the callee's actual LLVM param types
+			// (from the LLVM function declaration) to determine the expected width.
+			calleeFnType, _ := b.getFunction(fn)
+			if !calleeFnType.IsNil() {
+				// calleeFnType is the LLVM function type (void(params…)).
+				// +1 because SPMD functions have an implicit mask as first param;
+				// params[i] (0-indexed without mask) corresponds to callee param i+1.
+				calleeParamStart := 1 // skip implicit mask param
+				calleeParamTypes := calleeFnType.ParamTypes()
+				for i, arg := range params {
+					if arg.IsNil() {
+						continue
+					}
+					if arg.Type().TypeKind() != llvm.VectorTypeKind {
+						continue
+					}
+					calleeIdx := calleeParamStart + i
+					if calleeIdx >= len(calleeParamTypes) {
+						break
+					}
+					expectedType := calleeParamTypes[calleeIdx]
+					if expectedType.TypeKind() != llvm.VectorTypeKind {
+						continue
+					}
+					if arg.Type() == expectedType {
+						continue
+					}
+					actualLanes := arg.Type().VectorSize()
+					expectedLanes := expectedType.VectorSize()
+					if actualLanes < expectedLanes &&
+						arg.Type().ElementType() == expectedType.ElementType() {
+						params[i] = b.spmdWidenVector(arg, expectedLanes)
+					} else if actualLanes > expectedLanes &&
+						arg.Type().ElementType() == expectedType.ElementType() {
+						params[i] = b.spmdNarrowVector(arg, expectedLanes)
+					}
+				}
+			}
 			params = append([]llvm.Value{mask}, params...)
 		} else if b.spmdMaskType(fn) != (llvm.Type{}) {
 			// Fallback for go-for loop context (no SSA-level mask).
@@ -2448,8 +2544,10 @@ func (b *builder) getValue(expr ssa.Value, pos token.Pos) llvm.Value {
 		// SPMD: Varying[bool] and Varying[mask] constants are created with a default
 		// type based on their element width (e.g., <16 x i1> for bool, <4 x i32> for mask),
 		// but inside a different-lane-count loop the expected mask format may differ.
-		// Convert to the active loop's mask format.
-		if b.spmdLoopState != nil {
+		// Convert to the active loop's mask format. Also handle SPMD function bodies
+		// (spmdFuncIsBody) where constants outside a loop carry wrong width on x86
+		// (e.g., getLLVMType(Varying[mask]) yields <32 x i1> on AVX2 instead of <8 x i32>).
+		if b.spmdLoopState != nil || b.spmdFuncIsBody {
 			if spmdType, ok := expr.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
 				elem := spmdType.Elem().Underlying()
 				isBool := func() bool {
@@ -2458,11 +2556,31 @@ func (b *builder) getValue(expr ssa.Value, pos token.Pos) llvm.Value {
 				}
 				isMask := spmdtypes.IsMask(elem)
 				if isBool() || isMask {
+					laneCount := 0
 					if activeLoop := b.spmdFindActiveLoopForBlock(b.currentBlock); activeLoop != nil {
-						maskElem := b.spmdMaskElemType(activeLoop.laneCount)
-						targetType := llvm.VectorType(maskElem, activeLoop.laneCount)
+						laneCount = activeLoop.laneCount
+					} else if b.spmdFuncIsBody {
+						// SPMD function body: derive lane count from the entry mask,
+						// which was set from the first varying parameter's element type.
+						laneCount = b.spmdFuncBodyLaneCount()
+					}
+					if laneCount > 0 {
+						maskElem := b.spmdMaskElemType(laneCount)
+						targetType := llvm.VectorType(maskElem, laneCount)
 						if val.Type() != targetType {
 							val = b.spmdConvertMaskFormat(val, targetType)
+						}
+					}
+				} else if b.spmdFuncIsBody && b.spmdFuncMinLaneCount > 0 {
+					// SPMD function body with mixed-width varying types (e.g., AVX2):
+					// createSPMDConst uses compilerContext.getLLVMType which doesn't
+					// see spmdFuncMinLaneCount, so Varying[float32] constants are
+					// created as <8 x float> instead of <4 x float>. Narrow here.
+					if val.Type().TypeKind() == llvm.VectorTypeKind {
+						srcLanes := val.Type().VectorSize()
+						dstLanes := b.spmdFuncMinLaneCount
+						if srcLanes > dstLanes {
+							val = b.spmdNarrowVector(val, dstLanes)
 						}
 					}
 				}
@@ -2650,7 +2768,28 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		}
 		return result, nil
 	case *ssa.Call:
-		return b.createFunctionCall(expr.Common())
+		result, err := b.createFunctionCall(expr.Common())
+		if err != nil {
+			return result, err
+		}
+		// SPMD: narrow the call result if the callee's lane count exceeds the
+		// calling context's lane count. On x86-64, calling an 8-lane float32
+		// function from a 4-lane int loop yields an 8-lane result that must be
+		// narrowed to 4 lanes before use. The extra lanes contain garbage but
+		// are excluded by the caller's lane count.
+		if !result.IsNil() && result.Type().TypeKind() == llvm.VectorTypeKind {
+			expectedType := b.getLLVMType(expr.Type())
+			if expectedType.TypeKind() == llvm.VectorTypeKind &&
+				result.Type().ElementType() == expectedType.ElementType() &&
+				result.Type().VectorSize() != expectedType.VectorSize() {
+				if result.Type().VectorSize() > expectedType.VectorSize() {
+					result = b.spmdNarrowVector(result, expectedType.VectorSize())
+				} else {
+					result = b.spmdWidenVector(result, expectedType.VectorSize())
+				}
+			}
+		}
+		return result, nil
 	case *ssa.ChangeInterface:
 		// Do not change between interface types: always use the underlying
 		// (concrete) type in the type number of the interface. Every method
@@ -3407,6 +3546,25 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		}
 	case *ssa.Phi:
 		phiType := b.getLLVMType(expr.Type())
+		// SPMD: Varying[mask] and Varying[bool] phis must use the active lane count,
+		// not the static getLLVMType which gives wrong width on x86 (e.g., <32 x i1>
+		// for Varying[mask] on AVX2 instead of <8 x i32> for float32 operands).
+		if b.spmdLoopState != nil || b.spmdFuncIsBody {
+			if spmdType, ok := expr.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
+				if spmdtypes.IsMask(spmdType.Elem()) || b.spmdIsVaryingBoolPhi(expr) {
+					laneCount := 0
+					if activeLoop := b.spmdFindActiveLoopForBlock(expr.Block()); activeLoop != nil {
+						laneCount = activeLoop.laneCount
+					} else if b.spmdFuncIsBody {
+						laneCount = b.spmdFuncBodyLaneCount()
+					}
+					if laneCount > 0 {
+						maskElem := b.spmdMaskElemType(laneCount)
+						phiType = llvm.VectorType(maskElem, laneCount)
+					}
+				}
+			}
+		}
 		phi := b.CreatePHI(phiType, "")
 		b.phis = append(b.phis, phiNode{expr, phi})
 		return phi, nil

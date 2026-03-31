@@ -298,6 +298,44 @@ func (c *compilerContext) spmdEffectiveLaneCount(spmdType *types.SPMDType, elemL
 	return c.spmdLaneCount(elemLLVM)
 }
 
+// spmdMinLaneCountForSig returns the minimum lane count across all varying
+// parameters and results in a function signature. On architectures where
+// different element sizes produce different lane counts (e.g., AVX2: float32→8,
+// int→4), functions with mixed varying types must operate at the minimum width
+// so all Varying[T] operands are consistent and no spurious undef lanes arise.
+// Returns 0 if the signature has no varying parameters or results.
+func (c *compilerContext) spmdMinLaneCountForSig(sig *types.Signature) int {
+	if sig == nil {
+		return 0
+	}
+	minLC := 0
+	scan := func(t types.Type) {
+		spmdType, ok := t.(*types.SPMDType)
+		if !ok || !spmdType.IsVarying() {
+			return
+		}
+		elemType := c.getLLVMType(spmdType.Elem())
+		lc := c.spmdLaneCount(elemType)
+		if lc <= 0 {
+			return
+		}
+		if minLC == 0 || lc < minLC {
+			minLC = lc
+		}
+	}
+	params := sig.Params()
+	for i := 0; i < params.Len(); i++ {
+		scan(params.At(i).Type())
+	}
+	if sig.Results() != nil {
+		results := sig.Results()
+		for i := 0; i < results.Len(); i++ {
+			scan(results.At(i).Type())
+		}
+	}
+	return minLC
+}
+
 // spmdRangeIndexArrayLenCap returns the fixed array length if the rangeindex
 // loop iterates over a fixed-size array, or -1 for slices/unknown.
 //
@@ -2443,29 +2481,26 @@ func (c *compilerContext) spmdMaskType(fn *ssa.Function) llvm.Type {
 
 // spmdMaskTypeFromSig returns the LLVM mask type for an SPMD signature's implicit mask parameter.
 // On SIMD targets the mask is <N x iW> (e.g., <4 x i32>); on non-SIMD targets it is <N x i1>.
-// N is determined by the first varying parameter's element type.
+// N is the minimum lane count across all varying parameters and results. Using the minimum
+// ensures consistency on architectures where different element sizes yield different lane counts
+// (e.g., AVX2: float32→8 lanes, int→4 lanes). A function with both Varying[float32] and
+// Varying[int] must use 4 lanes throughout.
 // Returns zero-value llvm.Type{} if the signature has no varying parameters.
 func (c *compilerContext) spmdMaskTypeFromSig(sig *types.Signature) llvm.Type {
 	if sig == nil {
 		return llvm.Type{}
 	}
-	params := sig.Params()
-	for i := 0; i < params.Len(); i++ {
-		param := params.At(i)
-		if spmdType, ok := param.Type().(*types.SPMDType); ok && spmdType.IsVarying() {
-			// Found a varying parameter. Compute lane count respecting constraints.
-			elemType := c.getLLVMType(spmdType.Elem())
-			laneCount := c.spmdEffectiveLaneCount(spmdType, elemType)
-			// Scalar fallback: laneCount=1 means no SIMD. Return scalar mask (i32 on
-			// WASM, i1 elsewhere) instead of <1 x maskElem> which LLVM rejects as a
-			// branch condition.
-			if laneCount <= 1 {
-				return c.getLLVMType(spmdtypes.NewVaryingMask())
-			}
-			return llvm.VectorType(c.spmdMaskElemType(laneCount), laneCount)
-		}
+	laneCount := c.spmdMinLaneCountForSig(sig)
+	if laneCount == 0 {
+		return llvm.Type{} // No varying parameters
 	}
-	return llvm.Type{} // No varying parameters
+	// Scalar fallback: laneCount=1 means no SIMD. Return scalar mask (i32 on
+	// WASM, i1 elsewhere) instead of <1 x maskElem> which LLVM rejects as a
+	// branch condition.
+	if laneCount <= 1 {
+		return c.getLLVMType(spmdtypes.NewVaryingMask())
+	}
+	return llvm.VectorType(c.spmdMaskElemType(laneCount), laneCount)
 }
 
 // spmdWrapMask sign-extends an <N x i1> comparison result to the SIMD mask type
@@ -2531,6 +2566,20 @@ func (b *builder) spmdMaskSelect(mask, trueVal, falseVal llvm.Value) llvm.Value 
 
 	valType := trueVal.Type()
 	maskType := mask.Type() // e.g., <4 x i32>, <8 x i16>, or <16 x i8>
+
+	// Reconcile lane count mismatch: if mask has more lanes than the data, narrow it.
+	// This happens when getLLVMType(Varying[mask]) produces a wider vector than the
+	// data type (e.g., <32 x i1> mask for <16 x i8> data on AVX2 with i1 size=1).
+	if maskType.TypeKind() == llvm.VectorTypeKind && valType.TypeKind() == llvm.VectorTypeKind {
+		maskLanes := maskType.VectorSize()
+		dataLanes := valType.VectorSize()
+		if maskLanes != dataLanes {
+			maskElem := b.spmdMaskElemType(dataLanes)
+			targetMaskType := llvm.VectorType(maskElem, dataLanes)
+			mask = b.spmdConvertMaskFormat(mask, targetMaskType)
+			maskType = mask.Type()
+		}
+	}
 
 	// Efficient bitwise select only when mask and data have equal total bit width
 	// (e.g., <16 x i8> mask with <16 x i8> data, <4 x i32> mask with <4 x f32> data).
@@ -2645,6 +2694,72 @@ func (b *builder) spmdFindActiveLoopForBlock(block *ssa.BasicBlock) *spmdActiveL
 		}
 	}
 	return bestLoop
+}
+
+// spmdFuncBodyLaneCount returns the lane count for an SPMD function body
+// (spmdFuncIsBody=true), derived from the entry mask vector type. Returns 0
+// if the entry mask is not a vector (scalar fallback or not an SPMD function).
+// The entry mask is set from the first varying parameter's element type at
+// function entry, so its VectorSize() gives the correct hardware lane count.
+func (b *builder) spmdFuncBodyLaneCount() int {
+	if b.spmdEntryMask.IsNil() {
+		return 0
+	}
+	if b.spmdEntryMask.Type().TypeKind() != llvm.VectorTypeKind {
+		return 0
+	}
+	return b.spmdEntryMask.Type().VectorSize()
+}
+
+// spmdWidenVector extends a vector from srcLanes to dstLanes by appending
+// undef lanes at the end. Used when passing a narrow-lane vector to an SPMD
+// function declared with more lanes (e.g., calling an 8-lane float32 function
+// from a 4-lane int loop on AVX2 x86-64). The callee's entry mask constrains
+// which lanes are used, so undef lanes in the extra positions are safe.
+func (b *builder) spmdWidenVector(vec llvm.Value, dstLanes int) llvm.Value {
+	srcType := vec.Type()
+	if srcType.TypeKind() != llvm.VectorTypeKind {
+		return vec
+	}
+	srcLanes := srcType.VectorSize()
+	if srcLanes >= dstLanes {
+		return vec
+	}
+	// Build a shufflevector mask: first srcLanes from vec, rest as undef (0xFFFFFFFF).
+	shuffleElems := make([]llvm.Value, dstLanes)
+	i32Type := b.ctx.Int32Type()
+	for i := 0; i < srcLanes; i++ {
+		shuffleElems[i] = llvm.ConstInt(i32Type, uint64(i), false)
+	}
+	undefIdx := llvm.ConstInt(i32Type, 0xFFFFFFFF, false) // undef lane index
+	for i := srcLanes; i < dstLanes; i++ {
+		shuffleElems[i] = undefIdx
+	}
+	shuffleMask := llvm.ConstVector(shuffleElems, false)
+	undef := llvm.Undef(srcType)
+	return b.CreateShuffleVector(vec, undef, shuffleMask, "spmd.widen")
+}
+
+// spmdNarrowVector extracts the first dstLanes from a wider vector via
+// shufflevector. Used when the call site produces narrower vectors than the
+// callee expects and must widen, but also for the reverse (narrowing a result).
+func (b *builder) spmdNarrowVector(vec llvm.Value, dstLanes int) llvm.Value {
+	srcType := vec.Type()
+	if srcType.TypeKind() != llvm.VectorTypeKind {
+		return vec
+	}
+	srcLanes := srcType.VectorSize()
+	if srcLanes <= dstLanes {
+		return vec
+	}
+	i32Type := b.ctx.Int32Type()
+	shuffleElems := make([]llvm.Value, dstLanes)
+	for i := 0; i < dstLanes; i++ {
+		shuffleElems[i] = llvm.ConstInt(i32Type, uint64(i), false)
+	}
+	shuffleMask := llvm.ConstVector(shuffleElems, false)
+	undef := llvm.Undef(srcType)
+	return b.CreateShuffleVector(vec, undef, shuffleMask, "spmd.narrow")
 }
 
 // spmdConvertMaskFormat converts a vector mask value to a different vector mask
@@ -6706,6 +6821,16 @@ func (b *builder) spmdEmitInterleavedStoreMasked(lastVal ssa.Value, lastAddr ssa
 	}
 	vals[stride-1] = b.getValue(lastVal, token.NoPos)
 
+	// Clamp N to the actual vector lane count. On x86-64, the group laneCount may
+	// be larger than the actual LLVM vector (e.g., laneCount=32 for bytes on AVX2
+	// but x86 pshufb always produces <16 x i8>). Use the actual lane count so
+	// shufflevector indices remain within bounds.
+	if vals[0].Type().TypeKind() == llvm.VectorTypeKind {
+		if actualN := vals[0].Type().VectorSize(); actualN < N {
+			N = actualN
+		}
+	}
+
 	// Shuffle values into S interleaved output vectors.
 	var outVecs []llvm.Value
 	switch stride {
@@ -7043,17 +7168,25 @@ func (b *builder) createSPMDSelect(instr *ssa.SPMDSelect) llvm.Value {
 	// a <4 x i32> mask for a 16-lane bool select becomes <16 x i1> with each bit
 	// replicated 4 times: [0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3].
 	//
-	// When operands have fewer lanes than the mask, the situation is unexpected
-	// (a wider loop mask selecting a narrower varying type), so we panic.
+	// When operands have fewer lanes than the mask, narrow the mask to match.
+	// This can happen when getLLVMType(Varying[mask]) computes a different lane
+	// count than the data type (e.g., <32 x i1> for Varying[mask] on AVX2 vs
+	// <8 x i32> for float32 data). The comparison result has the correct lane
+	// count; we narrow the over-counted mask to match.
 	if x.Type().TypeKind() == llvm.VectorTypeKind {
 		maskLanes := mask.Type().VectorSize()
 		operandLanes := x.Type().VectorSize()
 		if maskLanes != operandLanes {
 			if maskLanes > operandLanes {
-				panic(fmt.Sprintf("createSPMDSelect: mask has more lanes than operands (mask=%d, operands=%d), cannot narrow Varying type in SPMD loop", maskLanes, operandLanes))
+				// Narrow: mask has more lanes than operands. Convert to the correct
+				// operand-appropriate mask type (e.g., <8 x i32> for 8 float32 lanes).
+				maskElem := b.spmdMaskElemType(operandLanes)
+				targetMaskType := llvm.VectorType(maskElem, operandLanes)
+				mask = b.spmdConvertMaskFormat(mask, targetMaskType)
+			} else {
+				// Widen: replicate each mask lane (operandLanes/maskLanes) times.
+				mask = b.spmdWidenMaskToOperandLanes(mask, operandLanes)
 			}
-			// Widen: replicate each mask lane (operandLanes/maskLanes) times.
-			mask = b.spmdWidenMaskToOperandLanes(mask, operandLanes)
 		}
 	}
 
