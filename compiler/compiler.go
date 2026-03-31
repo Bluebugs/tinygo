@@ -2888,6 +2888,19 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					// value is correct for all downstream SIMD operations; using it as-is
 					// avoids an invalid bitcast between differently-sized vector types.
 					changeTypeResult = x
+				} else if b.spmdDecomposed != nil {
+					if _, ok := b.spmdDecomposed[expr.X]; ok {
+						// SPMD: source is a decomposed index materialized as <N x i32>.
+						// The target type (e.g., <2 x i64> for Varying[int] on SSE) has
+						// a different lane count and cannot be bitcast. Since expr is also
+						// registered in spmdDecomposed (propagated below), all downstream
+						// consumers will go through spmdMaterializeDecomposed rather than
+						// reading b.locals[expr]. Use the source as-is to avoid emitting
+						// an invalid bitcast instruction.
+						changeTypeResult = x
+					} else {
+						changeTypeResult = b.CreateBitCast(x, llvmType, "changetype.vec")
+					}
 				} else {
 					changeTypeResult = b.CreateBitCast(x, llvmType, "changetype.vec")
 				}

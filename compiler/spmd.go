@@ -1062,9 +1062,13 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			laneCount = 1
 		}
 
-		// On WASM, rangeindex loops with more than 4 lanes use a decomposed
-		// (scalar base + <N x iW> offset) representation to stay within 128-bit SIMD.
-		isDecomposed := ssaLoop.IsRangeIndex && b.spmdIsWASM() && laneCount > 4
+		// Rangeindex loops with more than 4 lanes use a decomposed (scalar base +
+		// <N x i8> offset) representation on all targets. A naive <laneCount x i32>
+		// index vector would be wider than the natural SIMD register (e.g., 16 lanes
+		// × 32 bits = 512 bits on SSE), causing index corruption from narrowing. The
+		// decomposed path keeps the base as a scalar and tracks only byte offsets in
+		// the vector, which fits in any register width.
+		isDecomposed := ssaLoop.IsRangeIndex && laneCount > 4
 
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
@@ -1388,10 +1392,13 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			continue
 		}
 
-		// On WASM with laneCount > 4, a naive <laneCount x i32> index vector would
-		// be wider than 128 bits (e.g., <16 x i32> is 512-bit). Use decomposed
-		// representation (scalar base + <N x i8> offset) to stay within 128 bits.
-		isDecomposed := b.spmdIsWASM() && laneCount > 4
+		// Use decomposed representation (scalar base + <N x i8> offset) on all
+		// targets when laneCount > 4. A naive <laneCount x i32> index vector would
+		// exceed the natural SIMD register width on targets like SSE (e.g., 16 lanes
+		// × 32 bits = 512 bits, which would be narrowed to 128 bits and corrupt the
+		// upper lane indices). The decomposed path is width-independent and correct
+		// on both WASM SIMD128 and x86-64 SSE/AVX/AVX-512.
+		isDecomposed := laneCount > 4
 
 		loop := &spmdActiveLoop{
 			info:          loopInfo,
@@ -1529,11 +1536,21 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 
 		if loop.isDecomposed {
 			// Decomposed path: represent the index as scalar base + <N x i8> offset.
-			// This avoids creating a <16 x i32> 512-bit vector on WASM SIMD128.
+			// The base is always stored as i32 regardless of target pointer width.
+			// On x86-64 the loop iterator phi is i64, but array/slice lengths always
+			// fit in 32 bits, and all decomposed arithmetic uses i32 constants. Storing
+			// a narrowed i32 base avoids per-site truncations throughout the pipeline.
 			i8Type := b.ctx.Int8Type()
+			i32Type := b.ctx.Int32Type()
 			laneCount := loop.laneCount
 
 			varyingOffset := b.spmdLaneOffsetConst(laneCount, i8Type)
+
+			// Normalize base to i32 (safe: indices into Go slices/arrays fit in 32 bits).
+			decompBase := scalarPhi
+			if decompBase.Type() != i32Type {
+				decompBase = b.CreateTrunc(decompBase, i32Type, "spmd.base.narrow")
+			}
 
 			if b.spmdDecomposed != nil {
 				// Use the appropriate iter value as the body iterator for decomposition.
@@ -1544,7 +1561,7 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 					bodyIter = ssaLoop.TailIterPhi
 				}
 				b.spmdDecomposed[bodyIter] = &spmdDecomposedIndex{
-					scalarBase:    scalarPhi,
+					scalarBase:    decompBase,
 					varyingOffset: varyingOffset,
 					laneCount:     laneCount,
 					loop:          loop,
@@ -1557,13 +1574,21 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 				loop.tailMask = llvm.ConstAllOnes(maskType)
 			} else {
 				// Tail mask via <N x i8> comparison: offset < clamp(bound - base).
+				// All arithmetic is done in i32 regardless of target pointer width.
+				// On x86-64 the iterator phi is i64, so truncate both operands to i32
+				// before the subtraction. The result is always in [0, laneCount] which
+				// fits safely in i8 after clamping.
 				i32Type := b.ctx.Int32Type()
 				boundScalar := b.spmdBoundScalar(loop, i32Type)
 				// Ensure boundScalar is i32 for the sub/clamp arithmetic.
 				if boundScalar.Type() != i32Type {
 					boundScalar = b.CreateTrunc(boundScalar, i32Type, "spmd.bound.narrow")
 				}
-				diff := b.CreateSub(boundScalar, scalarPhi, "spmd.diff")
+				scalarPhiI32 := scalarPhi
+				if scalarPhiI32.Type() != i32Type {
+					scalarPhiI32 = b.CreateTrunc(scalarPhiI32, i32Type, "spmd.base.narrow")
+				}
+				diff := b.CreateSub(boundScalar, scalarPhiI32, "spmd.diff")
 				zero32 := llvm.ConstInt(i32Type, 0, false)
 				lcConst := llvm.ConstInt(i32Type, uint64(laneCount), false)
 				diffClamped := b.CreateSelect(
@@ -1668,15 +1693,23 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 		// Decomposed path: represent the index as scalar base + <N x i8> offset.
 		// This avoids creating a <16 x i32> 512-bit vector on WASM SIMD128.
 		i8Type := b.ctx.Int8Type()
+		i32Type := b.ctx.Int32Type()
 		laneCount := loop.laneCount
 
 		// Create constant byte offset <0, 1, 2, ..., laneCount-1> as <N x i8>.
 		varyingOffset := b.spmdLaneOffsetConst(laneCount, i8Type)
 
+		// Normalize base to i32 (safe: indices into Go slices/arrays fit in 32 bits).
+		// On x86-64 the loop iterator is i64; storing i32 avoids per-site truncations.
+		decompBase := scalarPhi
+		if decompBase.Type() != i32Type {
+			decompBase = b.CreateTrunc(decompBase, i32Type, "spmd.base.narrow")
+		}
+
 		// Register the decomposition so BinOp/IndexAddr handlers can use it.
 		if b.spmdDecomposed != nil {
 			b.spmdDecomposed[loop.bodyIterValue] = &spmdDecomposedIndex{
-				scalarBase:    scalarPhi,
+				scalarBase:    decompBase,
 				varyingOffset: varyingOffset,
 				laneCount:     laneCount,
 				loop:          loop,
@@ -1684,16 +1717,22 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 			}
 		}
 
-		// Compute tail mask using <N x i8> comparison to stay within 128-bit registers.
-		// diff = bound - base (scalar i32); clamp to [0, laneCount]; truncate to i8.
-		// Then compare: offset < clamp(diff) using unsigned <N x i8> comparison.
-		i32Type := b.ctx.Int32Type()
+		// Compute tail mask using <N x i8> comparison to stay within the natural
+		// SIMD register. diff = bound - base (scalar i32); clamp to [0, laneCount];
+		// truncate to i8. Then compare: offset < clamp(diff) using unsigned <N x i8>.
+		// All arithmetic is done in i32 regardless of target pointer width. On
+		// x86-64 the iterator is i64, so both operands are truncated to i32 first.
+		// The result is always in [0, laneCount] which fits in i8 after clamping.
 		boundScalar := b.spmdBoundScalar(loop, i32Type)
 		// Ensure boundScalar is i32 for the sub/clamp arithmetic.
 		if boundScalar.Type() != i32Type {
 			boundScalar = b.CreateTrunc(boundScalar, i32Type, "spmd.bound.narrow")
 		}
-		diff := b.CreateSub(boundScalar, scalarPhi, "spmd.diff")
+		scalarPhiI32 := scalarPhi
+		if scalarPhiI32.Type() != i32Type {
+			scalarPhiI32 = b.CreateTrunc(scalarPhiI32, i32Type, "spmd.base.narrow")
+		}
+		diff := b.CreateSub(boundScalar, scalarPhiI32, "spmd.diff")
 
 		// Clamp diff to [0, laneCount]: max(0, min(laneCount, diff)).
 		zero32 := llvm.ConstInt(i32Type, 0, false)
@@ -1795,6 +1834,7 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 func (b *builder) spmdMaterializeDecomposed(decomp *spmdDecomposedIndex) llvm.Value {
 	i32Type := b.ctx.Int32Type()
 	vecType := llvm.VectorType(i32Type, decomp.laneCount)
+	// decomp.scalarBase is always i32 (normalized at creation in emitSPMDBodyPrologue).
 	baseVec := b.splatScalar(decomp.scalarBase, vecType)
 	offsetExt := b.CreateZExt(decomp.varyingOffset, vecType, "")
 	return b.CreateAdd(baseVec, offsetExt, "spmd.materialized.idx")
@@ -4886,6 +4926,15 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 		}
 	}
 
+	// decomp.scalarBase is always i32 (normalized at creation). Ensure scalarLLVM
+	// matches so all arithmetic ops (ADD, SUB, MUL, SHR, etc.) stay in i32.
+	// On x86-64 int constants and values are i64; truncating to i32 is safe because
+	// decomposed indices represent positions within arrays (max 2^31-1 elements).
+	i32Type := b.ctx.Int32Type()
+	if scalarLLVM.Type().TypeKind() == llvm.IntegerTypeKind && scalarLLVM.Type().IntTypeWidth() > i32Type.IntTypeWidth() {
+		scalarLLVM = b.CreateTrunc(scalarLLVM, i32Type, "spmd.scalar.narrow")
+	}
+
 	switch expr.Op {
 	case token.ADD:
 		if !decompIsLHS {
@@ -5544,7 +5593,10 @@ func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.
 	}
 
 	// SPMD: on WASM, use i8x16.swizzle for const string lookups of <=16 bytes.
-	if b.spmdUsesSIMD() {
+	// Gated to laneCount <= 16 because the swizzle instruction produces exactly
+	// 16 result bytes; wider loops (e.g., laneCount=32 on AVX2) must fall through
+	// to the per-lane GEP path to produce the correct number of result bytes.
+	if b.spmdUsesSIMD() && laneCount <= 16 {
 		if constVal, ok := expr.X.(*ssa.Const); ok {
 			if constVal.Value != nil && constVal.Value.Kind() == constant.String {
 				strVal := constant.StringVal(constVal.Value)
@@ -5682,10 +5734,12 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 			return rawVec, nil
 		}
 
-		// i8x16.swizzle fast path: byte arrays ≤ 16 elements.
+		// i8x16.swizzle fast path: byte arrays ≤ 16 elements, at most 16 lanes.
 		// Bounds safety: swizzle returns 0 for indices >= 16 (no memory access,
-		// purely register-based).
-		if elemType == b.ctx.Int8Type() && xType.Len() <= 16 {
+		// purely register-based). Gated to laneCount <= 16 because the swizzle
+		// instruction produces exactly 16 result bytes; wider loops (e.g., laneCount=32
+		// on AVX2) must fall through to the per-lane GEP path to access all lanes.
+		if elemType == b.ctx.Int8Type() && xType.Len() <= 16 && laneCount <= 16 {
 			// If the collection was loaded from memory (SSA *UnOp dereference),
 			// use the source pointer directly — avoids aggregate→vector conversion
 			// that LLVM decomposes into per-byte loads.
