@@ -2437,36 +2437,54 @@ func (b *builder) spmdSwizzleScalarFallback(table, indices llvm.Value) llvm.Valu
 	return result
 }
 
-// spmdBitmask extracts the MSB of each byte lane into a scalar i32 bitmask.
+// spmdX86BitmaskI32 extracts one bit per logical lane from vec into a scalar i32.
+// vec must be a mask vector in the all-ones/all-zeros lane format (<N x iW>).
+// For <N x i8> (byte elements, 1 byte per lane), pmovmskb maps directly: 1 bit
+// per byte = 1 bit per lane. For wider elements (<N x i16>, <N x i32>), pmovmskb
+// on the raw bytes gives multiple bits per lane (garbage). Instead we reduce to
+// <N x i1> (icmp ne 0) then bitcast to iN: this always yields exactly 1 bit per
+// logical lane regardless of element width.
+func (b *builder) spmdX86BitmaskI32(vec llvm.Value) llvm.Value {
+	laneCount := vec.Type().VectorSize()
+	elemType := vec.Type().ElementType()
+	var i32bitmask llvm.Value
+	if elemType == b.ctx.Int8Type() {
+		// Fast path: <N x i8> — pmovmskb is a direct 1-bit-per-lane extraction.
+		i32bitmask = b.spmdX86Pmovmskb(vec)
+	} else {
+		// General path: collapse to <N x i1> (one true/false per lane), then
+		// bitcast to iN to get a compact bitmask. LLVM typically lowers this
+		// to a comparison + movmskb or similar without extra memory traffic.
+		zero := llvm.ConstNull(vec.Type())
+		i1Vec := b.CreateICmp(llvm.IntNE, vec, zero, "bitmask.i1")
+		intType := b.ctx.IntType(laneCount)
+		iN := b.CreateBitCast(i1Vec, intType, "bitmask.iN")
+		i32bitmask = b.CreateZExt(iN, b.ctx.Int32Type(), "bitmask.i32")
+	}
+	return i32bitmask
+}
+
+// spmdBitmask extracts one bit per logical lane into a scalar i32 bitmask.
 // On WASM: llvm.wasm.bitmask on the vector in WASM mask format.
-// On x86: pmovmskb after bitcasting to <regBytes x i8> (16 for SSE2, 32 for AVX2).
+// On x86: for <N x i8> uses pmovmskb (1 bit per byte = 1 bit per lane).
+// For wider elements (<N x i16>, <N x i32>) uses icmp+bitcast to avoid
+// pmovmskb producing multiple bits per lane.
 func (b *builder) spmdBitmask(vec llvm.Value) llvm.Value {
 	if b.spmdIsWASM() {
 		return b.spmdWasmBitmask(vec)
 	}
-	// x86: pmovmskb requires the correct byte-element vector for the register width.
-	regBytes := b.spmdRegisterBytes()
-	viN8 := llvm.VectorType(b.ctx.Int8Type(), regBytes)
-	if vec.Type() != viN8 {
-		vec = b.CreateBitCast(vec, viN8, "bitmask.cast")
-	}
-	return b.spmdX86Pmovmskb(vec)
+	return b.spmdX86BitmaskI32(vec)
 }
 
 // spmdAnyTrue tests if any lane in the vector is nonzero.
 // On WASM: llvm.wasm.anytrue returning i32 (0 or 1).
-// On x86: pmovmskb + icmp ne 0, returning i32.
-// Supports 128-bit (SSE2, <16 x i8>) and 256-bit (AVX2, <32 x i8>) registers.
+// On x86: bitmask + icmp ne 0, returning i32.
+// Supports any element width: <N x i8>, <N x i16>, <N x i32>.
 func (b *builder) spmdAnyTrue(vec llvm.Value) llvm.Value {
 	if b.spmdIsWASM() {
 		return b.spmdWasmAnyTrue(vec)
 	}
-	regBytes := b.spmdRegisterBytes()
-	viN8 := llvm.VectorType(b.ctx.Int8Type(), regBytes)
-	if vec.Type() != viN8 {
-		vec = b.CreateBitCast(vec, viN8, "anytrue.cast")
-	}
-	mask := b.spmdX86Pmovmskb(vec)
+	mask := b.spmdX86BitmaskI32(vec)
 	zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
 	ne := b.CreateICmp(llvm.IntNE, mask, zero, "anytrue")
 	return b.CreateZExt(ne, b.ctx.Int32Type(), "anytrue.i32")
@@ -2474,20 +2492,17 @@ func (b *builder) spmdAnyTrue(vec llvm.Value) llvm.Value {
 
 // spmdAllTrue tests if all lanes in the vector are nonzero.
 // On WASM: llvm.wasm.alltrue returning i32 (0 or 1).
-// On x86: pmovmskb + icmp eq allOnesMask, returning i32.
-// allOnesMask is (1<<regBytes)-1: 0xFFFF for 128-bit (SSE2), 0xFFFFFFFF for 256-bit (AVX2).
+// On x86: bitmask + icmp eq allOnesMask, returning i32.
+// allOnesMask is (1<<laneCount)-1: one bit per logical lane.
+// Supports any element width: <N x i8>, <N x i16>, <N x i32>.
 func (b *builder) spmdAllTrue(vec llvm.Value) llvm.Value {
 	if b.spmdIsWASM() {
 		return b.spmdWasmAllTrue(vec)
 	}
-	regBytes := b.spmdRegisterBytes()
-	viN8 := llvm.VectorType(b.ctx.Int8Type(), regBytes)
-	if vec.Type() != viN8 {
-		vec = b.CreateBitCast(vec, viN8, "alltrue.cast")
-	}
-	mask := b.spmdX86Pmovmskb(vec)
-	// Each byte lane contributes one bit; all-ones means regBytes bits are set.
-	allOnesMask := uint64((1 << regBytes) - 1)
+	laneCount := vec.Type().VectorSize()
+	mask := b.spmdX86BitmaskI32(vec)
+	// One bit per logical lane; all-ones means laneCount bits are set.
+	allOnesMask := uint64((1 << laneCount) - 1)
 	allOnes := llvm.ConstInt(b.ctx.Int32Type(), allOnesMask, false)
 	eq := b.CreateICmp(llvm.IntEQ, mask, allOnes, "alltrue")
 	return b.CreateZExt(eq, b.ctx.Int32Type(), "alltrue.i32")

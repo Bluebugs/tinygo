@@ -7292,8 +7292,37 @@ func TestSPMDSwizzleDispatch(t *testing.T) {
 }
 
 // TestSPMDBitmaskDispatch verifies that spmdBitmask dispatches correctly.
+// For <N x i8> inputs on x86, pmovmskb is the fast path (1 bit per byte = 1 bit per
+// logical lane). For wider element types (<N x i16>, <N x i32>), the general path
+// uses icmp+bitcast to extract exactly 1 bit per logical lane without garbage bits.
 func TestSPMDBitmaskDispatch(t *testing.T) {
-	t.Run("x86", func(t *testing.T) {
+	t.Run("x86_i8_fast_path", func(t *testing.T) {
+		// <16 x i8> on x86 SSE: pmovmskb.128, 1 bit per byte = 1 bit per lane.
+		c := newTestCompilerContextX86(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		v16i8 := llvm.VectorType(c.ctx.Int8Type(), 16)
+		vecAlloca := b.CreateAlloca(v16i8, "vec.alloca")
+		vec := b.CreateLoad(v16i8, vecAlloca, "vec")
+
+		result := b.spmdBitmask(vec)
+		if result.IsNil() {
+			t.Fatal("spmdBitmask result is nil on x86 i8")
+		}
+		if result.Type() != c.ctx.Int32Type() {
+			t.Errorf("result type = %v, want i32", result.Type())
+		}
+		modIR := b.mod.String()
+		if !strings.Contains(modIR, "llvm.x86.sse2.pmovmskb.128") {
+			t.Error("expected pmovmskb.128 fast path for <16 x i8>")
+		}
+	})
+
+	t.Run("x86_i32_general_path", func(t *testing.T) {
+		// <4 x i32> on x86: pmovmskb would give 16 bits (4 bytes per lane × 4 lanes),
+		// not 4 bits. Use icmp+bitcast to get exactly 4 bits (1 per lane).
 		c := newTestCompilerContextX86(t)
 		defer c.dispose()
 		b := newTestBuilder(t, c)
@@ -7305,14 +7334,19 @@ func TestSPMDBitmaskDispatch(t *testing.T) {
 
 		result := b.spmdBitmask(vec)
 		if result.IsNil() {
-			t.Fatal("spmdBitmask result is nil on x86")
+			t.Fatal("spmdBitmask result is nil on x86 i32")
 		}
 		if result.Type() != c.ctx.Int32Type() {
 			t.Errorf("result type = %v, want i32", result.Type())
 		}
 		modIR := b.mod.String()
-		if !strings.Contains(modIR, "llvm.x86.sse2.pmovmskb.128") {
-			t.Error("expected pmovmskb intrinsic on x86")
+		// Must NOT use pmovmskb for wide elements (would give multiple bits per lane).
+		if strings.Contains(modIR, "llvm.x86.sse2.pmovmskb.128") {
+			t.Error("must not use pmovmskb for <4 x i32> (produces 16 bits, not 4)")
+		}
+		// Must use icmp ne 0 to get <4 x i1> (one true/false per lane).
+		if !strings.Contains(modIR, "icmp ne") {
+			t.Error("expected icmp ne for <4 x i32> general path")
 		}
 	})
 
@@ -7465,8 +7499,10 @@ func TestSPMDWrapMaskAVX2_16Wide(t *testing.T) {
 	}
 }
 
-// TestSPMDAnyTrueAVX2 verifies that spmdAnyTrue bitcasts to <32 x i8> and emits
-// the AVX2 pmovmskb intrinsic when SIMDRegisterBytes=32.
+// TestSPMDAnyTrueAVX2 verifies that spmdAnyTrue on a <8 x i32> mask uses the
+// icmp+bitcast general path (not pmovmskb) when SIMDRegisterBytes=32.
+// pmovmskb on <32 x i8> would give 32 bits — 4 per logical i32 lane — which is
+// wrong. The correct result is 1 bit per lane: exactly 8 bits for 8 lanes.
 func TestSPMDAnyTrueAVX2(t *testing.T) {
 	c := newTestCompilerContextX86(t)
 	defer c.dispose()
@@ -7489,17 +7525,23 @@ func TestSPMDAnyTrueAVX2(t *testing.T) {
 		t.Errorf("result type = %v, want i32", result.Type())
 	}
 	modIR := b.mod.String()
-	if !strings.Contains(modIR, "llvm.x86.avx2.pmovmskb") {
-		t.Error("expected llvm.x86.avx2.pmovmskb intrinsic for AVX2 256-bit mask")
+	// Must NOT use pmovmskb for <8 x i32>: would produce 32 bits (4 per lane).
+	if strings.Contains(modIR, "llvm.x86.avx2.pmovmskb") {
+		t.Error("must not use avx2.pmovmskb for <8 x i32> (produces 32 bits, not 8)")
 	}
 	if strings.Contains(modIR, "llvm.x86.sse2.pmovmskb.128") {
-		t.Error("unexpected llvm.x86.sse2.pmovmskb.128 for AVX2 256-bit mask")
+		t.Error("unexpected sse2.pmovmskb.128 for <8 x i32> input")
+	}
+	// Must use icmp ne to extract 1 bit per lane.
+	if !strings.Contains(modIR, "icmp ne") {
+		t.Error("expected icmp ne for <8 x i32> general path")
 	}
 }
 
-// TestSPMDAllTrueAVX2 verifies that spmdAllTrue bitcasts to <32 x i8>, emits the
-// AVX2 pmovmskb intrinsic, and does NOT use the SSE2 128-bit variant when
-// SIMDRegisterBytes=32.
+// TestSPMDAllTrueAVX2 verifies that spmdAllTrue on a <8 x i32> mask uses the
+// icmp+bitcast general path (not pmovmskb) when SIMDRegisterBytes=32.
+// The all-ones mask constant must be (1<<8)-1 = 0xFF (one bit per lane),
+// not (1<<32)-1 which would compare against pmovmskb's 32-bit byte output.
 func TestSPMDAllTrueAVX2(t *testing.T) {
 	c := newTestCompilerContextX86(t)
 	defer c.dispose()
@@ -7522,15 +7564,20 @@ func TestSPMDAllTrueAVX2(t *testing.T) {
 		t.Errorf("result type = %v, want i32", result.Type())
 	}
 	modIR := b.mod.String()
-	if !strings.Contains(modIR, "llvm.x86.avx2.pmovmskb") {
-		t.Error("expected llvm.x86.avx2.pmovmskb intrinsic for AVX2 256-bit mask")
+	// Must NOT use pmovmskb for <8 x i32>: would produce 32 bits (4 per lane).
+	if strings.Contains(modIR, "llvm.x86.avx2.pmovmskb") {
+		t.Error("must not use avx2.pmovmskb for <8 x i32> (produces 32 bits, not 8)")
 	}
 	if strings.Contains(modIR, "llvm.x86.sse2.pmovmskb.128") {
-		t.Error("unexpected llvm.x86.sse2.pmovmskb.128 for AVX2 256-bit mask")
+		t.Error("unexpected sse2.pmovmskb.128 for <8 x i32> input")
 	}
-	// The bitcast target must be <32 x i8> for 256-bit AVX2, not <16 x i8>.
-	if !strings.Contains(modIR, "<32 x i8>") {
-		t.Error("expected <32 x i8> bitcast target for 256-bit AVX2 register")
+	// Must use icmp ne to extract 1 bit per lane.
+	if !strings.Contains(modIR, "icmp ne") {
+		t.Error("expected icmp ne for <8 x i32> general path")
+	}
+	// The all-ones constant must be 0xFF (8 bits for 8 lanes), not 0xFFFFFFFF.
+	if strings.Contains(modIR, "i32 -1") || strings.Contains(modIR, "i32 4294967295") {
+		t.Error("allOnesMask must be 0xFF (8 bits per 8 lanes), not 0xFFFFFFFF")
 	}
 }
 
