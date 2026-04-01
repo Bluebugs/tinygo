@@ -2389,13 +2389,15 @@ func (b *builder) spmdRelaxedDotI8x16Add(a, bVec, acc llvm.Value) llvm.Value {
 }
 
 // spmdSwizzle emits a byte-permute (i8x16.swizzle equivalent) for the current target.
-// On WASM: llvm.wasm.swizzle or llvm.wasm.relaxed.swizzle.
-// On x86 with SSSE3: llvm.x86.ssse3.pshuf.b.128 (pshufb).
-// Fallback: per-lane extractelement/insertelement loop.
-// Both table and indices must be <16 x i8>. Returns <16 x i8>.
+// On WASM: llvm.wasm.swizzle or llvm.wasm.relaxed.swizzle (always 128-bit / <16 x i8>).
+// On x86 with SSSE3: spmdX86Pshufb, which handles both <16 x i8> (pshufb) and
+// <32 x i8> (vpshufb ymm for AVX2) based on the table vector width.
+// Fallback: per-lane extractelement/insertelement loop (16 lanes only).
+// Table and indices must be the same vector type. Returns the same vector type.
 func (b *builder) spmdSwizzle(table, indices llvm.Value) llvm.Value {
-	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
 	if b.spmdIsWASM() {
+		// WASM always operates on 128-bit (16 lanes).
+		v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
 		intrinsicName := "llvm.wasm.swizzle"
 		if b.spmdHasRelaxedSIMD() {
 			intrinsicName = "llvm.wasm.relaxed.swizzle"
@@ -2408,6 +2410,8 @@ func (b *builder) spmdSwizzle(table, indices llvm.Value) llvm.Value {
 		return b.createCall(fnType, fn, []llvm.Value{table, indices}, "spmd.swizzle")
 	}
 	if b.spmdHasSSSE3() {
+		// spmdX86Pshufb dispatches to pshufb (128-bit) or vpshufb (256-bit) based on
+		// the vector width — no hardcoded <16 x i8> needed here.
 		return b.spmdX86Pshufb(table, indices)
 	}
 	return b.spmdSwizzleScalarFallback(table, indices)
@@ -6291,26 +6295,43 @@ func (b *builder) spmdExtendIndex(value llvm.Value, goType types.Type, targetTyp
 	return b.CreateSExt(value, targetType, "")
 }
 
-// spmdWasmSwizzle generates a WASM i8x16.swizzle instruction to look up bytes
-// from a constant table using a vector of indices. The table is zero-padded to 16 bytes.
-// For lane counts < 16, the result is narrowed using a shuffle extract.
+// spmdWasmSwizzle generates a byte-permute lookup using a constant table and a
+// vector of indices. The table is automatically duplicated when the swizzle width
+// exceeds the table size (e.g., a 16-byte hextable becomes [table, table] for
+// AVX2 32-lane swizzle, because vpshufb ymm shuffles each 128-bit half independently).
+//
+// For WASM (always 128-bit) and SSE (laneCount ≤ 16): swizzleWidth = 16, table
+// zero-padded to 16 bytes. For AVX2 (laneCount > 16, non-WASM): swizzleWidth =
+// laneCount; table duplicated to fill the register.
+//
+// For lane counts < swizzleWidth, the result is narrowed to laneCount lanes.
 func (b *builder) spmdWasmSwizzle(tableBytes []byte, index llvm.Value, laneCount int) llvm.Value {
 	i8Type := b.ctx.Int8Type()
-	v16i8 := llvm.VectorType(i8Type, 16)
+	tableLen := len(tableBytes)
 
-	// Build <16 x i8> constant from table bytes, zero-pad if < 16.
-	tableElems := make([]llvm.Value, 16)
-	for i := 0; i < 16; i++ {
-		if i < len(tableBytes) {
-			tableElems[i] = llvm.ConstInt(i8Type, uint64(tableBytes[i]), false)
+	// Determine the swizzle width: use the native register width for the target.
+	// WASM always stays at 128-bit (16 lanes); AVX2 uses the full 256-bit (32 lanes).
+	swizzleWidth := 16
+	if laneCount > 16 && !b.spmdIsWASM() {
+		swizzleWidth = laneCount
+	}
+
+	// Build the constant table vector. When swizzleWidth > tableLen, duplicate the
+	// table to fill all positions (required by AVX2 vpshufb which shuffles each
+	// 128-bit half independently — each half needs its own copy of the table).
+	tableElems := make([]llvm.Value, swizzleWidth)
+	for i := 0; i < swizzleWidth; i++ {
+		srcIdx := i % tableLen
+		if srcIdx < tableLen {
+			tableElems[i] = llvm.ConstInt(i8Type, uint64(tableBytes[srcIdx]), false)
 		} else {
 			tableElems[i] = llvm.ConstInt(i8Type, 0, false)
 		}
 	}
 	tableVec := llvm.ConstVector(tableElems, false)
 
-	// Prepare index as <16 x i8>.
-	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount)
+	// Prepare index to match swizzle width.
+	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount, swizzleWidth)
 
 	// Identity swizzle optimization: if the index is [0, 1, 2, ..., N-1],
 	// the swizzle is a no-op — use the table directly.
@@ -6322,14 +6343,15 @@ func (b *builder) spmdWasmSwizzle(tableBytes []byte, index llvm.Value, laneCount
 		result = b.spmdSwizzle(tableVec, idxVec)
 	}
 
-	// If laneCount < 16, extract the first laneCount lanes.
-	if laneCount < 16 {
+	// If laneCount < swizzleWidth, extract the first laneCount lanes.
+	if laneCount < swizzleWidth {
+		swizzleVecType := llvm.VectorType(i8Type, swizzleWidth)
 		maskElems := make([]llvm.Value, laneCount)
 		for i := 0; i < laneCount; i++ {
 			maskElems[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
 		}
 		maskVec := llvm.ConstVector(maskElems, false)
-		result = b.CreateShuffleVector(result, llvm.Undef(v16i8), maskVec, "")
+		result = b.CreateShuffleVector(result, llvm.Undef(swizzleVecType), maskVec, "")
 	}
 
 	return result
@@ -6596,8 +6618,8 @@ func (b *builder) spmdSwizzleWithTable(tableVec, index llvm.Value, laneCount int
 	i8Type := b.ctx.Int8Type()
 	i32Type := b.ctx.Int32Type()
 
-	// Prepare index as <16 x i8>.
-	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount)
+	// Prepare index as <16 x i8> (spmdSwizzleWithTable always uses 16-lane swizzle).
+	idxVec := b.spmdSwizzlePrepareIndex(index, laneCount, 16)
 
 	// Identity swizzle optimization: if the index is [0, 1, 2, ..., N-1],
 	// the swizzle is a no-op — use the table directly.
@@ -6686,12 +6708,13 @@ func spmdIsIdentitySwizzleIndex(v llvm.Value) bool {
 	return true
 }
 
-// spmdSwizzlePrepareIndex converts a vector index to <16 x i8> for i8x16.swizzle.
-// If the index element type is wider than i8 (e.g., <4 x i32>), it is truncated to
-// <N x i8>. If N < 16, the vector is padded to 16 lanes using a shuffle; the padding
-// lanes receive undef values from the second shuffle operand, which are safe because
-// spmdWasmSwizzle extracts only the first laneCount lanes from the swizzle result.
-func (b *builder) spmdSwizzlePrepareIndex(index llvm.Value, laneCount int) llvm.Value {
+// spmdSwizzlePrepareIndex converts a vector index to <targetWidth x i8> for use
+// with a swizzle instruction. If the index element type is wider than i8 (e.g.,
+// <4 x i32>), it is truncated to <laneCount x i8>. If laneCount == targetWidth,
+// the index is returned as-is. If laneCount < targetWidth, the index is padded to
+// targetWidth lanes using a shuffle; padding lanes pick from an undef second operand
+// and are safe because the caller discards those lanes from the swizzle result.
+func (b *builder) spmdSwizzlePrepareIndex(index llvm.Value, laneCount, targetWidth int) llvm.Value {
 	i8Type := b.ctx.Int8Type()
 
 	// Truncate to i8 if wider (safe since table indices are 0-15).
@@ -6701,15 +6724,15 @@ func (b *builder) spmdSwizzlePrepareIndex(index llvm.Value, laneCount int) llvm.
 		index = b.CreateTrunc(index, narrowType, "")
 	}
 
-	if laneCount == 16 {
+	if laneCount == targetWidth {
 		return index
 	}
 
-	// Pad to 16 lanes using a shuffle. Padding lanes pick from the undef second operand
-	// and produce undef values; the swizzle result for those lanes is discarded by the
-	// caller's extraction step, so undef padding is safe.
-	maskElems := make([]llvm.Value, 16)
-	for i := 0; i < 16; i++ {
+	// Pad to targetWidth lanes using a shuffle. Padding lanes pick from the undef
+	// second operand and produce undef; the swizzle result for those lanes is discarded
+	// by the caller's extraction step, so undef padding is safe.
+	maskElems := make([]llvm.Value, targetWidth)
+	for i := 0; i < targetWidth; i++ {
 		if i < laneCount {
 			maskElems[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
 		} else {

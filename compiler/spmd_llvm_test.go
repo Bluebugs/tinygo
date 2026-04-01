@@ -3240,17 +3240,22 @@ func TestSPMDSwizzleDetection(t *testing.T) {
 
 	i8Type := c.ctx.Int8Type()
 
-	// Test spmdSwizzlePrepareIndex with various lane counts and index widths.
+	// Test spmdSwizzlePrepareIndex with various lane counts, index widths, and target widths.
 	tests := []struct {
-		name      string
-		laneCount int
-		indexType llvm.Type
-		wantWidth int // expected result vector size (always 16)
+		name        string
+		laneCount   int
+		indexType   llvm.Type
+		targetWidth int
+		wantWidth   int
 	}{
-		{"16xi8_direct", 16, i8Type, 16},
-		{"4xi32_trunc_pad", 4, c.ctx.Int32Type(), 16},
-		{"8xi16_trunc_pad", 8, c.ctx.Int16Type(), 16},
-		{"4xi8_pad", 4, i8Type, 16},
+		{"16xi8_direct", 16, i8Type, 16, 16},
+		{"4xi32_trunc_pad", 4, c.ctx.Int32Type(), 16, 16},
+		{"8xi16_trunc_pad", 8, c.ctx.Int16Type(), 16, 16},
+		{"4xi8_pad", 4, i8Type, 16, 16},
+		// New: targetWidth == laneCount (no padding, no truncation).
+		{"16xi8_target16", 16, i8Type, 16, 16},
+		// New: pad 16 lanes to 32 (AVX2 width).
+		{"16xi8_pad_to_32", 16, i8Type, 32, 32},
 	}
 
 	for _, tt := range tests {
@@ -3263,7 +3268,7 @@ func TestSPMDSwizzleDetection(t *testing.T) {
 					llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false), "")
 			}
 
-			result := b.spmdSwizzlePrepareIndex(indexVec, tt.laneCount)
+			result := b.spmdSwizzlePrepareIndex(indexVec, tt.laneCount, tt.targetWidth)
 			if result.Type().VectorSize() != tt.wantWidth {
 				t.Errorf("vector size = %d, want %d", result.Type().VectorSize(), tt.wantWidth)
 			}
@@ -7526,5 +7531,71 @@ func TestSPMDAllTrueAVX2(t *testing.T) {
 	// The bitcast target must be <32 x i8> for 256-bit AVX2, not <16 x i8>.
 	if !strings.Contains(modIR, "<32 x i8>") {
 		t.Error("expected <32 x i8> bitcast target for 256-bit AVX2 register")
+	}
+}
+
+// TestSPMDX86Pshufb256 verifies that spmdX86Pshufb emits llvm.x86.avx2.pshuf.b
+// for a 256-bit (<32 x i8>) input vector, not the 128-bit ssse3 intrinsic.
+func TestSPMDX86Pshufb256(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	v32i8 := llvm.VectorType(c.ctx.Int8Type(), 32)
+	tableAlloca := b.CreateAlloca(v32i8, "table.alloca")
+	table := b.CreateLoad(v32i8, tableAlloca, "table")
+	idxAlloca := b.CreateAlloca(v32i8, "idx.alloca")
+	indices := b.CreateLoad(v32i8, idxAlloca, "idx")
+
+	result := b.spmdX86Pshufb(table, indices)
+
+	if result.IsNil() {
+		t.Fatal("spmdX86Pshufb result is nil for 256-bit")
+	}
+	if result.Type() != v32i8 {
+		t.Errorf("result type = %v, want <32 x i8>", result.Type())
+	}
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.x86.avx2.pshuf.b") {
+		t.Error("expected llvm.x86.avx2.pshuf.b in module IR for 256-bit")
+	}
+	if strings.Contains(modIR, "llvm.x86.ssse3.pshuf.b.128") {
+		t.Error("unexpected llvm.x86.ssse3.pshuf.b.128 for 256-bit input")
+	}
+}
+
+// TestSPMDConstTableSwizzle32Lane verifies that spmdWasmSwizzle with laneCount=32
+// on a non-WASM AVX2 context duplicates the 16-byte table to 32 bytes and emits
+// vpshufb ymm (llvm.x86.avx2.pshuf.b). Result must be <32 x i8>.
+func TestSPMDConstTableSwizzle32Lane(t *testing.T) {
+	c := newTestCompilerContextX86(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	c.SIMDRegisterBytes = 32 // AVX2
+
+	// 16-byte hextable; with 32 lanes the table must be duplicated to [table, table].
+	hextable := []byte("0123456789abcdef")
+	v32i8 := llvm.VectorType(c.ctx.Int8Type(), 32)
+	idxAlloca := b.CreateAlloca(v32i8, "idx.alloca")
+	index := b.CreateLoad(v32i8, idxAlloca, "idx")
+
+	result := b.spmdWasmSwizzle(hextable, index, 32)
+
+	if result.Type().VectorSize() != 32 {
+		t.Errorf("result lanes = %d, want 32", result.Type().VectorSize())
+	}
+	if result.Type().ElementType() != c.ctx.Int8Type() {
+		t.Errorf("result element type = %v, want i8", result.Type().ElementType())
+	}
+	// Must dispatch to AVX2 vpshufb for the 32-byte table vector.
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "llvm.x86.avx2.pshuf.b") {
+		t.Error("expected llvm.x86.avx2.pshuf.b for 32-lane swizzle")
+	}
+	if strings.Contains(modIR, "llvm.x86.ssse3.pshuf.b.128") {
+		t.Error("unexpected 128-bit pshufb for 32-lane AVX2 swizzle")
 	}
 }
