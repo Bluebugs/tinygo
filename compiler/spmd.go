@@ -5596,11 +5596,17 @@ func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.
 		}
 	}
 
-	// SPMD: on WASM, use i8x16.swizzle for const string lookups of <=16 bytes.
-	// Gated to laneCount <= 16 because the swizzle instruction produces exactly
-	// 16 result bytes; wider loops (e.g., laneCount=32 on AVX2) must fall through
-	// to the per-lane GEP path to produce the correct number of result bytes.
-	if b.spmdUsesSIMD() && laneCount <= 16 {
+	// SPMD: use swizzle/pshufb for const string lookups of <=16 bytes.
+	// WASM i8x16.swizzle is always 128-bit so laneCount is capped at 16.
+	// On x86 with AVX2, vpshufb operates on 256-bit registers (32 lanes) so
+	// the cap is widened to spmdRegisterBytes(). The table content must still
+	// fit in 16 bytes because swizzle indices address a 16-entry lookup table
+	// (spmdWasmSwizzle duplicates the table for wider registers).
+	maxSwizzleLanes := 16
+	if !b.spmdIsWASM() && b.spmdRegisterBytes() > 16 {
+		maxSwizzleLanes = b.spmdRegisterBytes()
+	}
+	if b.spmdUsesSIMD() && laneCount <= maxSwizzleLanes {
 		if constVal, ok := expr.X.(*ssa.Const); ok {
 			if constVal.Value != nil && constVal.Value.Kind() == constant.String {
 				strVal := constant.StringVal(constVal.Value)
@@ -5738,12 +5744,18 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 			return rawVec, nil
 		}
 
-		// i8x16.swizzle fast path: byte arrays ≤ 16 elements, at most 16 lanes.
+		// pshufb/swizzle fast path: byte arrays ≤ 16 elements.
 		// Bounds safety: swizzle returns 0 for indices >= 16 (no memory access,
-		// purely register-based). Gated to laneCount <= 16 because the swizzle
-		// instruction produces exactly 16 result bytes; wider loops (e.g., laneCount=32
-		// on AVX2) must fall through to the per-lane GEP path to access all lanes.
-		if elemType == b.ctx.Int8Type() && xType.Len() <= 16 && laneCount <= 16 {
+		// purely register-based). WASM i8x16.swizzle is always 128-bit so laneCount
+		// is capped at 16. On x86 with AVX2, vpshufb covers 256-bit registers (32
+		// lanes) so the cap is widened to spmdRegisterBytes(). The array length must
+		// still be ≤ 16 because the table occupies a single 128-bit row (spmdWasmSwizzle
+		// duplicates the row for wider registers).
+		maxSwizzleLanes := 16
+		if !b.spmdIsWASM() && b.spmdRegisterBytes() > 16 {
+			maxSwizzleLanes = b.spmdRegisterBytes()
+		}
+		if elemType == b.ctx.Int8Type() && int(xType.Len()) <= 16 && laneCount <= maxSwizzleLanes {
 			// If the collection was loaded from memory (SSA *UnOp dereference),
 			// use the source pointer directly — avoids aggregate→vector conversion
 			// that LLVM decomposes into per-byte loads.
