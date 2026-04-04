@@ -2888,6 +2888,21 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					// value is correct for all downstream SIMD operations; using it as-is
 					// avoids an invalid bitcast between differently-sized vector types.
 					changeTypeResult = x
+				} else if x.Type().VectorSize() > llvmType.VectorSize() &&
+					x.Type().ElementType().TypeKind() == llvm.IntegerTypeKind &&
+					llvmType.ElementType().TypeKind() == llvm.IntegerTypeKind &&
+					x.Type().ElementType().IntTypeWidth() < llvmType.ElementType().IntTypeWidth() {
+					// SPMD: source has more lanes with narrower elements than target
+					// (e.g., <4 x i32> → <2 x i64> on SSE). This arises when the SPMD
+					// loop runs with a lane count derived from the actual element size
+					// (e.g., 4 lanes for i32) but getLLVMType(Varying[int]) returns the
+					// register-natural lane count (<2 x i64> on SSE). A bitcast would
+					// reinterpret the 128 bits and destroy per-lane semantics.
+					// Keep the source — spmdValueOverride propagation below ensures all
+					// downstream consumers receive the correct wider-lane value.
+					// Note: no spmdValueOverride guard here; this can arise in non-body
+					// blocks (e.g., loop preheaders) where spmdValueOverride is nil.
+					changeTypeResult = x
 				} else if b.spmdDecomposed != nil {
 					if _, ok := b.spmdDecomposed[expr.X]; ok {
 						// SPMD: source is a decomposed index materialized as <N x i32>.

@@ -683,11 +683,24 @@ func (b *builder) spmdBroadcastMatch(x, y llvm.Value, signExtend ...bool) (llvm.
 				y = b.spmdConvertMaskFormat(y, x.Type())
 			}
 		} else {
-			// Data operations: the narrower width is authoritative
-			// (determined by the SPMD loop's effective lane count). Resize the wider one.
+			// Data operations: when one operand is a splat constant (all lanes equal),
+			// resize it to match the other operand's lane count. This handles the case
+			// where a Varying[int] constant is splatted at the register-natural lane count
+			// (e.g., <2 x i64> on SSE) but the loop index has the correct effective lane
+			// count (e.g., <4 x i32>). Without this, the constant's narrower lane count
+			// would be treated as authoritative, truncating the loop index.
 			xSize := x.Type().VectorSize()
 			ySize := y.Type().VectorSize()
-			if xSize < ySize {
+			xSplat := x.IsConstant() && spmdIsConstSplat(x)
+			ySplat := y.IsConstant() && spmdIsConstSplat(y)
+			if xSplat && !ySplat {
+				// x is a splat constant — resize it to match y.
+				x = b.spmdResizeVector(x, ySize, y.Type().ElementType())
+			} else if ySplat && !xSplat {
+				// y is a splat constant — resize it to match x.
+				y = b.spmdResizeVector(y, xSize, x.Type().ElementType())
+			} else if xSize < ySize {
+				// Neither is a splat constant: narrower is authoritative.
 				y = b.spmdResizeVector(y, xSize, x.Type().ElementType())
 			} else {
 				x = b.spmdResizeVector(x, ySize, y.Type().ElementType())
@@ -6715,6 +6728,26 @@ func (b *builder) spmdIsLoopLaneIndex(index llvm.Value, ssaIndex ...ssa.Value) b
 // spmdIsIdentitySwizzleIndex checks whether a <16 x i8> swizzle index vector is
 // the identity permutation [0, 1, 2, ..., 15]. When true, the swizzle is a no-op
 // and can be elided — the table vector IS the result.
+// spmdIsConstSplat returns true if v is a constant vector where all elements
+// have the same value (a splat constant like <4 x i32> splat(4)).
+func spmdIsConstSplat(v llvm.Value) bool {
+	if v.Type().TypeKind() != llvm.VectorTypeKind {
+		return false
+	}
+	n := v.Type().VectorSize()
+	if n == 0 {
+		return false
+	}
+	first := llvm.ConstExtractElement(v, llvm.ConstInt(v.Type().Context().Int32Type(), 0, false))
+	for i := 1; i < n; i++ {
+		elem := llvm.ConstExtractElement(v, llvm.ConstInt(v.Type().Context().Int32Type(), uint64(i), false))
+		if elem != first {
+			return false
+		}
+	}
+	return true
+}
+
 func spmdIsIdentitySwizzleIndex(v llvm.Value) bool {
 	if !v.IsConstant() || v.Type().TypeKind() != llvm.VectorTypeKind {
 		return false
@@ -7555,6 +7588,11 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 		vecResultType := resultType
 		if resultType.TypeKind() != llvm.VectorTypeKind {
 			vecResultType = llvm.VectorType(resultType, addrLaneCount)
+		} else if resultType.VectorSize() != addrLaneCount {
+			// getLLVMType(Varying[T]) returns the register-natural lane count (e.g., <16 x i8>
+			// for Varying[byte] on SSE). But the gather must return exactly addrLaneCount
+			// elements — one per address pointer. Rebuild with the correct lane count.
+			vecResultType = llvm.VectorType(resultType.ElementType(), addrLaneCount)
 		}
 		return b.spmdMaskedGather(vecResultType, addr, mask)
 	}
