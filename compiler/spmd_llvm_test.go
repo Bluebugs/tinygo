@@ -2507,6 +2507,47 @@ func TestSPMDSwizzleWithinMask(t *testing.T) {
 	}
 }
 
+// TestSPMDSwizzleWithinMaskAVX2 verifies SwizzleWithin mask computation for 8-wide AVX2.
+func TestSPMDSwizzleWithinMaskAVX2(t *testing.T) {
+	tests := []struct {
+		name       string
+		totalLanes int
+		groupSize  int
+		indices    []int64
+		want       []uint64
+	}{
+		{
+			name:       "reverse within groups of 4 on 8-wide",
+			totalLanes: 8,
+			groupSize:  4,
+			indices:    []int64{3, 2, 1, 0},
+			want:       []uint64{3, 2, 1, 0, 7, 6, 5, 4},
+		},
+		{
+			name:       "swap pairs within groups of 2 on 8-wide",
+			totalLanes: 8,
+			groupSize:  2,
+			indices:    []int64{1, 0},
+			want:       []uint64{1, 0, 3, 2, 5, 4, 7, 6},
+		},
+		{
+			name:       "identity within groups of 8 on 8-wide",
+			totalLanes: 8,
+			groupSize:  8,
+			indices:    []int64{0, 1, 2, 3, 4, 5, 6, 7},
+			want:       []uint64{0, 1, 2, 3, 4, 5, 6, 7},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := spmdSwizzleWithinMask(tt.totalLanes, tt.groupSize, tt.indices)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("spmdSwizzleWithinMask() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestSPMDShiftLeftWithinMask verifies the shuffle index mask computed by spmdShiftLeftWithinMask.
 func TestSPMDShiftLeftWithinMask(t *testing.T) {
 	tests := []struct {

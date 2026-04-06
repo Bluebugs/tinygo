@@ -3313,6 +3313,33 @@ func spmdExtractIntConst(v ssa.Value) (int64, bool) {
 	return c.Int64(), true
 }
 
+// spmdExtractConstVectorInt64s extracts compile-time constant int64 values from an LLVM vector.
+// Returns nil if the value is not a constant vector or has unexpected length.
+// Uses signed extraction (SExtValue); indices are expected to be non-negative.
+func (b *builder) spmdExtractConstVectorInt64s(v llvm.Value, expectedLen int) []int64 {
+	if !v.IsConstant() {
+		return nil
+	}
+	if v.Type().TypeKind() != llvm.VectorTypeKind {
+		return nil
+	}
+	n := v.Type().VectorSize()
+	if n != expectedLen {
+		return nil
+	}
+	result := make([]int64, n)
+	i32Type := b.ctx.Int32Type()
+	for i := 0; i < n; i++ {
+		idx := llvm.ConstInt(i32Type, uint64(i), false)
+		elem := llvm.ConstExtractElement(v, idx)
+		if elem.IsUndef() || !elem.IsConstant() {
+			return nil
+		}
+		result[i] = int64(elem.SExtValue())
+	}
+	return result
+}
+
 // spmdShuffleConst builds an LLVM <N x i32> constant vector from a slice of uint64 indices.
 // This is the mask operand for CreateShuffleVector.
 func (c *compilerContext) spmdShuffleConst(indices []uint64) llvm.Value {
@@ -3492,16 +3519,7 @@ func (b *builder) createSwizzle(instr *ssa.CallCommon) (llvm.Value, error) {
 func (b *builder) createSwizzleWithin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
 	pos := getPos(instr)
 	value := b.getValue(instr.Args[0], pos)
-
-	// Extract indices as compile-time constant array
-	indicesSSA, ok := instr.Args[1].(ssa.Const)
-	if !ok {
-		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: indices must be a compile-time constant array")
-	}
-	indices := indicesSSA.Value.GetInt64s()
-	if len(indices) == 0 {
-		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: indices array cannot be empty")
-	}
+	indices := b.getValue(instr.Args[1], pos)
 
 	groupSize, ok := spmdExtractIntConst(instr.Args[2])
 	if !ok {
@@ -3509,34 +3527,39 @@ func (b *builder) createSwizzleWithin(instr *ssa.CallCommon, name string) (llvm.
 	}
 
 	vecType := value.Type()
-	var totalLanes int
-	if vecType.TypeKind() == llvm.VectorTypeKind {
-		totalLanes = vecType.VectorSize()
-	} else if vecType.TypeKind() == llvm.ArrayTypeKind {
-		totalLanes = vecType.ArrayLength()
-	} else {
-		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: unsupported value type")
-	}
-
+	totalLanes := vecType.VectorSize()
 	gs := int(groupSize)
-	if gs <= 0 {
-		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: groupSize must be > 0")
-	}
-	if totalLanes%gs != 0 {
+
+	if gs <= 0 || totalLanes%gs != 0 {
 		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: groupSize must evenly divide lane count")
 	}
-	if len(indices) != gs {
-		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: indices length must equal groupSize")
+
+	// indices is Varying[int], always totalLanes-wide. Extract constant values
+	// and verify the permutation pattern repeats across all groups.
+	fullIndices := b.spmdExtractConstVectorInt64s(indices, totalLanes)
+	if fullIndices == nil {
+		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: indices must be a compile-time constant")
+	}
+	// Validate that every group carries the same permutation.
+	constIndices := fullIndices[:gs]
+	for g := 1; g < totalLanes/gs; g++ {
+		for k := 0; k < gs; k++ {
+			if fullIndices[g*gs+k] != constIndices[k] {
+				return llvm.Value{}, b.makeError(pos, fmt.Sprintf(
+					"lanes.SwizzleWithin: indices must repeat every %d lanes (group 0 lane %d = %d, group %d lane %d = %d)",
+					gs, k, constIndices[k], g, k, fullIndices[g*gs+k]))
+			}
+		}
 	}
 
-	// Verify all indices are in valid range
-	for i, idx := range indices {
+	// Verify all indices are in valid range.
+	for i, idx := range constIndices {
 		if idx < 0 || idx >= int64(gs) {
 			return llvm.Value{}, b.makeError(pos, fmt.Sprintf("lanes.SwizzleWithin: indices[%d] out of range [0, %d]", i, gs-1))
 		}
 	}
 
-	mask := spmdSwizzleWithinMask(totalLanes, gs, indices)
+	mask := spmdSwizzleWithinMask(totalLanes, gs, constIndices)
 	shuffleMask := b.spmdShuffleConst(mask)
 	return b.CreateShuffleVector(value, llvm.Undef(vecType), shuffleMask, "swizzlewithin"), nil
 }
