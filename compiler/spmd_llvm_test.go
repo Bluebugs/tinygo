@@ -156,10 +156,10 @@ func TestSPMDMakeLLVMTypeVaryingAggregate(t *testing.T) {
 	defer c.dispose()
 
 	tests := []struct {
-		name          string
-		goType        types.Type
-		wantArrayLen  int
-		wantElemKind  llvm.TypeKind
+		name         string
+		goType       types.Type
+		wantArrayLen int
+		wantElemKind llvm.TypeKind
 	}{
 		{
 			// Varying[[]int] on WASM32: []int is {ptr,i32,i32} = 12 bytes, laneCount = 16/12 = 1.
@@ -2448,6 +2448,60 @@ func TestSPMDRotateWithinMask(t *testing.T) {
 				if v != tt.want[i] {
 					t.Errorf("mask[%d] = %d, want %d", i, v, tt.want[i])
 				}
+			}
+		})
+	}
+}
+
+func TestSPMDSwizzleWithinMask(t *testing.T) {
+	tests := []struct {
+		name       string
+		totalLanes int
+		groupSize  int
+		indices    []int64
+		want       []uint64
+	}{
+		{
+			name:       "simple swap within groups of 4",
+			totalLanes: 8,
+			groupSize:  4,
+			indices:    []int64{1, 0, 2, 3},
+			want:       []uint64{1, 0, 2, 3, 5, 4, 6, 7},
+		},
+		{
+			name:       "rotate left within groups of 4",
+			totalLanes: 8,
+			groupSize:  4,
+			indices:    []int64{1, 2, 3, 0},
+			want:       []uint64{1, 2, 3, 0, 5, 6, 7, 4},
+		},
+		{
+			name:       "groupSize 2",
+			totalLanes: 4,
+			groupSize:  2,
+			indices:    []int64{1, 0},
+			want:       []uint64{1, 0, 3, 2},
+		},
+		{
+			name:       "single element groups",
+			totalLanes: 4,
+			groupSize:  1,
+			indices:    []int64{0},
+			want:       []uint64{0, 1, 2, 3},
+		},
+		{
+			name:       "full permutation",
+			totalLanes: 4,
+			groupSize:  4,
+			indices:    []int64{3, 2, 1, 0},
+			want:       []uint64{3, 2, 1, 0},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := spmdSwizzleWithinMask(tt.totalLanes, tt.groupSize, tt.indices)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("spmdSwizzleWithinMask() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -5940,9 +5994,9 @@ func TestSPMDFieldAddrVaryingPtr(t *testing.T) {
 	// Post-fix: the fix registers the field's scalar GEP → lookup succeeds → PASS.
 	fieldCI, ok := b.spmdContiguousPtr[fieldAddr]
 	if !ok || fieldCI == nil {
-		t.Fatalf("spmdContiguousPtr[fieldAddr] = nil after createInstruction(fieldAddr): "+
-			"the FieldAddr handler in createExpr must propagate contiguous access info "+
-			"from indexAddr so that SPMDLoad can emit llvm.masked.load instead of gather "+
+		t.Fatalf("spmdContiguousPtr[fieldAddr] = nil after createInstruction(fieldAddr): " +
+			"the FieldAddr handler in createExpr must propagate contiguous access info " +
+			"from indexAddr so that SPMDLoad can emit llvm.masked.load instead of gather " +
 			"(Task 7 fix needed)")
 	}
 

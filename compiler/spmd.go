@@ -942,9 +942,9 @@ type spmdVecShadowPendingPhi struct {
 }
 
 type spmdVecShadowState struct {
-	current     map[*ssa.Alloc]llvm.Value                    // alloc → current shadow vector in this block
+	current     map[*ssa.Alloc]llvm.Value                     // alloc → current shadow vector in this block
 	blockOut    map[llvm.BasicBlock]map[*ssa.Alloc]llvm.Value // LLVM block (exit) → shadow snapshot at block end
-	pendingPhis []spmdVecShadowPendingPhi                    // phis awaiting finalization after all blocks compile
+	pendingPhis []spmdVecShadowPendingPhi                     // phis awaiting finalization after all blocks compile
 }
 
 // analyzeSPMDLoops performs two-pass pre-analysis of SPMD loops before block compilation.
@@ -3042,9 +3042,9 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 			// Scalar fallback for DotProductI8x16Add(a, b [16]byte, acc [4]int) [4]int.
 			// acc[i] += sum(int8(a[i*4+j]) * int8(b[i*4+j]) for j in 0..3)
 			pos := getPos(instr)
-			aVal := b.getValue(instr.Args[0], pos)  // [16 x i8]
-			bVal := b.getValue(instr.Args[1], pos)  // [16 x i8]
-			acc := b.getValue(instr.Args[2], pos)   // [4 x i32]
+			aVal := b.getValue(instr.Args[0], pos) // [16 x i8]
+			bVal := b.getValue(instr.Args[1], pos) // [16 x i8]
+			acc := b.getValue(instr.Args[2], pos)  // [4 x i32]
 			i32Type := b.ctx.Int32Type()
 			for i := 0; i < 4; i++ {
 				sum := llvm.ConstInt(i32Type, 0, false)
@@ -3211,10 +3211,7 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		return b.createShiftRightWithin(instr, name)
 
 	case strings.HasPrefix(name, "lanes.SwizzleWithin["):
-		// SwizzleWithin requires variable shuffle indices which are not supported
-		// as constant shufflevector masks on all LLVM targets. Deferred to a future
-		// phase that can generate extractelement/insertelement sequences.
-		return llvm.Value{}, b.makeError(getPos(instr), "lanes.SwizzleWithin not yet implemented")
+		return b.createSwizzleWithin(instr, name)
 
 	case name == "lanes.DotProductI8x16Add":
 		// lanes.DotProductI8x16Add(a, b [16]byte, acc [4]int) [4]int
@@ -3242,7 +3239,7 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 		// so we must adapt: truncate acc elements to i32, compute, then sign-extend.
 		resultGoType := instr.Signature().Results().At(0).Type()
 		resultLLVMType := b.getLLVMType(resultGoType) // [4 x i32] on WASM32, [4 x i64] on x86-64
-		accElemType := b.intType                       // i32 on WASM32, i64 on x86-64
+		accElemType := b.intType                      // i32 on WASM32, i64 on x86-64
 
 		// Convert acc to <4 x i32> for the computation.
 		var accI32 llvm.Value
@@ -3374,6 +3371,19 @@ func spmdRotateWithinMask(totalLanes, groupSize, offset int) []uint64 {
 	return mask
 }
 
+// spmdSwizzleWithinMask computes the shufflevector index mask for SwizzleWithin.
+// Each group of groupSize elements is permuted according to indices array.
+func spmdSwizzleWithinMask(totalLanes, groupSize int, indices []int64) []uint64 {
+	mask := make([]uint64, totalLanes)
+	for i := 0; i < totalLanes; i++ {
+		group := i / groupSize
+		laneInGroup := i % groupSize
+		srcLane := group*groupSize + int(indices[laneInGroup])
+		mask[i] = uint64(srcLane)
+	}
+	return mask
+}
+
 // createRotate rotates all lanes of a vector by a compile-time constant offset.
 //
 // Positive offset rotates left (each lane i gets the value from lane (i+offset) % N).
@@ -3469,6 +3479,66 @@ func (b *builder) createSwizzle(instr *ssa.CallCommon) (llvm.Value, error) {
 	}
 
 	return llvm.Value{}, b.makeError(pos, "lanes.Swizzle: unsupported value type")
+}
+
+// createSwizzleWithin permutes values within independent groups using compile-time constant indices.
+//
+// For a vector of totalLanes elements divided into groups of groupSize, each group
+// is permuted according to the indices array. indices[i] specifies the source lane
+// within the group for output lane i.
+//
+// Example: SwizzleWithin(<0,1,2,3,4,5,6,7>, indices=<1,0,2,3>, groupSize=4)
+// => <1,0,2,3,5,4,6,7>  (each group of 4 permuted by indices)
+func (b *builder) createSwizzleWithin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
+	pos := getPos(instr)
+	value := b.getValue(instr.Args[0], pos)
+
+	// Extract indices as compile-time constant array
+	indicesSSA, ok := instr.Args[1].(ssa.Const)
+	if !ok {
+		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: indices must be a compile-time constant array")
+	}
+	indices := indicesSSA.Value.GetInt64s()
+	if len(indices) == 0 {
+		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: indices array cannot be empty")
+	}
+
+	groupSize, ok := spmdExtractIntConst(instr.Args[2])
+	if !ok {
+		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: groupSize must be a compile-time constant")
+	}
+
+	vecType := value.Type()
+	var totalLanes int
+	if vecType.TypeKind() == llvm.VectorTypeKind {
+		totalLanes = vecType.VectorSize()
+	} else if vecType.TypeKind() == llvm.ArrayTypeKind {
+		totalLanes = vecType.ArrayLength()
+	} else {
+		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: unsupported value type")
+	}
+
+	gs := int(groupSize)
+	if gs <= 0 {
+		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: groupSize must be > 0")
+	}
+	if totalLanes%gs != 0 {
+		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: groupSize must evenly divide lane count")
+	}
+	if len(indices) != gs {
+		return llvm.Value{}, b.makeError(pos, "lanes.SwizzleWithin: indices length must equal groupSize")
+	}
+
+	// Verify all indices are in valid range
+	for i, idx := range indices {
+		if idx < 0 || idx >= int64(gs) {
+			return llvm.Value{}, b.makeError(pos, fmt.Sprintf("lanes.SwizzleWithin: indices[%d] out of range [0, %d]", i, gs-1))
+		}
+	}
+
+	mask := spmdSwizzleWithinMask(totalLanes, gs, indices)
+	shuffleMask := b.spmdShuffleConst(mask)
+	return b.CreateShuffleVector(value, llvm.Undef(vecType), shuffleMask, "swizzlewithin"), nil
 }
 
 // createShiftLeftWithin shifts values left within independent groups of groupSize lanes.
