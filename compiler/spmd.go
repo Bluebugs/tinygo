@@ -6764,14 +6764,13 @@ func (b *builder) spmdSwizzleWithTable(tableVec, index llvm.Value, laneCount int
 		swizzled = b.spmdSwizzle(tableVec, idxVec)
 	}
 
-	// Determine result element type. On WASM, widen bytes to avoid sub-128-bit vectors.
+	// Result element type is always i8. The caller is responsible for widening
+	// if needed. We previously widened to i32 here to avoid sub-128-bit vectors,
+	// but that caused byte arithmetic (e.g., nibble-LUT decode) to overflow:
+	// (byte(83) + byte(191)) = i8(18) correctly, but i32(83)+i32(191) = i32(274)
+	// which then shifts incorrectly before truncation at the store.
+	// LLVM handles <4 x i8> arithmetic correctly for WASM by mapping to i8x16.
 	resultElemType := i8Type
-	if b.spmdUsesSIMD() {
-		vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(i8Type, laneCount))) * 8
-		if vecBits < 128 {
-			resultElemType = b.spmdMaskElemType(laneCount)
-		}
-	}
 
 	// Fast path: 16 byte lanes, no widening needed.
 	if laneCount == 16 && resultElemType == i8Type {
@@ -7144,11 +7143,25 @@ func (b *builder) spmdEmitInterleavedStoreMasked(lastVal ssa.Value, lastAddr ssa
 
 	// Retrieve the scalar base index (iter*stride) from the decomposed index map.
 	// This is the scalar component of the decomposed index for addr0.Index.
-	// Fall back to zero if not found (shouldn't happen for well-formed groups).
+	// On x86-64 with laneCount > 4 (decomposed path), the scalar base is in
+	// spmdDecomposed. On WASM (non-decomposed), extract lane 0 from the LLVM
+	// vector value — lane 0 always holds the smallest index which equals the
+	// scalar base for the current SIMD group (e.g., g*stride+0 for g=0,4,8,...).
 	scalarBase := llvm.Value{}
 	if b.spmdDecomposed != nil {
 		if decomp, ok := b.spmdDecomposed[addr0.Index]; ok {
 			scalarBase = decomp.scalarBase
+		}
+	}
+	if scalarBase.IsNil() {
+		// Non-decomposed path (WASM, laneCount <= 4): get the LLVM value of the
+		// varying index vector and extract element 0, which is the scalar base.
+		idxVec := b.getValue(addr0.Index, getPos(addr0))
+		if idxVec.Type().TypeKind() == llvm.VectorTypeKind {
+			scalarBase = b.CreateExtractElement(idxVec,
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false), "interleaved.base")
+		} else {
+			scalarBase = idxVec
 		}
 	}
 	if scalarBase.IsNil() {
@@ -7163,6 +7176,24 @@ func (b *builder) spmdEmitInterleavedStoreMasked(lastVal ssa.Value, lastAddr ssa
 			"interleaved.end")
 		oob := b.CreateICmp(llvm.IntUGT, endIdx, buflen, "interleaved.oob")
 		b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+	}
+
+	// Narrow output vectors to match the destination element type when needed.
+	// This handles the case where values were widened from bytes to i32 by the
+	// swizzle fast path (spmdSwizzleWithTable widens <N x i8> to <N x i32> on
+	// WASM to avoid sub-128-bit vectors). If the outVecs have wider element types
+	// than the slice element type, truncate them now so the masked store emits
+	// byte stores rather than i32 stores.
+	if elemType.TypeKind() == llvm.IntegerTypeKind {
+		destWidth := elemType.IntTypeWidth()
+		for k, v := range outVecs {
+			if v.Type().TypeKind() == llvm.VectorTypeKind {
+				srcElem := v.Type().ElementType()
+				if srcElem.TypeKind() == llvm.IntegerTypeKind && srcElem.IntTypeWidth() > destWidth {
+					outVecs[k] = b.CreateTrunc(v, llvm.VectorType(elemType, v.Type().VectorSize()), "interleave.trunc")
+				}
+			}
+		}
 	}
 
 	// Get the execution mask and expand it for each of the S output stores.
@@ -7854,6 +7885,24 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 	// If the address is a vector (varying pointers), emit a masked scatter.
 	// spmdMaskedScatter handles mask format unwrapping internally.
 	if addr.Type().TypeKind() == llvm.VectorTypeKind {
+		// Narrow widened values before scatter: when the value is <N x i32> but the
+		// destination pointer type implies a narrower element (e.g., *uint8 → i8), truncate
+		// so each lane scatter-writes only the correct number of bytes.
+		if val.Type().TypeKind() == llvm.VectorTypeKind {
+			var narrowBits uint64
+			if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
+				narrowBits = b.spmdNarrowStoreElemBits(val, addrPtrType.Elem())
+			}
+			if narrowBits == 0 {
+				if spmdVal, ok := instr.Val.Type().(*types.SPMDType); ok {
+					narrowBits = b.spmdNarrowStoreElemBits(val, spmdVal.Elem())
+				}
+			}
+			if narrowBits > 0 {
+				narrowType := b.ctx.IntType(int(narrowBits))
+				val = b.CreateTrunc(val, llvm.VectorType(narrowType, laneCount), "scatter.trunc")
+			}
+		}
 		b.spmdMaskedScatter(val, addr, mask)
 		return
 	}
