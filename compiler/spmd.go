@@ -4558,6 +4558,14 @@ func (b *builder) spmdMaskedStore(val, ptr, mask llvm.Value) {
 //	maskedBB: masked.store(val, ptr, mask); br mergeBB
 //	mergeBB: (void, no phi)
 func (b *builder) spmdFullStoreWithBlend(val llvm.Value, ci *spmdContiguousInfo, mask llvm.Value) {
+	// Fast path: all-ones mask — direct store, no blend needed.
+	if b.spmdIsConstAllOnesMask(mask) {
+		elemAlign := int(b.targetData.TypeAllocSize(val.Type().ElementType()))
+		st := b.CreateStore(val, ci.scalarPtr)
+		st.SetAlignment(elemAlign)
+		return
+	}
+
 	vecType := val.Type()
 
 	// Fast path: alloca origin — stack memory is always fully accessible.
@@ -7882,7 +7890,12 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 			}
 			if narrowBits > 0 {
 				b.spmdMaskedStoreNarrow(val, narrowBits, ci.scalarPtr, mask)
-			} else if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
+			} else if b.spmdIsConstAllOnesMask(mask) {
+				// All lanes active — direct contiguous store, no blend needed.
+				elemAlign := int(b.targetData.TypeAllocSize(val.Type().ElementType()))
+				st := b.CreateStore(val, ci.scalarPtr)
+				st.SetAlignment(elemAlign)
+			} else if b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil() {
 				b.spmdFullStoreWithBlend(val, ci, mask)
 				b.currentBlockInfo.exit = b.GetInsertBlock()
 			} else {
