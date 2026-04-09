@@ -3379,11 +3379,80 @@ func (b *builder) createCompactStoreConst(ptr, val llvm.Value, mask []bool, elem
 	return llvm.ConstInt(b.intType, uint64(activeCount), false)
 }
 
+// spmdByteShiftRight shifts a <N x i8> vector right by count byte positions,
+// filling vacated left positions with zero. Element[i] = (i >= count) ? vec[i-count] : 0.
+// This is the prefix-sum carry: each position receives the value that was count positions
+// to its left. Uses LLVM shufflevector which lowers to pslldq (SSE), vpslldq (AVX2),
+// or the appropriate WASM/NEON shuffle.
+func (b *builder) spmdByteShiftRight(vec llvm.Value, count int) llvm.Value {
+	laneCount := vec.Type().VectorSize()
+	if count <= 0 {
+		return vec
+	}
+	if count >= laneCount {
+		return llvm.ConstNull(vec.Type())
+	}
+	// Use zero as the first operand and vec as the second. Indices < count pull from
+	// the zero vector (first op, positions 0..laneCount-1), indices >= count pull from
+	// vec (second op, positions laneCount..2*laneCount-1).
+	i32Type := b.ctx.Int32Type()
+	indices := make([]llvm.Value, laneCount)
+	for i := 0; i < laneCount; i++ {
+		if i < count {
+			// Fill from zero vector (first operand) — any index in [0, laneCount-1].
+			indices[i] = llvm.ConstInt(i32Type, 0, false)
+		} else {
+			// Source from vec (second operand) at position i-count.
+			indices[i] = llvm.ConstInt(i32Type, uint64(laneCount+i-count), false)
+		}
+	}
+	shuffleMask := llvm.ConstVector(indices, false)
+	zero := llvm.ConstNull(vec.Type())
+	return b.CreateShuffleVector(zero, vec, shuffleMask, "compact.bsr")
+}
+
+// spmdSplatConstI8 creates a <N x i8> vector with all elements set to val.
+func (b *builder) spmdSplatConstI8(laneCount int, val uint8) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+	c := llvm.ConstInt(i8Type, uint64(val), false)
+	elts := make([]llvm.Value, laneCount)
+	for i := range elts {
+		elts[i] = c
+	}
+	return llvm.ConstVector(elts, false)
+}
+
+// spmdPopcount computes the popcount of a scalar integer bitmask using the
+// llvm.ctpop intrinsic, returning the result as the compiler's int type.
+func (b *builder) spmdPopcount(bitmask llvm.Value) llvm.Value {
+	bitmaskType := bitmask.Type()
+	width := bitmaskType.IntTypeWidth()
+	fnName := fmt.Sprintf("llvm.ctpop.i%d", width)
+	fnType := llvm.FunctionType(bitmaskType, []llvm.Type{bitmaskType}, false)
+	fn := b.mod.NamedFunction(fnName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, fnName, fnType)
+	}
+	count := b.createCall(fnType, fn, []llvm.Value{bitmask}, "compact.popcount")
+	if count.Type() != b.intType {
+		count = b.CreateZExt(count, b.intType, "compact.popcount.ext")
+	}
+	return count
+}
+
 // createCompactStoreRuntime handles lanes.CompactStore with a runtime mask.
+// Dispatches to createCompactStoreRuntimeScalar for all element widths.
+// The byte-shift and prefix-sum helpers (spmdByteShiftRight, spmdSplatConstI8)
+// are reserved for future use when a fully SIMD gather-permutation path is added.
+func (b *builder) createCompactStoreRuntime(ptr, val, mask llvm.Value, elemType llvm.Type, laneCount int) llvm.Value {
+	return b.createCompactStoreRuntimeScalar(ptr, val, mask, elemType, laneCount)
+}
+
+// createCompactStoreRuntimeScalar handles lanes.CompactStore with a runtime mask.
 // For each lane, if the mask element is true the lane value is stored at the current
 // output index, which is then incremented.  Uses a chain of PHI nodes to thread the
 // running index across the per-lane conditional blocks.
-func (b *builder) createCompactStoreRuntime(ptr, val, mask llvm.Value, elemType llvm.Type, laneCount int) llvm.Value {
+func (b *builder) createCompactStoreRuntimeScalar(ptr, val, mask llvm.Value, elemType llvm.Type, laneCount int) llvm.Value {
 	i32Type := b.ctx.Int32Type()
 	// Running output index, starts at 0.
 	outIdx := llvm.ConstInt(b.intType, 0, false)
