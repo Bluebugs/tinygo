@@ -2356,10 +2356,39 @@ func (c *compilerContext) spmdIsX86() bool {
 	return strings.HasPrefix(c.Triple, "x86_64") || strings.HasPrefix(c.Triple, "i386")
 }
 
-// spmdHasSSSE3 returns true when the target is x86 with SSSE3 enabled.
-// SSSE3 provides pshufb (i8x16.swizzle equivalent) used for fast byte permutation.
+// x86FeatureChain lists x86 SIMD features in implication order.
+// Each feature implies all features before it in the chain.
+var x86FeatureChain = []string{
+	"sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2", "avx512f",
+}
+
+// spmdHasX86Feature returns true when the target is x86 and has the named
+// feature (or any feature that implies it). For example, "+avx2" implies "+ssse3".
+func (c *compilerContext) spmdHasX86Feature(name string) bool {
+	if !c.spmdIsX86() {
+		return false
+	}
+	reqIdx := -1
+	for i, f := range x86FeatureChain {
+		if f == name {
+			reqIdx = i
+			break
+		}
+	}
+	if reqIdx < 0 {
+		return false
+	}
+	for i := reqIdx; i < len(x86FeatureChain); i++ {
+		if strings.Contains(c.Features, "+"+x86FeatureChain[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// spmdHasSSSE3 returns true when the target is x86 with SSSE3 or higher.
 func (c *compilerContext) spmdHasSSSE3() bool {
-	return c.spmdIsX86() && strings.Contains(c.Features, "+ssse3")
+	return c.spmdHasX86Feature("ssse3")
 }
 
 // spmdUsesSIMD returns true when SIMD vector instructions should be emitted.
