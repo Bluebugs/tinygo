@@ -2383,24 +2383,6 @@ func (c *compilerContext) spmdHasRelaxedSIMD() bool {
 	return c.spmdIsWASM() && strings.Contains(c.Features, "+relaxed-simd")
 }
 
-// spmdRelaxedDotI8x16Add emits an i32x4.relaxed_dot_i8x16_i7x16_add_s
-// intrinsic call: result[i] = sum(a[4i+j]*b[4i+j] for j=0..3) + acc[i].
-// The second operand (bVec) must hold signed 7-bit values [-64, 63].
-func (b *builder) spmdRelaxedDotI8x16Add(a, bVec, acc llvm.Value) llvm.Value {
-	i8Type := b.ctx.Int8Type()
-	i32Type := b.ctx.Int32Type()
-	v16i8 := llvm.VectorType(i8Type, 16)
-	v4i32 := llvm.VectorType(i32Type, 4)
-
-	const intrinsicName = "llvm.wasm.relaxed.dot.i8x16.i7x16.add.signed"
-	fnType := llvm.FunctionType(v4i32, []llvm.Type{v16i8, v16i8, v4i32}, false)
-	fn := b.mod.NamedFunction(intrinsicName)
-	if fn.IsNil() {
-		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
-	}
-	return b.createCall(fnType, fn, []llvm.Value{a, bVec, acc}, "spmd.relaxed.dot")
-}
-
 // spmdSwizzle emits a byte-permute (i8x16.swizzle equivalent) for the current target.
 // On WASM: llvm.wasm.swizzle or llvm.wasm.relaxed.swizzle (always 128-bit / <16 x i8>).
 // On x86 with SSSE3: spmdX86Pshufb, which handles both <16 x i8> (pshufb) and
@@ -3038,31 +3020,6 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 			strings.HasPrefix(name, "lanes.SwizzleWithin["):
 			// Single lane: all cross-lane ops are identity.
 			return b.getValue(instr.Args[0], getPos(instr)), nil
-		case name == "lanes.DotProductI8x16Add":
-			// Scalar fallback for DotProductI8x16Add(a, b [16]byte, acc [4]int) [4]int.
-			// acc[i] += sum(int8(a[i*4+j]) * int8(b[i*4+j]) for j in 0..3)
-			pos := getPos(instr)
-			aVal := b.getValue(instr.Args[0], pos) // [16 x i8]
-			bVal := b.getValue(instr.Args[1], pos) // [16 x i8]
-			acc := b.getValue(instr.Args[2], pos)  // [4 x i32]
-			i32Type := b.ctx.Int32Type()
-			for i := 0; i < 4; i++ {
-				sum := llvm.ConstInt(i32Type, 0, false)
-				for j := 0; j < 4; j++ {
-					idx := i*4 + j
-					aElem := b.CreateExtractValue(aVal, idx, "")
-					bElem := b.CreateExtractValue(bVal, idx, "")
-					// Sign-extend i8 to i32 for signed multiply.
-					aExt := b.CreateSExt(aElem, i32Type, "")
-					bExt := b.CreateSExt(bElem, i32Type, "")
-					prod := b.CreateMul(aExt, bExt, "")
-					sum = b.CreateAdd(sum, prod, "")
-				}
-				accElem := b.CreateExtractValue(acc, i, "")
-				accElem = b.CreateAdd(accElem, sum, "")
-				acc = b.CreateInsertValue(acc, accElem, i, "")
-			}
-			return acc, nil
 		}
 	}
 
@@ -3212,91 +3169,6 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 
 	case strings.HasPrefix(name, "lanes.SwizzleWithin["):
 		return b.createSwizzleWithin(instr, name)
-
-	case name == "lanes.DotProductI8x16Add":
-		// lanes.DotProductI8x16Add(a, b [16]byte, acc [4]int) [4]int
-		// Maps to i32x4.relaxed_dot_i8x16_i7x16_add_s on WASM Relaxed SIMD,
-		// or pmaddubsw + pmaddwd on x86 with SSSE3.
-		pos := getPos(instr)
-		aVal := b.getValue(instr.Args[0], pos)
-		bVal := b.getValue(instr.Args[1], pos)
-		accVal := b.getValue(instr.Args[2], pos)
-
-		v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
-		v4i32 := llvm.VectorType(b.ctx.Int32Type(), 4)
-
-		// Convert a and b aggregates to <16 x i8> vectors.
-		// Direct bitcast between aggregate and vector types is illegal in LLVM IR.
-		if aVal.Type().TypeKind() == llvm.ArrayTypeKind {
-			aVal = b.spmdAggregateToVector(aVal, v16i8, 16, "dot.a")
-		}
-		if bVal.Type().TypeKind() == llvm.ArrayTypeKind {
-			bVal = b.spmdAggregateToVector(bVal, v16i8, 16, "dot.b")
-		}
-
-		// Determine the native result type from the function's return type.
-		// On WASM32 int=i32; on x86-64 int=i64. The computation is always i32,
-		// so we must adapt: truncate acc elements to i32, compute, then sign-extend.
-		resultGoType := instr.Signature().Results().At(0).Type()
-		resultLLVMType := b.getLLVMType(resultGoType) // [4 x i32] on WASM32, [4 x i64] on x86-64
-		accElemType := b.intType                      // i32 on WASM32, i64 on x86-64
-
-		// Convert acc to <4 x i32> for the computation.
-		var accI32 llvm.Value
-		if accVal.Type().TypeKind() == llvm.ArrayTypeKind {
-			if accElemType == b.ctx.Int32Type() {
-				// WASM32: [4 x i32] aggregate → <4 x i32> vector.
-				accI32 = b.spmdAggregateToVector(accVal, v4i32, 4, "dot.acc")
-			} else {
-				// x86-64: [4 x i64] aggregate; extract and truncate each element to i32.
-				accI32 = llvm.ConstNull(v4i32)
-				for i := 0; i < 4; i++ {
-					elem := b.CreateExtractValue(accVal, i, "dot.acc.elem")
-					elem32 := b.CreateTrunc(elem, b.ctx.Int32Type(), "dot.acc.trunc")
-					accI32 = b.CreateInsertElement(accI32, elem32,
-						llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false), "dot.acc.i32")
-				}
-			}
-		} else if accVal.Type().TypeKind() == llvm.VectorTypeKind && accVal.Type().ElementType() != b.ctx.Int32Type() {
-			// Varying acc (already a vector) with non-i32 elements: trunc to i32.
-			accI32 = b.CreateTrunc(accVal, v4i32, "dot.acc.trunc")
-		} else {
-			accI32 = accVal
-		}
-
-		var result llvm.Value
-		if b.spmdIsWASM() && b.spmdHasRelaxedSIMD() {
-			result = b.spmdRelaxedDotI8x16Add(aVal, bVal, accI32)
-		} else if b.spmdHasSSSE3() {
-			// x86: pmaddubsw(a_u8, b_i8) → <8 x i16>, then pmaddwd(result, ones) → <4 x i32>.
-			// Weight 100 (as used in the IPv4 parser) fits in u8 without decomposition.
-			halfResult := b.spmdX86Pmaddubsw(aVal, bVal) // <8 x i16>
-			i16Type := b.ctx.Int16Type()
-			ones := llvm.ConstVector([]llvm.Value{
-				llvm.ConstInt(i16Type, 1, false), llvm.ConstInt(i16Type, 1, false),
-				llvm.ConstInt(i16Type, 1, false), llvm.ConstInt(i16Type, 1, false),
-				llvm.ConstInt(i16Type, 1, false), llvm.ConstInt(i16Type, 1, false),
-				llvm.ConstInt(i16Type, 1, false), llvm.ConstInt(i16Type, 1, false),
-			}, false)
-			result = b.spmdX86Pmaddwd(halfResult, ones) // <4 x i32>
-			result = b.CreateAdd(result, accI32, "dot.add.acc")
-		} else {
-			return llvm.Value{}, b.makeError(pos, "lanes.DotProductI8x16Add requires WASM +relaxed-simd or x86 +ssse3")
-		}
-
-		// On x86-64 (int=i64), sign-extend the <4 x i32> result back to [4 x i64].
-		if accElemType != b.ctx.Int32Type() {
-			// Convert <4 x i32> → [4 x i64]: extract each lane, sext, insert into aggregate.
-			finalResult := llvm.Undef(resultLLVMType)
-			for i := 0; i < 4; i++ {
-				elem := b.CreateExtractElement(result,
-					llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false), "dot.res.elem")
-				elem64 := b.CreateSExt(elem, accElemType, "dot.res.sext")
-				finalResult = b.CreateInsertValue(finalResult, elem64, i, "dot.res")
-			}
-			return finalResult, nil
-		}
-		return result, nil
 
 	default:
 		return llvm.Value{}, b.makeError(getPos(instr), "unsupported lanes builtin: "+name)

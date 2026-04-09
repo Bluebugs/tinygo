@@ -6970,41 +6970,6 @@ func TestSPMDHasRelaxedSIMD(t *testing.T) {
 	}
 }
 
-func TestSPMDRelaxedDotI8x16Add(t *testing.T) {
-	c := newTestCompilerContextRelaxed(t)
-	defer c.dispose()
-	b := newTestBuilder(t, c)
-	defer b.Dispose()
-
-	i8Type := c.ctx.Int8Type()
-	i32Type := c.ctx.Int32Type()
-	v16i8 := llvm.VectorType(i8Type, 16)
-	v4i32 := llvm.VectorType(i32Type, 4)
-
-	aVec := llvm.Undef(v16i8)
-	bVec := llvm.Undef(v16i8)
-	accVec := llvm.Undef(v4i32)
-
-	result := b.spmdRelaxedDotI8x16Add(aVec, bVec, accVec)
-
-	// Result must be <4 x i32>.
-	if result.Type().TypeKind() != llvm.VectorTypeKind {
-		t.Fatalf("expected vector result, got %v", result.Type().TypeKind())
-	}
-	if result.Type().VectorSize() != 4 {
-		t.Errorf("expected 4-lane result, got %d", result.Type().VectorSize())
-	}
-	if result.Type().ElementType() != i32Type {
-		t.Errorf("expected i32 element type")
-	}
-
-	// Verify the intrinsic appears in the module IR.
-	modIR := b.mod.String()
-	if !strings.Contains(modIR, "llvm.wasm.relaxed.dot.i8x16.i7x16.add.signed") {
-		t.Error("expected llvm.wasm.relaxed.dot.i8x16.i7x16.add.signed in module IR")
-	}
-}
-
 func TestSPMDRelaxedSwizzleUsedWhenAvailable(t *testing.T) {
 	c := newTestCompilerContextRelaxed(t)
 	defer c.dispose()
