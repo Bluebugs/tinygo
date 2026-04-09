@@ -3020,6 +3020,9 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 			strings.HasPrefix(name, "lanes.SwizzleWithin["):
 			// Single lane: all cross-lane ops are identity.
 			return b.getValue(instr.Args[0], getPos(instr)), nil
+		case strings.HasPrefix(name, "lanes.CompactStore["):
+			// Scalar: conditional store + return 0 or 1.
+			return b.createCompactStoreScalar(instr), nil
 		}
 	}
 
@@ -3170,9 +3173,197 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 	case strings.HasPrefix(name, "lanes.SwizzleWithin["):
 		return b.createSwizzleWithin(instr, name)
 
+	case strings.HasPrefix(name, "lanes.CompactStore["):
+		return b.createCompactStoreSIMD(instr), nil
+
 	default:
 		return llvm.Value{}, b.makeError(getPos(instr), "unsupported lanes builtin: "+name)
 	}
+}
+
+// createCompactStoreScalar implements lanes.CompactStore in scalar (laneCount=1) mode.
+// With a single lane the effective mask is just the user mask: if true store the value
+// and return 1, otherwise return 0.
+func (b *builder) createCompactStoreScalar(instr *ssa.CallCommon) llvm.Value {
+	pos := getPos(instr)
+	dst := b.getValue(instr.Args[0], pos)  // []T slice
+	val := b.getValue(instr.Args[1], pos)  // T value (scalar in scalar mode)
+	mask := b.getValue(instr.Args[2], pos) // bool (scalar in scalar mode)
+
+	// Extract pointer from the slice header (field 0).
+	ptr := b.CreateExtractValue(dst, 0, "compact.scalar.ptr")
+
+	// Normalize mask to i1 (it may be an i32 on some targets).
+	if mask.Type() != b.ctx.Int1Type() {
+		mask = b.CreateICmp(llvm.IntNE, mask, llvm.ConstNull(mask.Type()), "compact.scalar.mask.i1")
+	}
+
+	thenBlock := b.insertBasicBlock("compact.scalar.then")
+	doneBlock := b.insertBasicBlock("compact.scalar.done")
+	curBlock := b.GetInsertBlock()
+
+	b.CreateCondBr(mask, thenBlock, doneBlock)
+
+	b.SetInsertPointAtEnd(thenBlock)
+	b.CreateStore(val, ptr)
+	b.CreateBr(doneBlock)
+
+	b.SetInsertPointAtEnd(doneBlock)
+	phi := b.CreatePHI(b.intType, "compact.scalar.n")
+	phi.AddIncoming(
+		[]llvm.Value{llvm.ConstInt(b.intType, 1, false), llvm.ConstInt(b.intType, 0, false)},
+		[]llvm.BasicBlock{thenBlock, curBlock},
+	)
+	return phi
+}
+
+// createCompactStoreSIMD implements lanes.CompactStore in SIMD mode.
+// It stores active-lane values contiguously to the destination slice and returns
+// the number of elements written (popcount of the effective mask).
+//
+// Effective mask = explicit user mask AND execution mask (instr.SPMDMask).
+// For compile-time constant effective masks a shuffle+partial-store fast path is used.
+// For runtime masks a per-lane conditional store fallback is used.
+func (b *builder) createCompactStoreSIMD(instr *ssa.CallCommon) llvm.Value {
+	pos := getPos(instr)
+	dst := b.getValue(instr.Args[0], pos)         // []T slice
+	val := b.getValue(instr.Args[1], pos)          // Varying[T] — <N x T> vector
+	explicitMask := b.getValue(instr.Args[2], pos) // Varying[bool] — <N x i?> mask
+
+	// Extract destination pointer from the slice header.
+	ptr := b.CreateExtractValue(dst, 0, "compact.ptr")
+
+	// Normalize explicit mask to <N x i1> for logical AND.
+	laneCount := explicitMask.Type().VectorSize()
+	i1ExplicitMask := b.spmdUnwrapMaskForIntrinsic(explicitMask, laneCount)
+
+	// Combine with the execution mask (set by SSA predication when inside a varying
+	// control-flow region or a peeled loop tail).
+	effectiveMaskI1 := i1ExplicitMask
+	if instr.SPMDMask != nil {
+		execMask := b.getValue(instr.SPMDMask, pos)
+		i1ExecMask := b.spmdUnwrapMaskForIntrinsic(execMask, laneCount)
+		effectiveMaskI1 = b.CreateAnd(i1ExplicitMask, i1ExecMask, "compact.effmask")
+	}
+
+	// Ensure val is a vector (it might be a scalar if this call was hoisted outside a
+	// varying-if block where only one lane is active).
+	elemType := val.Type()
+	if elemType.TypeKind() != llvm.VectorTypeKind {
+		val = b.splatScalar(val, llvm.VectorType(elemType, laneCount))
+		elemType = val.Type()
+	}
+	scalarElemType := elemType.ElementType()
+
+	// Fast path: compile-time constant mask — known shuffle + known element count.
+	if constMask := spmdExtractConstBoolMask(effectiveMaskI1, laneCount); constMask != nil {
+		return b.createCompactStoreConst(ptr, val, constMask, scalarElemType, laneCount)
+	}
+
+	// Slow path: runtime mask — per-lane conditional stores.
+	return b.createCompactStoreRuntime(ptr, val, effectiveMaskI1, scalarElemType, laneCount)
+}
+
+// spmdExtractConstBoolMask returns a []bool slice if mask is a compile-time constant
+// <N x i1> vector, or nil if any element is non-constant.
+func spmdExtractConstBoolMask(mask llvm.Value, laneCount int) []bool {
+	if !mask.IsConstant() {
+		return nil
+	}
+	i32Type := mask.Type().Context().Int32Type()
+	result := make([]bool, laneCount)
+	for i := 0; i < laneCount; i++ {
+		elem := llvm.ConstExtractElement(mask, llvm.ConstInt(i32Type, uint64(i), false))
+		if elem.IsNil() || !elem.IsConstant() {
+			return nil
+		}
+		result[i] = elem.ZExtValue() != 0
+	}
+	return result
+}
+
+// createCompactStoreConst handles lanes.CompactStore with a compile-time constant mask.
+// Active lanes are shuffled to positions 0..activeCount-1, then stored via scalar stores.
+// Returns the constant activeCount as an LLVM integer.
+func (b *builder) createCompactStoreConst(ptr, val llvm.Value, mask []bool, elemType llvm.Type, laneCount int) llvm.Value {
+	activeCount := 0
+	for _, m := range mask {
+		if m {
+			activeCount++
+		}
+	}
+	if activeCount == 0 {
+		return llvm.ConstInt(b.intType, 0, false)
+	}
+
+	// Build a shufflevector that moves the active lanes to the front.
+	i32Type := b.ctx.Int32Type()
+	indices := make([]llvm.Value, laneCount)
+	outIdx := 0
+	for i := 0; i < laneCount; i++ {
+		if mask[i] {
+			indices[outIdx] = llvm.ConstInt(i32Type, uint64(i), false)
+			outIdx++
+		}
+	}
+	// Fill the remaining (inactive) shuffle positions with undef — their values are
+	// never stored.
+	for i := outIdx; i < laneCount; i++ {
+		indices[i] = llvm.Undef(i32Type)
+	}
+	shuffleMask := llvm.ConstVector(indices, false)
+	compacted := b.CreateShuffleVector(val, llvm.Undef(val.Type()), shuffleMask, "compact.const.shuffle")
+
+	// Store the first activeCount elements with individual scalar stores.
+	for i := 0; i < activeCount; i++ {
+		elem := b.CreateExtractElement(compacted, llvm.ConstInt(i32Type, uint64(i), false), "compact.const.elem")
+		gep := b.CreateInBoundsGEP(elemType, ptr, []llvm.Value{
+			llvm.ConstInt(i32Type, uint64(i), false),
+		}, "compact.const.gep")
+		b.CreateStore(elem, gep)
+	}
+
+	return llvm.ConstInt(b.intType, uint64(activeCount), false)
+}
+
+// createCompactStoreRuntime handles lanes.CompactStore with a runtime mask.
+// For each lane, if the mask element is true the lane value is stored at the current
+// output index, which is then incremented.  Uses a chain of PHI nodes to thread the
+// running index across the per-lane conditional blocks.
+func (b *builder) createCompactStoreRuntime(ptr, val, mask llvm.Value, elemType llvm.Type, laneCount int) llvm.Value {
+	i32Type := b.ctx.Int32Type()
+	// Running output index, starts at 0.
+	outIdx := llvm.ConstInt(b.intType, 0, false)
+
+	for i := 0; i < laneCount; i++ {
+		lane := llvm.ConstInt(i32Type, uint64(i), false)
+		elem := b.CreateExtractElement(val, lane, "compact.rt.elem")
+		active := b.CreateExtractElement(mask, lane, "compact.rt.mask")
+
+		// Normalize active to i1 in case the mask element type is wider.
+		if active.Type() != b.ctx.Int1Type() {
+			active = b.CreateICmp(llvm.IntNE, active, llvm.ConstNull(active.Type()), "compact.rt.active.i1")
+		}
+
+		thenBlock := b.insertBasicBlock("compact.rt.then")
+		doneBlock := b.insertBasicBlock("compact.rt.done")
+		curBlock := b.GetInsertBlock()
+
+		b.CreateCondBr(active, thenBlock, doneBlock)
+
+		b.SetInsertPointAtEnd(thenBlock)
+		gep := b.CreateInBoundsGEP(elemType, ptr, []llvm.Value{outIdx}, "compact.rt.gep")
+		b.CreateStore(elem, gep)
+		nextIdx := b.CreateAdd(outIdx, llvm.ConstInt(b.intType, 1, false), "compact.rt.next")
+		b.CreateBr(doneBlock)
+
+		b.SetInsertPointAtEnd(doneBlock)
+		phi := b.CreatePHI(b.intType, "compact.rt.idx")
+		phi.AddIncoming([]llvm.Value{nextIdx, outIdx}, []llvm.BasicBlock{thenBlock, curBlock})
+		outIdx = phi
+	}
+
+	return outIdx
 }
 
 // spmdExtractIntConst extracts a compile-time integer constant from an SSA value.
