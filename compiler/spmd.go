@@ -2443,17 +2443,18 @@ func (b *builder) spmdSwizzle(table, indices llvm.Value) llvm.Value {
 
 // spmdSwizzleScalarFallback emits a per-lane byte-permute via extractelement/insertelement.
 // Used when neither WASM swizzle nor x86 pshufb is available.
-// Indices with value >= 16 or bit 7 set produce 0 (matching i8x16.swizzle semantics).
+// Indices with value >= laneCount or bit 7 set produce 0 (matching i8x16.swizzle semantics).
 func (b *builder) spmdSwizzleScalarFallback(table, indices llvm.Value) llvm.Value {
 	i8Type := b.ctx.Int8Type()
 	i32Type := b.ctx.Int32Type()
-	v16i8 := llvm.VectorType(i8Type, 16)
-	result := llvm.ConstNull(v16i8)
-	for i := 0; i < 16; i++ {
+	laneCount := table.Type().VectorSize()
+	resultType := llvm.VectorType(i8Type, laneCount)
+	result := llvm.ConstNull(resultType)
+	threshold := llvm.ConstInt(i8Type, uint64(laneCount), false)
+	for i := 0; i < laneCount; i++ {
 		laneConst := llvm.ConstInt(i32Type, uint64(i), false)
 		idx := b.CreateExtractElement(indices, laneConst, "")
-		// Indices >= 16 or with bit 7 set produce 0 per swizzle semantics.
-		oob := b.CreateICmp(llvm.IntUGE, idx, llvm.ConstInt(i8Type, 16, false), "")
+		oob := b.CreateICmp(llvm.IntUGE, idx, threshold, "")
 		elem := b.CreateExtractElement(table, idx, "")
 		elem = b.CreateSelect(oob, llvm.ConstInt(i8Type, 0, false), elem, "")
 		result = b.CreateInsertElement(result, elem, laneConst, "")
