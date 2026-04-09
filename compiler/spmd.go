@@ -3313,8 +3313,9 @@ func spmdExtractConstBoolMask(mask llvm.Value, laneCount int) []bool {
 }
 
 // createCompactStoreConst handles lanes.CompactStore with a compile-time constant mask.
-// Active lanes are shuffled to positions 0..activeCount-1, then stored via scalar stores.
-// Returns the constant activeCount as an LLVM integer.
+// Active lanes are compacted to the front via a byte-shuffle (pshufb/i8x16.swizzle/tbl),
+// then stored as a single full-width vector write (overwrite pattern — the caller advances
+// by activeCount and the next call overwrites trailing garbage).
 func (b *builder) createCompactStoreConst(ptr, val llvm.Value, mask []bool, elemType llvm.Type, laneCount int) llvm.Value {
 	activeCount := 0
 	for _, m := range mask {
@@ -3326,8 +3327,38 @@ func (b *builder) createCompactStoreConst(ptr, val llvm.Value, mask []bool, elem
 		return llvm.ConstInt(b.intType, 0, false)
 	}
 
-	// Build a shufflevector that moves the active lanes to the front.
+	i8Type := b.ctx.Int8Type()
 	i32Type := b.ctx.Int32Type()
+	elemSize := int(b.targetData.TypeAllocSize(elemType))
+
+	// For byte-width elements, use the target's native byte-shuffle (pshufb/swizzle/tbl)
+	// which operates on <N x i8> directly. For wider elements, use LLVM shufflevector.
+	if elemSize == 1 {
+		// Build <N x i8> shuffle indices: active lanes packed to front.
+		// Inactive output positions get 0x80 (produces 0 for pshufb/swizzle semantics).
+		indexElts := make([]llvm.Value, laneCount)
+		outIdx := 0
+		for i := 0; i < laneCount; i++ {
+			if mask[i] {
+				indexElts[outIdx] = llvm.ConstInt(i8Type, uint64(i), false)
+				outIdx++
+			}
+		}
+		for i := outIdx; i < laneCount; i++ {
+			indexElts[i] = llvm.ConstInt(i8Type, 0x80, false) // out-of-range → 0
+		}
+		indexVec := llvm.ConstVector(indexElts, false)
+
+		// Use the target's native byte-shuffle.
+		compacted := b.spmdSwizzle(val, indexVec)
+
+		// Single full-width vector store (overwrite pattern).
+		st := b.CreateStore(compacted, ptr)
+		st.SetAlignment(1)
+		return llvm.ConstInt(b.intType, uint64(activeCount), false)
+	}
+
+	// Wider types: use LLVM shufflevector + single store.
 	indices := make([]llvm.Value, laneCount)
 	outIdx := 0
 	for i := 0; i < laneCount; i++ {
@@ -3336,23 +3367,15 @@ func (b *builder) createCompactStoreConst(ptr, val llvm.Value, mask []bool, elem
 			outIdx++
 		}
 	}
-	// Fill the remaining (inactive) shuffle positions with undef — their values are
-	// never stored.
 	for i := outIdx; i < laneCount; i++ {
 		indices[i] = llvm.Undef(i32Type)
 	}
 	shuffleMask := llvm.ConstVector(indices, false)
 	compacted := b.CreateShuffleVector(val, llvm.Undef(val.Type()), shuffleMask, "compact.const.shuffle")
 
-	// Store the first activeCount elements with individual scalar stores.
-	for i := 0; i < activeCount; i++ {
-		elem := b.CreateExtractElement(compacted, llvm.ConstInt(i32Type, uint64(i), false), "compact.const.elem")
-		gep := b.CreateInBoundsGEP(elemType, ptr, []llvm.Value{
-			llvm.ConstInt(i32Type, uint64(i), false),
-		}, "compact.const.gep")
-		b.CreateStore(elem, gep)
-	}
-
+	// Single full-width vector store.
+	st := b.CreateStore(compacted, ptr)
+	st.SetAlignment(elemSize)
 	return llvm.ConstInt(b.intType, uint64(activeCount), false)
 }
 
