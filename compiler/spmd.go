@@ -8382,24 +8382,9 @@ func (b *builder) spmdTryEmitPmadd(addInstr *ssa.BinOp) (llvm.Value, bool) {
 	constEven := evenSide.constVal
 	constOdd := oddSide.constVal
 
-	if isPmaddubsw {
-		// vpmaddubsw stores weights as signed i8 (-128..127). Constants > 127
-		// would be truncated to negative values by llvm.ConstInt(i8, uint64(v)),
-		// producing wrong multiply results. Reject them.
-		if constEven > 127 || constOdd > 127 {
-			return llvm.Value{}, false
-		}
-		// vpmaddubsw multiplies each unsigned byte by a signed byte weight and
-		// adds adjacent pairs into a signed int16, with saturation. Go int16
-		// arithmetic wraps on overflow, so the pattern is only safe when the
-		// maximum possible adjacent sum cannot saturate: with uint8 source values
-		// (max 255), the worst case is 255*constEven + 255*constOdd. If that
-		// exceeds 32767 the hardware saturates but Go would wrap — diverging
-		// results — so bail out and let normal codegen handle it.
-		if 255*(constEven+constOdd) > 32767 {
-			return llvm.Value{}, false
-		}
-	}
+	// pmaddubsw weight/saturation constraints are handled inside
+	// spmdEmitPmaddubsw via greedy decomposition, so no bail-out here.
+
 	// pmaddwd (int16→int32) multiplies adjacent int16 pairs by int16 weights and
 	// adds them into int32 with two's-complement wrapping — identical to Go
 	// int32 wrapping semantics — so no saturation guard is needed.
@@ -8499,25 +8484,94 @@ func (b *builder) spmdTryEmitPmadd(addInstr *ssa.BinOp) (llvm.Value, bool) {
 }
 
 // spmdEmitPmaddubsw emits the byte→int16 pmaddubsw pattern:
-// load <srcLaneCount x i8> from srcPtr, build interleaved weight vector
-// [constEven, constOdd, ...], emit pmaddubsw → <laneCount x i16>.
+// load <srcLaneCount x i8> from srcPtr, then call spmdEmitPmaddubswFromVec.
 func (b *builder) spmdEmitPmaddubsw(srcPtr llvm.Value, srcLaneCount, laneCount int, constEven, constOdd int64) llvm.Value {
 	i8Type := b.ctx.Int8Type()
 
-	// Load srcLaneCount bytes contiguously from srcPtr.
+	// Load srcLaneCount bytes contiguously from srcPtr once; decomposition
+	// reuses the same rawLoad for all partial pmaddubsw calls.
 	srcVecType := llvm.VectorType(i8Type, srcLaneCount)
 	rawLoad := b.CreateLoad(srcVecType, srcPtr, "pmadd.src.vec")
 	rawLoad.SetAlignment(1)
 
-	// Build constant weight vector [constEven, constOdd, constEven, constOdd, ...].
-	constElems := make([]llvm.Value, srcLaneCount)
-	for j := 0; j < srcLaneCount; j += 2 {
-		constElems[j] = llvm.ConstInt(i8Type, uint64(constEven), false)
-		constElems[j+1] = llvm.ConstInt(i8Type, uint64(constOdd), false)
-	}
-	constVec := llvm.ConstVector(constElems, false)
+	return b.spmdEmitPmaddubswFromVec(rawLoad, srcLaneCount, constEven, constOdd)
+}
 
-	return b.spmdX86Pmaddubsw(rawLoad, constVec)
+// spmdEmitPmaddubswFromVec emits one or more pmaddubsw instructions on an
+// already-loaded byte vector, decomposing large constants (> 127) or
+// saturating weight sums into multiple partial calls that are then summed
+// with wrapping int16 addition.
+//
+// pmaddubsw has two constraints per call:
+//  1. Each weight must fit in a positive signed i8: w ≤ 127.
+//  2. The adjacent sum must not saturate: 255*(w_even+w_odd) ≤ 32767,
+//     i.e. w_even+w_odd ≤ 128.
+//
+// When either constraint is violated we split greedily: each iteration
+// allocates at most maxIndividual=127 to w_even and the remaining pair
+// budget (maxPair=128 − w_even) to w_odd, also capped at 127. Partial
+// results are accumulated with vpaddi16 (CreateAdd on <N x i16>), which
+// wraps exactly like Go int16 arithmetic.
+func (b *builder) spmdEmitPmaddubswFromVec(rawLoad llvm.Value, srcLaneCount int, constEven, constOdd int64) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+
+	// Single-op fast path: both weights fit in signed i8 and no saturation.
+	if constEven <= 127 && constOdd <= 127 && 255*(constEven+constOdd) <= 32767 {
+		constElems := make([]llvm.Value, srcLaneCount)
+		for j := 0; j < srcLaneCount; j += 2 {
+			constElems[j] = llvm.ConstInt(i8Type, uint64(constEven), false)
+			constElems[j+1] = llvm.ConstInt(i8Type, uint64(constOdd), false)
+		}
+		constVec := llvm.ConstVector(constElems, false)
+		return b.spmdX86Pmaddubsw(rawLoad, constVec)
+	}
+
+	// Decomposition: greedily consume (remaining_even, remaining_odd).
+	// Per-call limits: maxIndividual=127 (signed i8), maxPair=128 (no saturation).
+	const maxIndividual = int64(127)
+	const maxPair = int64(128)
+
+	remainEven := constEven
+	remainOdd := constOdd
+	var result llvm.Value
+
+	for remainEven > 0 || remainOdd > 0 {
+		chunkEven := remainEven
+		if chunkEven > maxIndividual {
+			chunkEven = maxIndividual
+		}
+		// Pair budget left after allocating chunkEven.
+		pairLeft := maxPair - chunkEven
+		chunkOdd := remainOdd
+		if chunkOdd > pairLeft {
+			chunkOdd = pairLeft
+		}
+		if chunkOdd > maxIndividual {
+			chunkOdd = maxIndividual
+		}
+		if chunkOdd < 0 {
+			chunkOdd = 0
+		}
+
+		constElems := make([]llvm.Value, srcLaneCount)
+		for j := 0; j < srcLaneCount; j += 2 {
+			constElems[j] = llvm.ConstInt(i8Type, uint64(chunkEven), false)
+			constElems[j+1] = llvm.ConstInt(i8Type, uint64(chunkOdd), false)
+		}
+		constVec := llvm.ConstVector(constElems, false)
+		partial := b.spmdX86Pmaddubsw(rawLoad, constVec)
+
+		if result.IsNil() {
+			result = partial
+		} else {
+			result = b.CreateAdd(result, partial, "pmadd.sum")
+		}
+
+		remainEven -= chunkEven
+		remainOdd -= chunkOdd
+	}
+
+	return result
 }
 
 // spmdEmitPmaddwd emits the int16→int32 pmaddwd pattern:
