@@ -7335,6 +7335,171 @@ func TestSPMDX86Pmaddwd(t *testing.T) {
 	}
 }
 
+// TestSPMDWasmPmaddubsw verifies that spmdWasmEmitPmaddubswFromVec emits the
+// correct deinterleave+zext+mul+add sequence on WASM SIMD128.
+// Input: <16 x i8>, weights constEven=64, constOdd=1.
+// Expected: shufflevector (even) + shufflevector (odd) + zext + mul + add → <8 x i16>.
+func TestSPMDWasmPmaddubsw(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	v16i8 := llvm.VectorType(c.ctx.Int8Type(), 16)
+	alloca := b.CreateAlloca(v16i8, "src.alloca")
+	rawLoad := b.CreateLoad(v16i8, alloca, "src")
+
+	result := b.spmdWasmEmitPmaddubswFromVec(rawLoad, 16, 64, 1)
+
+	if result.IsNil() {
+		t.Fatal("spmdWasmEmitPmaddubswFromVec result is nil")
+	}
+	v8i16 := llvm.VectorType(c.ctx.Int16Type(), 8)
+	if result.Type() != v8i16 {
+		t.Errorf("result type = %v, want <8 x i16>", result.Type())
+	}
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "shufflevector") {
+		t.Error("expected shufflevector in module IR for deinterleave")
+	}
+	if !strings.Contains(modIR, "zext") {
+		t.Error("expected zext in module IR for byte widening")
+	}
+	if !strings.Contains(modIR, "mul") {
+		t.Error("expected mul in module IR for constant multiply")
+	}
+	if !strings.Contains(modIR, "add") {
+		t.Error("expected add in module IR for lane summation")
+	}
+	// Must not contain x86 intrinsics.
+	if strings.Contains(modIR, "llvm.x86") {
+		t.Error("unexpected x86 intrinsic on WASM target")
+	}
+}
+
+// TestSPMDWasmPmaddwd verifies that spmdWasmEmitPmaddwdFromVec emits the
+// correct deinterleave+sext+mul+add sequence on WASM SIMD128.
+// Input: <8 x i16>, weights constEven=4096, constOdd=1.
+// Expected: shufflevector (even) + shufflevector (odd) + sext + mul + add → <4 x i32>.
+func TestSPMDWasmPmaddwd(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	v8i16 := llvm.VectorType(c.ctx.Int16Type(), 8)
+	alloca := b.CreateAlloca(v8i16, "src.alloca")
+	rawLoad := b.CreateLoad(v8i16, alloca, "src")
+
+	result := b.spmdWasmEmitPmaddwdFromVec(rawLoad, 8, 4096, 1)
+
+	if result.IsNil() {
+		t.Fatal("spmdWasmEmitPmaddwdFromVec result is nil")
+	}
+	v4i32 := llvm.VectorType(c.ctx.Int32Type(), 4)
+	if result.Type() != v4i32 {
+		t.Errorf("result type = %v, want <4 x i32>", result.Type())
+	}
+	modIR := b.mod.String()
+	if !strings.Contains(modIR, "shufflevector") {
+		t.Error("expected shufflevector in module IR for deinterleave")
+	}
+	if !strings.Contains(modIR, "sext") {
+		t.Error("expected sext in module IR for signed i16 widening")
+	}
+	if !strings.Contains(modIR, "mul") {
+		t.Error("expected mul in module IR for constant multiply")
+	}
+	if !strings.Contains(modIR, "add") {
+		t.Error("expected add in module IR for lane summation")
+	}
+	// Must not contain x86 intrinsics.
+	if strings.Contains(modIR, "llvm.x86") {
+		t.Error("unexpected x86 intrinsic on WASM target")
+	}
+}
+
+// TestSPMDPmaddDispatch verifies that spmdEmitPmaddubswFromVec dispatches to
+// the x86 intrinsic path on x86+SSSE3 and to the WASM deinterleave path on WASM.
+func TestSPMDPmaddDispatch(t *testing.T) {
+	t.Run("x86_ssse3", func(t *testing.T) {
+		c := newTestCompilerContextX86(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		v16i8 := llvm.VectorType(c.ctx.Int8Type(), 16)
+		alloca := b.CreateAlloca(v16i8, "src.alloca")
+		rawLoad := b.CreateLoad(v16i8, alloca, "src")
+
+		result := b.spmdEmitPmaddubswFromVec(rawLoad, 16, 64, 1)
+		if result.IsNil() {
+			t.Fatal("spmdEmitPmaddubswFromVec result is nil on x86")
+		}
+		modIR := b.mod.String()
+		if !strings.Contains(modIR, "llvm.x86.ssse3.pmadd.ub.sw.128") {
+			t.Error("expected pmaddubsw intrinsic on x86+ssse3")
+		}
+		if strings.Contains(modIR, "shufflevector") {
+			t.Error("unexpected shufflevector on x86 path (should use intrinsic)")
+		}
+	})
+
+	t.Run("wasm_simd128", func(t *testing.T) {
+		c := newTestCompilerContext(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		v16i8 := llvm.VectorType(c.ctx.Int8Type(), 16)
+		alloca := b.CreateAlloca(v16i8, "src.alloca")
+		rawLoad := b.CreateLoad(v16i8, alloca, "src")
+
+		result := b.spmdEmitPmaddubswFromVec(rawLoad, 16, 64, 1)
+		if result.IsNil() {
+			t.Fatal("spmdEmitPmaddubswFromVec result is nil on WASM")
+		}
+		modIR := b.mod.String()
+		if strings.Contains(modIR, "llvm.x86") {
+			t.Error("unexpected x86 intrinsic on WASM target")
+		}
+		if !strings.Contains(modIR, "shufflevector") {
+			t.Error("expected shufflevector for WASM deinterleave path")
+		}
+	})
+
+	t.Run("wasm_pmaddwd", func(t *testing.T) {
+		c := newTestCompilerContext(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		// <8 x i16> input, weights constEven=4096, constOdd=1.
+		// Expected: shufflevector (even) + shufflevector (odd) + sext + mul + add → <4 x i32>.
+		v8i16 := llvm.VectorType(c.ctx.Int16Type(), 8)
+		alloca := b.CreateAlloca(v8i16, "src.alloca")
+		rawLoad := b.CreateLoad(v8i16, alloca, "src")
+
+		result := b.spmdWasmEmitPmaddwdFromVec(rawLoad, 8, 4096, 1)
+		if result.IsNil() {
+			t.Fatal("spmdWasmEmitPmaddwdFromVec result is nil on WASM")
+		}
+		modIR := b.mod.String()
+		if strings.Contains(modIR, "llvm.x86") {
+			t.Error("unexpected x86 intrinsic on WASM target")
+		}
+		if !strings.Contains(modIR, "sext") {
+			t.Error("expected sext in module IR for signed i16 widening")
+		}
+		if !strings.Contains(modIR, "mul") {
+			t.Error("expected mul in module IR for constant multiply")
+		}
+		if !strings.Contains(modIR, "add") {
+			t.Error("expected add in module IR for lane summation")
+		}
+	})
+}
+
 // TestSPMDSwizzleDispatch verifies that spmdSwizzle dispatches to the correct
 // implementation based on the target: pshufb on x86-SSSE3, wasm.swizzle on WASM.
 func TestSPMDSwizzleDispatch(t *testing.T) {

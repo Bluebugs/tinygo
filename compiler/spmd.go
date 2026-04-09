@@ -8335,9 +8335,15 @@ func (b *builder) spmdMatchStride2Index(index ssa.Value) (int64, bool) {
 // One side may omit the MUL (implicit multiply by 1).
 //
 // On x86 with SSSE3: emits a double-width contiguous load + pmaddubsw/pmaddwd.
+// On WASM SIMD128: emits deinterleave shuffles + zext/sext + mul + add.
 // On other targets: returns (zero, false) so normal codegen handles it.
 func (b *builder) spmdTryEmitPmadd(addInstr *ssa.BinOp) (llvm.Value, bool) {
-	if !b.spmdHasSSSE3() {
+	if !b.spmdUsesSIMD() {
+		return llvm.Value{}, false
+	}
+	// On x86, SSSE3 is required for pmaddubsw (pshufb dependency).
+	// On non-x86 SIMD (WASM), the deinterleave path works without SSSE3.
+	if b.spmdIsX86() && !b.spmdHasSSSE3() {
 		return llvm.Value{}, false
 	}
 
@@ -8497,12 +8503,13 @@ func (b *builder) spmdEmitPmaddubsw(srcPtr llvm.Value, srcLaneCount, laneCount i
 	return b.spmdEmitPmaddubswFromVec(rawLoad, srcLaneCount, constEven, constOdd)
 }
 
-// spmdEmitPmaddubswFromVec emits one or more pmaddubsw instructions on an
+// spmdEmitPmaddubswFromVec emits one or more pmaddubsw-equivalent instructions on an
 // already-loaded byte vector, decomposing large constants (> 127) or
 // saturating weight sums into multiple partial calls that are then summed
 // with wrapping int16 addition.
 //
-// pmaddubsw has two constraints per call:
+// On x86 with SSSE3, uses the pmaddubsw intrinsic directly. The intrinsic has
+// two constraints per call:
 //  1. Each weight must fit in a positive signed i8: w ≤ 127.
 //  2. The adjacent sum must not saturate: 255*(w_even+w_odd) ≤ 32767,
 //     i.e. w_even+w_odd ≤ 128.
@@ -8512,10 +8519,20 @@ func (b *builder) spmdEmitPmaddubsw(srcPtr llvm.Value, srcLaneCount, laneCount i
 // budget (maxPair=128 − w_even) to w_odd, also capped at 127. Partial
 // results are accumulated with vpaddi16 (CreateAdd on <N x i16>), which
 // wraps exactly like Go int16 arithmetic.
+//
+// On WASM SIMD128, uses deinterleave shuffles + zext + mul + add, which LLVM
+// lowers to i16x8.extmul_low/high where profitable. No saturation constraints
+// apply because the WASM path uses standard wrapping integer arithmetic.
 func (b *builder) spmdEmitPmaddubswFromVec(rawLoad llvm.Value, srcLaneCount int, constEven, constOdd int64) llvm.Value {
 	i8Type := b.ctx.Int8Type()
 
-	// Single-op fast path: both weights fit in signed i8 and no saturation.
+	// WASM path: deinterleave even/odd bytes, zext to i16, multiply by constants, add.
+	// No saturation constraints — uses wrapping arithmetic throughout.
+	if b.spmdIsWASM() {
+		return b.spmdWasmEmitPmaddubswFromVec(rawLoad, srcLaneCount, constEven, constOdd)
+	}
+
+	// x86 path: single-op fast path when both weights fit in signed i8 and no saturation.
 	if constEven <= 127 && constOdd <= 127 && 255*(constEven+constOdd) <= 32767 {
 		constElems := make([]llvm.Value, srcLaneCount)
 		for j := 0; j < srcLaneCount; j += 2 {
@@ -8526,7 +8543,7 @@ func (b *builder) spmdEmitPmaddubswFromVec(rawLoad llvm.Value, srcLaneCount int,
 		return b.spmdX86Pmaddubsw(rawLoad, constVec)
 	}
 
-	// Decomposition: greedily consume (remaining_even, remaining_odd).
+	// x86 decomposition: greedily consume (remaining_even, remaining_odd).
 	// Per-call limits: maxIndividual=127 (signed i8), maxPair=128 (no saturation).
 	const maxIndividual = int64(127)
 	const maxPair = int64(128)
@@ -8574,9 +8591,66 @@ func (b *builder) spmdEmitPmaddubswFromVec(rawLoad llvm.Value, srcLaneCount int,
 	return result
 }
 
+// spmdWasmEmitPmaddubswFromVec emits the byte→int16 multiply-add pattern for
+// WASM SIMD128 using shufflevector deinterleave + zext + mul + add.
+//
+// For a srcLaneCount=16 byte vector and constEven/constOdd weights:
+//   - Even bytes (positions 0,2,4,...) are extracted via shufflevector → <8 x i8>
+//   - Odd bytes  (positions 1,3,5,...) are extracted via shufflevector → <8 x i8>
+//   - Each half is zero-extended to <8 x i16>
+//   - Multiplied by the respective constant splat
+//   - The two products are added together → <8 x i16>
+//
+// LLVM may lower zext+mul to i16x8.extmul_low/high where profitable.
+// No saturation constraints apply; arithmetic wraps exactly like Go int16.
+//
+// constEven and constOdd must fit in i16 (0..65535). In practice this is always
+// true because the ubsw pattern only matches Go byte*int16_const expressions where
+// the constant is already within i16 range by construction. The guard below makes
+// the assumption explicit and returns a zero Value if it is ever violated.
+func (b *builder) spmdWasmEmitPmaddubswFromVec(rawLoad llvm.Value, srcLaneCount int, constEven, constOdd int64) llvm.Value {
+	if constEven > 65535 || constOdd > 65535 {
+		// Constants must fit in i16 for the WASM deinterleave+multiply path.
+		// This should never fire given how the ubsw pattern matcher bounds inputs.
+		return llvm.Value{}
+	}
+	i16Type := b.ctx.Int16Type()
+	dstLaneCount := srcLaneCount / 2
+
+	// Build shuffle masks: even picks bytes at indices 0,2,4,...; odd picks 1,3,5,...
+	evenMaskElems := make([]llvm.Value, dstLaneCount)
+	oddMaskElems := make([]llvm.Value, dstLaneCount)
+	i32Type := b.ctx.Int32Type()
+	for j := 0; j < dstLaneCount; j++ {
+		evenMaskElems[j] = llvm.ConstInt(i32Type, uint64(j*2), false)
+		oddMaskElems[j] = llvm.ConstInt(i32Type, uint64(j*2+1), false)
+	}
+
+	// Deinterleave: <srcLaneCount x i8> → two <dstLaneCount x i8> halves.
+	undef := llvm.Undef(rawLoad.Type())
+	evens := b.CreateShuffleVector(rawLoad, undef, llvm.ConstVector(evenMaskElems, false), "pmadd.evens")
+	odds := b.CreateShuffleVector(rawLoad, undef, llvm.ConstVector(oddMaskElems, false), "pmadd.odds")
+
+	// Zero-extend each half to i16 (bytes are unsigned).
+	dstVecType := llvm.VectorType(i16Type, dstLaneCount)
+	evensWide := b.CreateZExt(evens, dstVecType, "pmadd.evens.i16")
+	oddsWide := b.CreateZExt(odds, dstVecType, "pmadd.odds.i16")
+
+	// Multiply each half by its constant weight splat.
+	evenConst := b.splatScalar(llvm.ConstInt(i16Type, uint64(constEven), false), dstVecType)
+	oddConst := b.splatScalar(llvm.ConstInt(i16Type, uint64(constOdd), false), dstVecType)
+	evenProds := b.CreateMul(evensWide, evenConst, "pmadd.even.prod")
+	oddProds := b.CreateMul(oddsWide, oddConst, "pmadd.odd.prod")
+
+	return b.CreateAdd(evenProds, oddProds, "pmadd.result")
+}
+
 // spmdEmitPmaddwd emits the int16→int32 pmaddwd pattern:
 // load <srcLaneCount x i16> from srcPtr, build interleaved weight vector
 // [constEven, constOdd, ...], emit pmaddwd → <laneCount x i32>.
+//
+// On x86, uses the pmaddwd intrinsic. On WASM, uses deinterleave shuffles +
+// sext + mul + add with wrapping int32 arithmetic.
 func (b *builder) spmdEmitPmaddwd(srcPtr llvm.Value, srcLaneCount, laneCount int, constEven, constOdd int64) llvm.Value {
 	i16Type := b.ctx.Int16Type()
 
@@ -8585,6 +8659,12 @@ func (b *builder) spmdEmitPmaddwd(srcPtr llvm.Value, srcLaneCount, laneCount int
 	rawLoad := b.CreateLoad(srcVecType, srcPtr, "pmadd.src.vec")
 	rawLoad.SetAlignment(1)
 
+	// WASM path: deinterleave even/odd i16 values, sext to i32, multiply, add.
+	if b.spmdIsWASM() {
+		return b.spmdWasmEmitPmaddwdFromVec(rawLoad, srcLaneCount, constEven, constOdd)
+	}
+
+	// x86 path: build interleaved weight vector and call pmaddwd intrinsic.
 	// Build constant weight vector [constEven, constOdd, constEven, constOdd, ...].
 	constElems := make([]llvm.Value, srcLaneCount)
 	for j := 0; j < srcLaneCount; j += 2 {
@@ -8594,4 +8674,46 @@ func (b *builder) spmdEmitPmaddwd(srcPtr llvm.Value, srcLaneCount, laneCount int
 	constVec := llvm.ConstVector(constElems, false)
 
 	return b.spmdX86Pmaddwd(rawLoad, constVec)
+}
+
+// spmdWasmEmitPmaddwdFromVec emits the int16→int32 multiply-add pattern for
+// WASM SIMD128 using shufflevector deinterleave + sext + mul + add.
+//
+// For a srcLaneCount=8 i16 vector and constEven/constOdd weights:
+//   - Even i16s (positions 0,2,4,...) are extracted via shufflevector → <4 x i16>
+//   - Odd i16s  (positions 1,3,5,...) are extracted via shufflevector → <4 x i16>
+//   - Each half is sign-extended to <4 x i32> (int16 values are signed)
+//   - Multiplied by the respective constant splat
+//   - The two products are added together → <4 x i32>
+//
+// Arithmetic wraps exactly like Go int32 (same semantics as pmaddwd).
+func (b *builder) spmdWasmEmitPmaddwdFromVec(rawLoad llvm.Value, srcLaneCount int, constEven, constOdd int64) llvm.Value {
+	i32Type := b.ctx.Int32Type()
+	dstLaneCount := srcLaneCount / 2
+
+	// Build shuffle masks to extract even (0,2,4,...) and odd (1,3,5,...) i16 lanes.
+	evenMaskElems := make([]llvm.Value, dstLaneCount)
+	oddMaskElems := make([]llvm.Value, dstLaneCount)
+	for j := 0; j < dstLaneCount; j++ {
+		evenMaskElems[j] = llvm.ConstInt(i32Type, uint64(j*2), false)
+		oddMaskElems[j] = llvm.ConstInt(i32Type, uint64(j*2+1), false)
+	}
+
+	// Deinterleave: <srcLaneCount x i16> → two <dstLaneCount x i16> halves.
+	undef := llvm.Undef(rawLoad.Type())
+	evens := b.CreateShuffleVector(rawLoad, undef, llvm.ConstVector(evenMaskElems, false), "pmaddwd.evens")
+	odds := b.CreateShuffleVector(rawLoad, undef, llvm.ConstVector(oddMaskElems, false), "pmaddwd.odds")
+
+	// Sign-extend each half to i32 (int16 values are signed).
+	dstVecType := llvm.VectorType(i32Type, dstLaneCount)
+	evensWide := b.CreateSExt(evens, dstVecType, "pmaddwd.evens.i32")
+	oddsWide := b.CreateSExt(odds, dstVecType, "pmaddwd.odds.i32")
+
+	// Multiply each half by its constant weight splat.
+	evenConst := b.splatScalar(llvm.ConstInt(i32Type, uint64(constEven), false), dstVecType)
+	oddConst := b.splatScalar(llvm.ConstInt(i32Type, uint64(constOdd), false), dstVecType)
+	evenProds := b.CreateMul(evensWide, evenConst, "pmaddwd.even.prod")
+	oddProds := b.CreateMul(oddsWide, oddConst, "pmaddwd.odd.prod")
+
+	return b.CreateAdd(evenProds, oddProds, "pmaddwd.result")
 }
