@@ -54,32 +54,63 @@ func (b *builder) spmdX86Pmovmskb(vec llvm.Value) llvm.Value {
 	return b.createCall(fnType, fn, []llvm.Value{vec}, "x86.pmovmskb")
 }
 
-// spmdX86Pmaddubsw emits llvm.x86.ssse3.pmadd.ub.sw.128.
-// Multiplies u8×i8 pairs with saturation, horizontally adds adjacent products → i16.
-// Input: a <16 x i8> (unsigned), b <16 x i8> (signed). Output: <8 x i16>.
+// spmdX86Pmaddubsw emits pmaddubsw: multiply unsigned×signed bytes, horizontal
+// add adjacent pairs → i16. Dispatches to SSSE3 (128-bit) or AVX2 (256-bit).
+// Input: <N x i8> × <N x i8> where N=16 (SSE) or N=32 (AVX2)
+// Output: <N/2 x i16>
 func (b *builder) spmdX86Pmaddubsw(a, bVec llvm.Value) llvm.Value {
-	v8i16 := llvm.VectorType(b.ctx.Int16Type(), 8)
-	v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
-	fnType := llvm.FunctionType(v8i16, []llvm.Type{v16i8, v16i8}, false)
-	fn := b.mod.NamedFunction("llvm.x86.ssse3.pmadd.ub.sw.128")
-	if fn.IsNil() {
-		fn = llvm.AddFunction(b.mod, "llvm.x86.ssse3.pmadd.ub.sw.128", fnType)
+	laneCount := a.Type().VectorSize()
+	switch laneCount {
+	case 32:
+		// AVX2 256-bit: vpmaddubsw ymm — 32 bytes → 16 int16s.
+		v16i16 := llvm.VectorType(b.ctx.Int16Type(), 16)
+		v32i8 := llvm.VectorType(b.ctx.Int8Type(), 32)
+		fnType := llvm.FunctionType(v16i16, []llvm.Type{v32i8, v32i8}, false)
+		fn := b.mod.NamedFunction("llvm.x86.avx2.pmadd.ub.sw")
+		if fn.IsNil() {
+			fn = llvm.AddFunction(b.mod, "llvm.x86.avx2.pmadd.ub.sw", fnType)
+		}
+		return b.createCall(fnType, fn, []llvm.Value{a, bVec}, "x86.vpmaddubsw")
+	default:
+		// SSE/SSSE3 128-bit: pmaddubsw xmm — 16 bytes → 8 int16s.
+		v8i16 := llvm.VectorType(b.ctx.Int16Type(), 8)
+		v16i8 := llvm.VectorType(b.ctx.Int8Type(), 16)
+		fnType := llvm.FunctionType(v8i16, []llvm.Type{v16i8, v16i8}, false)
+		fn := b.mod.NamedFunction("llvm.x86.ssse3.pmadd.ub.sw.128")
+		if fn.IsNil() {
+			fn = llvm.AddFunction(b.mod, "llvm.x86.ssse3.pmadd.ub.sw.128", fnType)
+		}
+		return b.createCall(fnType, fn, []llvm.Value{a, bVec}, "x86.pmaddubsw")
 	}
-	return b.createCall(fnType, fn, []llvm.Value{a, bVec}, "x86.pmaddubsw")
 }
 
-// spmdX86Pmaddwd emits llvm.x86.sse2.pmadd.wd.
-// Multiplies i16 pairs, horizontally adds adjacent products → i32.
-// Input: a <8 x i16>, b <8 x i16>. Output: <4 x i32>.
-// Note: the LLVM intrinsic name is "llvm.x86.sse2.pmadd.wd" (no .128 suffix),
-// unlike the 128-bit variants of other SSE2/SSSE3 intrinsics.
+// spmdX86Pmaddwd emits pmaddwd: multiply i16 pairs, horizontal add → i32.
+// Dispatches to SSE2 (128-bit) or AVX2 (256-bit).
+// Input: <N x i16> × <N x i16> where N=8 (SSE) or N=16 (AVX2)
+// Output: <N/2 x i32>
 func (b *builder) spmdX86Pmaddwd(a, bVec llvm.Value) llvm.Value {
-	v4i32 := llvm.VectorType(b.ctx.Int32Type(), 4)
-	v8i16 := llvm.VectorType(b.ctx.Int16Type(), 8)
-	fnType := llvm.FunctionType(v4i32, []llvm.Type{v8i16, v8i16}, false)
-	fn := b.mod.NamedFunction("llvm.x86.sse2.pmadd.wd")
-	if fn.IsNil() {
-		fn = llvm.AddFunction(b.mod, "llvm.x86.sse2.pmadd.wd", fnType)
+	laneCount := a.Type().VectorSize()
+	switch laneCount {
+	case 16:
+		// AVX2 256-bit: vpmaddwd ymm — 16 int16s → 8 int32s.
+		v8i32 := llvm.VectorType(b.ctx.Int32Type(), 8)
+		v16i16 := llvm.VectorType(b.ctx.Int16Type(), 16)
+		fnType := llvm.FunctionType(v8i32, []llvm.Type{v16i16, v16i16}, false)
+		fn := b.mod.NamedFunction("llvm.x86.avx2.pmadd.wd")
+		if fn.IsNil() {
+			fn = llvm.AddFunction(b.mod, "llvm.x86.avx2.pmadd.wd", fnType)
+		}
+		return b.createCall(fnType, fn, []llvm.Value{a, bVec}, "x86.vpmaddwd")
+	default:
+		// SSE2 128-bit: pmaddwd xmm — 8 int16s → 4 int32s.
+		// Note: intrinsic name has no .128 suffix, unlike other SSE2 intrinsics.
+		v4i32 := llvm.VectorType(b.ctx.Int32Type(), 4)
+		v8i16 := llvm.VectorType(b.ctx.Int16Type(), 8)
+		fnType := llvm.FunctionType(v4i32, []llvm.Type{v8i16, v8i16}, false)
+		fn := b.mod.NamedFunction("llvm.x86.sse2.pmadd.wd")
+		if fn.IsNil() {
+			fn = llvm.AddFunction(b.mod, "llvm.x86.sse2.pmadd.wd", fnType)
+		}
+		return b.createCall(fnType, fn, []llvm.Value{a, bVec}, "x86.pmaddwd")
 	}
-	return b.createCall(fnType, fn, []llvm.Value{a, bVec}, "x86.pmaddwd")
 }

@@ -2727,6 +2727,27 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			}
 		}
 
+		// SPMD: intercept pmaddubsw/pmaddwd patterns in SPMD main body blocks.
+		// Detects: int16(src[i*2])*C1 + int16(src[i*2+1])*C2 and emits pmaddubsw (byte→int16).
+		// Detects: int32(src[i*2])*C1 + int32(src[i*2+1])*C2 and emits pmaddwd (int16→int32).
+		// Only applies in the main body (not tail): the double-width contiguous load reads
+		// srcLaneCount = 2*N elements from src, which requires src to have at least 2*N
+		// elements starting at the current position. In the tail body, fewer elements may be
+		// available, making this load unsafe.
+		if expr.Op == token.ADD && b.spmdLoopState != nil {
+			if loop, ok := b.spmdLoopState.bodyBlocks[b.currentBlock.Index]; ok {
+				// Skip the tail body: the double-width load may read past the end of src.
+				isMainBody := true
+				if loop.isPeeled && loop.ssaLoopInfo != nil && loop.ssaLoopInfo.TailBodyBlock != nil {
+					isMainBody = b.currentBlock.Index != loop.ssaLoopInfo.TailBodyBlock.Index
+				}
+				if isMainBody {
+					if result, ok2 := b.spmdTryEmitPmadd(expr); ok2 {
+						return result, nil
+					}
+				}
+			}
+		}
 		x := b.getValue(expr.X, getPos(expr))
 		y := b.getValue(expr.Y, getPos(expr))
 		// SPMD: replace +1 with +laneCount for SPMD loop increment.

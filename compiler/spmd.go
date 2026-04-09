@@ -8151,3 +8151,393 @@ func (b *builder) createSPMDVectorFromMemory(instr *ssa.SPMDVectorFromMemory) ll
 	// guard zone or platform memory layout for safety.
 	return b.createSPMDVectorFromMemoryMasked(dataPtr, length, lanes)
 }
+
+// spmdPmaddSide holds the decomposed components of one operand in a
+// stride-2 widen-multiply-add expression: MUL(Convert(load(src[i*2+r])), C)
+// or just Convert(load(src[i*2+r])) where C defaults to 1.
+type spmdPmaddSide struct {
+	load      *ssa.SPMDLoad // the underlying SPMDLoad
+	indexAddr *ssa.IndexAddr
+	constVal  int64 // the multiply constant (1 if bare Convert)
+	remainder int64 // 0 for i*2, 1 for i*2+1
+}
+
+// spmdExtractPmaddSide attempts to parse an SSA value as one side of a
+// stride-2 widen-multiply-add:
+//   - MUL(Convert(SPMDLoad(IndexAddr)), constVal)  → remainder from index
+//   - Convert(SPMDLoad(IndexAddr))                 → constVal=1, remainder from index
+//
+// It validates that the IndexAddr index follows an iter*2+r stride pattern.
+// Returns nil if the pattern does not match.
+func (b *builder) spmdExtractPmaddSide(v ssa.Value) *spmdPmaddSide {
+	var cvt *ssa.Convert
+	var constVal int64 = 1
+
+	switch side := v.(type) {
+	case *ssa.BinOp:
+		// MUL(Convert, Const) or MUL(Const, Convert)
+		if side.Op != token.MUL {
+			return nil
+		}
+		if c, ok := side.Y.(*ssa.Const); ok {
+			if cv, ok2 := side.X.(*ssa.Convert); ok2 {
+				cvt = cv
+				if iv, ok3 := ssaConstInt64(c); ok3 && iv > 0 {
+					constVal = iv
+				} else {
+					return nil
+				}
+			}
+		} else if c, ok := side.X.(*ssa.Const); ok {
+			if cv, ok2 := side.Y.(*ssa.Convert); ok2 {
+				cvt = cv
+				if iv, ok3 := ssaConstInt64(c); ok3 && iv > 0 {
+					constVal = iv
+				} else {
+					return nil
+				}
+			}
+		}
+		if cvt == nil {
+			return nil
+		}
+	case *ssa.Convert:
+		cvt = side
+		constVal = 1
+	default:
+		return nil
+	}
+
+	// The Convert must load from an SPMDLoad.
+	load, ok := cvt.X.(*ssa.SPMDLoad)
+	if !ok {
+		return nil
+	}
+
+	// The load address must be an IndexAddr.
+	ia, ok := load.Addr.(*ssa.IndexAddr)
+	if !ok {
+		return nil
+	}
+
+	// The index must follow a stride-2 pattern (iter*2 or iter*2+1).
+	// Try spmdAnalyzeStrideIndex first (works for main body via activeLoops).
+	// Fall back to spmdMatchStride2Index for tail body (TailIterPhi not in activeLoops).
+	pat := b.spmdAnalyzeStrideIndex(ia.Index)
+	if pat != nil && pat.stride == 2 {
+		return &spmdPmaddSide{
+			load:      load,
+			indexAddr: ia,
+			constVal:  constVal,
+			remainder: pat.remainder,
+		}
+	}
+
+	// Fallback: directly match iter*2 or iter*2+1 patterns where iter may be
+	// in spmdValueOverride (tail body) rather than activeLoops.
+	if rem, ok2 := b.spmdMatchStride2Index(ia.Index); ok2 {
+		return &spmdPmaddSide{
+			load:      load,
+			indexAddr: ia,
+			constVal:  constVal,
+			remainder: rem,
+		}
+	}
+
+	return nil
+}
+
+// spmdMatchStride2Index matches an index expression of the form iter*2 or iter*2+1,
+// where iter (after ChangeType unwrapping) is registered in spmdValueOverride.
+// Returns (remainder, true) where remainder is 0 for iter*2 and 1 for iter*2+1.
+// This handles tail body blocks where TailIterPhi is in spmdValueOverride but
+// not in activeLoops.
+func (b *builder) spmdMatchStride2Index(index ssa.Value) (int64, bool) {
+	if b.spmdValueOverride == nil {
+		return 0, false
+	}
+
+	// Unwrap ChangeType wrappers.
+	unwrapCT := func(v ssa.Value) ssa.Value {
+		for {
+			if ct, ok := v.(*ssa.ChangeType); ok {
+				v = ct.X
+			} else {
+				break
+			}
+		}
+		return v
+	}
+
+	// isIter returns true if v (after ChangeType peel) is in spmdValueOverride.
+	isIter := func(v ssa.Value) bool {
+		core := unwrapCT(v)
+		_, ok := b.spmdValueOverride[core]
+		return ok
+	}
+
+	idx := unwrapCT(index)
+
+	// Pattern: iter*2 (remainder 0)
+	if mul, ok := idx.(*ssa.BinOp); ok && mul.Op == token.MUL {
+		cX, isX := ssaConstInt64(mul.X)
+		cY, isY := ssaConstInt64(mul.Y)
+		if isX && cX == 2 && isIter(mul.Y) {
+			return 0, true
+		}
+		if isY && cY == 2 && isIter(mul.X) {
+			return 0, true
+		}
+	}
+
+	// Pattern: iter*2+1 (remainder 1)
+	if add, ok := idx.(*ssa.BinOp); ok && add.Op == token.ADD {
+		// add.X = iter*2, add.Y = 1
+		if c, ok2 := ssaConstInt64(add.Y); ok2 && c == 1 {
+			if mul, ok3 := unwrapCT(add.X).(*ssa.BinOp); ok3 && mul.Op == token.MUL {
+				cX, isX := ssaConstInt64(mul.X)
+				cY, isY := ssaConstInt64(mul.Y)
+				if isX && cX == 2 && isIter(mul.Y) {
+					return 1, true
+				}
+				if isY && cY == 2 && isIter(mul.X) {
+					return 1, true
+				}
+			}
+		}
+		// add.Y = iter*2, add.X = 1
+		if c, ok2 := ssaConstInt64(add.X); ok2 && c == 1 {
+			if mul, ok3 := unwrapCT(add.Y).(*ssa.BinOp); ok3 && mul.Op == token.MUL {
+				cX, isX := ssaConstInt64(mul.X)
+				cY, isY := ssaConstInt64(mul.Y)
+				if isX && cX == 2 && isIter(mul.Y) {
+					return 1, true
+				}
+				if isY && cY == 2 && isIter(mul.X) {
+					return 1, true
+				}
+			}
+		}
+	}
+
+	return 0, false
+}
+
+// spmdTryEmitPmadd attempts to detect and emit a vpmaddubsw (byte→int16) or
+// vpmaddwd (int16→int32) instruction for a BinOp ADD in an SPMD body block.
+//
+// Recognized pattern:
+//
+//	Convert(src[i*2], wide)*C_even + Convert(src[i*2+1], wide)*C_odd
+//
+// where src is a []byte (for pmaddubsw) or []int16 (for pmaddwd),
+// Convert widens to int16 or int32 respectively, and C_even/C_odd are integer constants.
+// One side may omit the MUL (implicit multiply by 1).
+//
+// On x86 with SSSE3: emits a double-width contiguous load + pmaddubsw/pmaddwd.
+// On other targets: returns (zero, false) so normal codegen handles it.
+func (b *builder) spmdTryEmitPmadd(addInstr *ssa.BinOp) (llvm.Value, bool) {
+	if !b.spmdHasSSSE3() {
+		return llvm.Value{}, false
+	}
+
+	// Parse both sides of the ADD.
+	sideX := b.spmdExtractPmaddSide(addInstr.X)
+	sideY := b.spmdExtractPmaddSide(addInstr.Y)
+	if sideX == nil || sideY == nil {
+		return llvm.Value{}, false
+	}
+
+	// One side must be remainder 0 (even index) and the other remainder 1 (odd index).
+	var evenSide, oddSide *spmdPmaddSide
+	switch {
+	case sideX.remainder == 0 && sideY.remainder == 1:
+		evenSide, oddSide = sideX, sideY
+	case sideX.remainder == 1 && sideY.remainder == 0:
+		evenSide, oddSide = sideY, sideX
+	default:
+		return llvm.Value{}, false
+	}
+
+	// Both IndexAddr must reference the same source slice.
+	if evenSide.indexAddr.X != oddSide.indexAddr.X {
+		return llvm.Value{}, false
+	}
+
+	// Determine the pattern kind from the source element type.
+	srcElemType := evenSide.load.Addr.Type().Underlying().(*types.Pointer).Elem()
+	srcBasic, ok := srcElemType.Underlying().(*types.Basic)
+	if !ok {
+		return llvm.Value{}, false
+	}
+	kind := srcBasic.Kind()
+
+	// Classify: byte→int16 (pmaddubsw) or int16→int32 (pmaddwd).
+	isPmaddubsw := (kind == types.Uint8 || kind == types.Byte)
+	isPmaddwd := (kind == types.Int16)
+	if !isPmaddubsw && !isPmaddwd {
+		return llvm.Value{}, false
+	}
+
+	constEven := evenSide.constVal
+	constOdd := oddSide.constVal
+
+	if isPmaddubsw {
+		// vpmaddubsw stores weights as signed i8 (-128..127). Constants > 127
+		// would be truncated to negative values by llvm.ConstInt(i8, uint64(v)),
+		// producing wrong multiply results. Reject them.
+		if constEven > 127 || constOdd > 127 {
+			return llvm.Value{}, false
+		}
+		// vpmaddubsw multiplies each unsigned byte by a signed byte weight and
+		// adds adjacent pairs into a signed int16, with saturation. Go int16
+		// arithmetic wraps on overflow, so the pattern is only safe when the
+		// maximum possible adjacent sum cannot saturate: with uint8 source values
+		// (max 255), the worst case is 255*constEven + 255*constOdd. If that
+		// exceeds 32767 the hardware saturates but Go would wrap — diverging
+		// results — so bail out and let normal codegen handle it.
+		if 255*(constEven+constOdd) > 32767 {
+			return llvm.Value{}, false
+		}
+	}
+	// pmaddwd (int16→int32) multiplies adjacent int16 pairs by int16 weights and
+	// adds them into int32 with two's-complement wrapping — identical to Go
+	// int32 wrapping semantics — so no saturation guard is needed.
+
+	// Determine the SPMD lane count from the loop that owns the even-side load.
+	// The loop is identified via the stride pattern in evenSide. We use the
+	// even-side load's SPMDLoad.Lanes field as a fallback.
+	laneCount := evenSide.load.Lanes
+	if laneCount <= 0 {
+		return llvm.Value{}, false
+	}
+	srcLaneCount := laneCount * 2 // 2N bytes/int16 in the source vector
+
+	// Get the source slice and compute the scalar base pointer.
+	// We use the even-index IndexAddr to get the source.
+	srcIndexAddr := evenSide.indexAddr
+	srcSliceVal := b.getValue(srcIndexAddr.X, getPos(srcIndexAddr))
+	if srcSliceVal.IsNil() {
+		return llvm.Value{}, false
+	}
+
+	var bufptr llvm.Value
+	var buflen llvm.Value
+	var srcElemLLVM llvm.Type
+
+	switch ptrTyp := srcIndexAddr.X.Type().Underlying().(type) {
+	case *types.Slice:
+		bufptr = b.CreateExtractValue(srcSliceVal, 0, "pmadd.src.ptr")
+		buflen = b.CreateExtractValue(srcSliceVal, 1, "pmadd.src.len")
+		srcElemLLVM = b.getLLVMType(ptrTyp.Elem())
+	case *types.Pointer:
+		arrType, ok2 := ptrTyp.Elem().Underlying().(*types.Array)
+		if !ok2 {
+			return llvm.Value{}, false
+		}
+		bufptr = srcSliceVal
+		buflen = llvm.ConstInt(b.uintptrType, uint64(arrType.Len()), false)
+		srcElemLLVM = b.getLLVMType(arrType.Elem())
+	default:
+		return llvm.Value{}, false
+	}
+
+	// Get the scalar base index (iter*2) from the even-index IndexAddr.
+	// Same strategy as interleaved stores: try spmdDecomposed first, then
+	// extract lane 0 from the varying index vector.
+	scalarBase := llvm.Value{}
+	if b.spmdDecomposed != nil {
+		if decomp, ok2 := b.spmdDecomposed[srcIndexAddr.Index]; ok2 {
+			scalarBase = decomp.scalarBase
+		}
+	}
+	if scalarBase.IsNil() {
+		idxVec := b.getValue(srcIndexAddr.Index, getPos(srcIndexAddr))
+		if idxVec.Type().TypeKind() == llvm.VectorTypeKind {
+			scalarBase = b.CreateExtractElement(idxVec,
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false), "pmadd.base.elem0")
+		} else {
+			scalarBase = idxVec
+		}
+	}
+	scalarBase = b.extendInteger(scalarBase, srcIndexAddr.Index.Type(), b.uintptrType)
+
+	// Bounds check: scalarBase + srcLaneCount <= buflen.
+	if !b.info.nobounds && !buflen.IsNil() {
+		endIdx := b.CreateAdd(scalarBase,
+			llvm.ConstInt(b.uintptrType, uint64(srcLaneCount), false),
+			"pmadd.end")
+		oob := b.CreateICmp(llvm.IntUGT, endIdx, buflen, "pmadd.oob")
+		b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+	}
+
+	// Compute pointer to src[scalarBase].
+	srcPtr := b.CreateInBoundsGEP(srcElemLLVM, bufptr, []llvm.Value{scalarBase}, "pmadd.srcptr")
+
+	// Dispatch based on element type.
+	var result llvm.Value
+	if isPmaddubsw {
+		result = b.spmdEmitPmaddubsw(srcPtr, srcLaneCount, laneCount, constEven, constOdd)
+	} else {
+		result = b.spmdEmitPmaddwd(srcPtr, srcLaneCount, laneCount, constEven, constOdd)
+	}
+	if result.IsNil() {
+		return llvm.Value{}, false
+	}
+
+	// Apply execution mask to zero out inactive lanes.
+	// Get the mask from the even-side SPMDLoad (both loads have the same mask).
+	maskVal := b.getValue(evenSide.load.Mask, getPos(evenSide.load))
+	if !b.spmdIsConstAllOnesMask(maskVal) {
+		// Normalize mask to <N x i1> for select.
+		maskI1 := b.CreateTrunc(maskVal, llvm.VectorType(b.ctx.Int1Type(), laneCount), "pmadd.mask.i1")
+		zero := llvm.ConstNull(result.Type())
+		result = b.CreateSelect(maskI1, result, zero, "pmadd.masked")
+	}
+
+	return result, true
+}
+
+// spmdEmitPmaddubsw emits the byte→int16 pmaddubsw pattern:
+// load <srcLaneCount x i8> from srcPtr, build interleaved weight vector
+// [constEven, constOdd, ...], emit pmaddubsw → <laneCount x i16>.
+func (b *builder) spmdEmitPmaddubsw(srcPtr llvm.Value, srcLaneCount, laneCount int, constEven, constOdd int64) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+
+	// Load srcLaneCount bytes contiguously from srcPtr.
+	srcVecType := llvm.VectorType(i8Type, srcLaneCount)
+	rawLoad := b.CreateLoad(srcVecType, srcPtr, "pmadd.src.vec")
+	rawLoad.SetAlignment(1)
+
+	// Build constant weight vector [constEven, constOdd, constEven, constOdd, ...].
+	constElems := make([]llvm.Value, srcLaneCount)
+	for j := 0; j < srcLaneCount; j += 2 {
+		constElems[j] = llvm.ConstInt(i8Type, uint64(constEven), false)
+		constElems[j+1] = llvm.ConstInt(i8Type, uint64(constOdd), false)
+	}
+	constVec := llvm.ConstVector(constElems, false)
+
+	return b.spmdX86Pmaddubsw(rawLoad, constVec)
+}
+
+// spmdEmitPmaddwd emits the int16→int32 pmaddwd pattern:
+// load <srcLaneCount x i16> from srcPtr, build interleaved weight vector
+// [constEven, constOdd, ...], emit pmaddwd → <laneCount x i32>.
+func (b *builder) spmdEmitPmaddwd(srcPtr llvm.Value, srcLaneCount, laneCount int, constEven, constOdd int64) llvm.Value {
+	i16Type := b.ctx.Int16Type()
+
+	// Load srcLaneCount int16s contiguously from srcPtr.
+	srcVecType := llvm.VectorType(i16Type, srcLaneCount)
+	rawLoad := b.CreateLoad(srcVecType, srcPtr, "pmadd.src.vec")
+	rawLoad.SetAlignment(1)
+
+	// Build constant weight vector [constEven, constOdd, constEven, constOdd, ...].
+	constElems := make([]llvm.Value, srcLaneCount)
+	for j := 0; j < srcLaneCount; j += 2 {
+		constElems[j] = llvm.ConstInt(i16Type, uint64(constEven), false)
+		constElems[j+1] = llvm.ConstInt(i16Type, uint64(constOdd), false)
+	}
+	constVec := llvm.ConstVector(constElems, false)
+
+	return b.spmdX86Pmaddwd(rawLoad, constVec)
+}
