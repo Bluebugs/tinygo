@@ -1356,15 +1356,15 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		// (which retains the original array type [N]T) for the array-length cap.
 		// This enables TailMask registration so SSA-level masked loads use the
 		// correct tail mask instead of all-ones.
-		// Match by BodyBlock pointer first, then fall back to comment matching
-		// (blocks may be restructured after predication/optimization).
+		// Use exact BodyBlock pointer match only. Comment-based fallback is
+		// incorrect for functions with multiple SPMD loops because all
+		// rangeindex.body blocks share the same comment, causing the second
+		// loop to incorrectly match the first loop's ssaLoop.
 		var ssaLoop *ssa.SPMDLoopInfo
 		for _, sl := range b.fn.SPMDLoops {
-			if sl.IsRangeIndex && !sl.IsPeeled {
-				if sl.BodyBlock == block || (sl.BodyBlock != nil && sl.BodyBlock.Comment == block.Comment) {
-					ssaLoop = sl
-					break
-				}
+			if sl.IsRangeIndex && !sl.IsPeeled && sl.BodyBlock == block {
+				ssaLoop = sl
+				break
 			}
 		}
 
