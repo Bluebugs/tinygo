@@ -7705,6 +7705,16 @@ func (b *builder) createSPMDSelect(instr *ssa.SPMDSelect) llvm.Value {
 		}
 	}
 
+	// Fast path: when the mask is a compile-time constant, use LLVM's native
+	// vector select instead of the bitwise (mask & x) | (~mask & y) path.
+	// LLVM will constant-fold the select, eliminating 4 bitwise operations.
+	if mask.IsConstant() {
+		// Convert mask to <N x i1> for LLVM select.
+		laneCount := mask.Type().VectorSize()
+		i1Mask := b.spmdUnwrapMaskForIntrinsic(mask, laneCount)
+		return b.CreateSelect(i1Mask, x, y, "spmd.select.const")
+	}
+
 	return b.spmdMaskSelect(mask, x, y)
 }
 
