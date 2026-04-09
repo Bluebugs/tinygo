@@ -5319,7 +5319,14 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 				if k > int64(laneCount) {
 					break
 				}
-				baseRem := b.CreateURem(decomp.scalarBase, scalarLLVM, "spmd.decomp.quo.rem")
+				// Power-of-2 optimization: x % (2^n) == x & (2^n - 1).
+				var baseRem llvm.Value
+				if k&(k-1) == 0 { // k is power of 2
+					maskVal := llvm.ConstInt(decomp.scalarBase.Type(), uint64(k-1), false)
+					baseRem = b.CreateAnd(decomp.scalarBase, maskVal, "spmd.decomp.quo.rem.and")
+				} else {
+					baseRem = b.CreateURem(decomp.scalarBase, scalarLLVM, "spmd.decomp.quo.rem")
+				}
 				// Precompute offset vectors for each remainder r ∈ [0, k-1]:
 				//   pattern_r[lane] = (r + lane) / k
 				patterns := make([]llvm.Value, k)
@@ -5363,12 +5370,11 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 		}
 		if constVal, ok := scalarSSA.(*ssa.Const); ok {
 			if k, ok := constant.Int64Val(constVal.Value); ok && k > 0 {
-				// Base contribution: base % k (scalar).
-				baseRem := b.CreateURem(decomp.scalarBase, scalarLLVM, "spmd.decomp.rem.base")
 				if int64(laneCount)%k == 0 {
 					// Fast path: laneCount is a multiple of k. The offset pattern
 					// repeats cleanly and base%k is always 0 (since base is a multiple
-					// of laneCount which is divisible by k).
+					// of laneCount which is divisible by k). No scalar REM needed.
+					zeroBase := llvm.ConstInt(decomp.scalarBase.Type(), 0, false)
 					newOffsetElts := make([]llvm.Value, laneCount)
 					for i := 0; i < laneCount; i++ {
 						newOffsetElts[i] = llvm.ConstInt(i8Type, uint64(i)%uint64(k), false)
@@ -5376,13 +5382,22 @@ func (b *builder) spmdDecomposedBinOp(expr *ssa.BinOp, decomp *spmdDecomposedInd
 					newOffset := llvm.ConstVector(newOffsetElts, false)
 					if b.spmdDecomposed != nil {
 						b.spmdDecomposed[expr] = &spmdDecomposedIndex{
-							scalarBase:    baseRem,
+							scalarBase:    zeroBase,
 							varyingOffset: newOffset,
 							laneCount:     laneCount,
 							loop:          decomp.loop,
 						}
 					}
 					return llvm.Value{}, true
+				}
+				// General path: base % k may be non-zero.
+				// Power-of-2 optimization: x % (2^n) == x & (2^n - 1) for unsigned values.
+				var baseRem llvm.Value
+				if k&(k-1) == 0 { // k is power of 2
+					maskVal := llvm.ConstInt(decomp.scalarBase.Type(), uint64(k-1), false)
+					baseRem = b.CreateAnd(decomp.scalarBase, maskVal, "spmd.decomp.rem.base.and")
+				} else {
+					baseRem = b.CreateURem(decomp.scalarBase, scalarLLVM, "spmd.decomp.rem.base")
 				}
 				// General path: laneCount % k != 0 (e.g., 16-lane byte loop with k=3).
 				// Use: (base+lane) % k = (base%k + lane) % k
