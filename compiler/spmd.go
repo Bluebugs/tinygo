@@ -7786,6 +7786,182 @@ func (b *builder) createSPMDMux(instr *ssa.SPMDMux) llvm.Value {
 	return result
 }
 
+// createSPMDInterleaveStore lowers an SPMDInterleaveStore instruction.
+// Uses N diagonal-extraction shuffles + ORs + 1 compaction shuffle + 1 store.
+// Returns the constant element count (len(Values) * Lanes / Period).
+func (b *builder) createSPMDInterleaveStore(instr *ssa.SPMDInterleaveStore) llvm.Value {
+	period := instr.Period
+	lanes := instr.Lanes
+	numValues := len(instr.Values)
+	elemCount := numValues * lanes / period
+
+	// Scalar fallback.
+	if !b.simdEnabled {
+		return b.createSPMDInterleaveStoreScalar(instr, elemCount)
+	}
+
+	pos := getPos(instr)
+
+	// Evaluate all value vectors.
+	vals := make([]llvm.Value, numValues)
+	for i, v := range instr.Values {
+		vals[i] = b.getValue(v, pos)
+	}
+
+	// Ensure all are vectors. Find a vector-typed value for reference.
+	var vecType llvm.Type
+	for _, v := range vals {
+		if v.Type().TypeKind() == llvm.VectorTypeKind {
+			vecType = v.Type()
+			break
+		}
+	}
+	if vecType.IsNil() {
+		vecType = llvm.VectorType(vals[0].Type(), lanes)
+	}
+	for i, v := range vals {
+		if v.Type().TypeKind() != llvm.VectorTypeKind {
+			vals[i] = b.splatScalar(v, vecType)
+		}
+	}
+
+	elemType := vecType.ElementType()
+	elemSize := int(b.targetData.TypeAllocSize(elemType))
+
+	// Extract destination pointer from the slice.
+	dstSlice := b.getValue(instr.Addr, pos)
+	ptr := b.CreateExtractValue(dstSlice, 0, "ileave.ptr")
+
+	if elemSize == 1 {
+		return b.createInterleaveStoreByte(ptr, vals, period, lanes, elemCount)
+	}
+	return b.createInterleaveStoreWide(ptr, vals, period, lanes, elemCount)
+}
+
+// createInterleaveStoreByte handles byte-width SPMDInterleaveStore.
+// N diagonal-extraction spmdSwizzle + (N-1) ORs + 1 compaction spmdSwizzle + 1 store.
+func (b *builder) createInterleaveStoreByte(ptr llvm.Value, vals []llvm.Value, period, lanes, elemCount int) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+	numValues := len(vals)
+
+	// Step 1: N diagonal-extraction swizzles.
+	// For value index r, the mask picks lane (g*period + r) from each group g, zeros others.
+	parts := make([]llvm.Value, numValues)
+	for r := 0; r < numValues; r++ {
+		maskElts := make([]llvm.Value, lanes)
+		for lane := 0; lane < lanes; lane++ {
+			posInGroup := lane % period
+			if posInGroup == r {
+				// Identity position — keep this lane.
+				maskElts[lane] = llvm.ConstInt(i8Type, uint64(lane), false)
+			} else {
+				// Zero out — 0x80 is out-of-range for swizzle (produces 0).
+				maskElts[lane] = llvm.ConstInt(i8Type, 0x80, false)
+			}
+		}
+		indexVec := llvm.ConstVector(maskElts, false)
+		parts[r] = b.spmdSwizzle(vals[r], indexVec)
+	}
+
+	// Step 2: OR all parts together.
+	interleaved := parts[0]
+	for r := 1; r < numValues; r++ {
+		interleaved = b.CreateOr(interleaved, parts[r], "ileave.or")
+	}
+
+	// Step 3: Compaction swizzle — remove gap lanes, pack N active per group.
+	compactElts := make([]llvm.Value, lanes)
+	outIdx := 0
+	for lane := 0; lane < lanes; lane++ {
+		posInGroup := lane % period
+		if posInGroup < numValues {
+			compactElts[outIdx] = llvm.ConstInt(i8Type, uint64(lane), false)
+			outIdx++
+		}
+	}
+	for i := outIdx; i < lanes; i++ {
+		compactElts[i] = llvm.ConstInt(i8Type, 0x80, false) // zero padding
+	}
+	compactVec := llvm.ConstVector(compactElts, false)
+	output := b.spmdSwizzle(interleaved, compactVec)
+
+	// Step 4: Full-width vector store (overwrite pattern).
+	st := b.CreateStore(output, ptr)
+	st.SetAlignment(1) // byte alignment
+
+	return llvm.ConstInt(b.intType, uint64(elemCount), false)
+}
+
+// createInterleaveStoreWide handles non-byte SPMDInterleaveStore via shufflevector.
+func (b *builder) createInterleaveStoreWide(ptr llvm.Value, vals []llvm.Value, period, lanes, elemCount int) llvm.Value {
+	i32Type := b.ctx.Int32Type()
+	numValues := len(vals)
+
+	// Same algorithm as byte path but with LLVM shufflevector.
+	parts := make([]llvm.Value, numValues)
+	for r := 0; r < numValues; r++ {
+		maskElts := make([]llvm.Value, lanes)
+		for lane := 0; lane < lanes; lane++ {
+			posInGroup := lane % period
+			if posInGroup == r {
+				maskElts[lane] = llvm.ConstInt(i32Type, uint64(lane), false)
+			} else {
+				// Select from second operand (zeroinitializer) at index 0.
+				maskElts[lane] = llvm.ConstInt(i32Type, uint64(lanes), false)
+			}
+		}
+		shuffleMask := llvm.ConstVector(maskElts, false)
+		zero := llvm.ConstNull(vals[r].Type())
+		parts[r] = b.CreateShuffleVector(vals[r], zero, shuffleMask, "ileave.diag")
+	}
+
+	interleaved := parts[0]
+	for r := 1; r < numValues; r++ {
+		interleaved = b.CreateOr(interleaved, parts[r], "ileave.or")
+	}
+
+	compactElts := make([]llvm.Value, lanes)
+	outIdx := 0
+	for lane := 0; lane < lanes; lane++ {
+		if lane%period < numValues {
+			compactElts[outIdx] = llvm.ConstInt(i32Type, uint64(lane), false)
+			outIdx++
+		}
+	}
+	for i := outIdx; i < lanes; i++ {
+		compactElts[i] = llvm.Undef(i32Type)
+	}
+	compactMask := llvm.ConstVector(compactElts, false)
+	output := b.CreateShuffleVector(interleaved, llvm.Undef(interleaved.Type()), compactMask, "ileave.compact")
+
+	st := b.CreateStore(output, ptr)
+	st.SetAlignment(1)
+
+	return llvm.ConstInt(b.intType, uint64(elemCount), false)
+}
+
+// createSPMDInterleaveStoreScalar handles scalar fallback.
+func (b *builder) createSPMDInterleaveStoreScalar(instr *ssa.SPMDInterleaveStore, elemCount int) llvm.Value {
+	pos := getPos(instr)
+	dstSlice := b.getValue(instr.Addr, pos)
+	ptr := b.CreateExtractValue(dstSlice, 0, "ileave.scalar.ptr")
+
+	// Get the element type from the first value.
+	val0 := b.getValue(instr.Values[0], pos)
+	elemType := val0.Type()
+
+	// Single group: store Values[0], Values[1], ... to consecutive positions.
+	for r, v := range instr.Values {
+		val := b.getValue(v, pos)
+		gep := b.CreateInBoundsGEP(elemType, ptr, []llvm.Value{
+			llvm.ConstInt(b.ctx.Int32Type(), uint64(r), false),
+		}, "ileave.scalar.gep")
+		b.CreateStore(val, gep)
+	}
+
+	return llvm.ConstInt(b.intType, uint64(elemCount), false)
+}
+
 // spmdIsVectorizableElemType returns true if the LLVM type can be used as a
 // vector element type. LLVM vectors only support integer, floating-point, and
 // pointer element types — NOT structs or arrays. When this returns false,
