@@ -7718,6 +7718,74 @@ func (b *builder) createSPMDSelect(instr *ssa.SPMDSelect) llvm.Value {
 	return b.spmdMaskSelect(mask, x, y)
 }
 
+// createSPMDMux lowers an SPMDMux instruction to LLVM IR.
+// Emits N LLVM select instructions with compile-time constant <Lanes x i1> masks,
+// one per value operand. LLVM constant-folds these into optimal blend/shuffle
+// sequences per target.
+func (b *builder) createSPMDMux(instr *ssa.SPMDMux) llvm.Value {
+	// Scalar fallback: Indices has one element, just return that value.
+	if !b.simdEnabled {
+		idx := instr.Indices[0]
+		return b.getValue(instr.Values[idx], token.NoPos)
+	}
+
+	laneCount := instr.Lanes
+	numValues := len(instr.Values)
+
+	// Evaluate all value operands.
+	vals := make([]llvm.Value, numValues)
+	for i, v := range instr.Values {
+		vals[i] = b.getValue(v, token.NoPos)
+	}
+
+	// Ensure all values are vectors (some may be scalar constants that need splatting).
+	// Use the first vector-typed value as the reference type.
+	var vecType llvm.Type
+	for _, v := range vals {
+		if v.Type().TypeKind() == llvm.VectorTypeKind {
+			vecType = v.Type()
+			break
+		}
+	}
+	if vecType.IsNil() {
+		// All scalar — shouldn't happen in SIMD mode, but handle gracefully.
+		vecType = llvm.VectorType(vals[0].Type(), laneCount)
+	}
+	for i, v := range vals {
+		if v.Type().TypeKind() != llvm.VectorTypeKind {
+			vals[i] = b.splatScalar(v, vecType)
+		}
+	}
+
+	// Build per-value constant <Lanes x i1> masks and chain selects.
+	i1Type := b.ctx.Int1Type()
+	trueVal := llvm.ConstInt(i1Type, 1, false)
+	falseVal := llvm.ConstInt(i1Type, 0, false)
+
+	result := llvm.ConstNull(vecType)
+
+	for valIdx := 0; valIdx < numValues; valIdx++ {
+		// Build mask: true where Indices[lane] == valIdx.
+		maskElts := make([]llvm.Value, laneCount)
+		anyActive := false
+		for lane := 0; lane < laneCount; lane++ {
+			if instr.Indices[lane] == valIdx {
+				maskElts[lane] = trueVal
+				anyActive = true
+			} else {
+				maskElts[lane] = falseVal
+			}
+		}
+		if !anyActive {
+			continue
+		}
+		mask := llvm.ConstVector(maskElts, false)
+		result = b.CreateSelect(mask, vals[valIdx], result, "spmd.mux.sel")
+	}
+
+	return result
+}
+
 // spmdIsVectorizableElemType returns true if the LLVM type can be used as a
 // vector element type. LLVM vectors only support integer, floating-point, and
 // pointer element types — NOT structs or arrays. When this returns false,
