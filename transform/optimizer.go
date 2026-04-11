@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"go/token"
 	"os"
+	"strings"
 
 	"github.com/tinygo-org/tinygo/compileopts"
 	"github.com/tinygo-org/tinygo/compiler/ircheck"
@@ -57,6 +58,17 @@ func Optimize(mod llvm.Module, config *compileopts.Config) []error {
 		if llvmutil.Version() < 18 {
 			// LLVM 17 doesn't have the no-verify-fixpoint flag.
 			optPasses = "globaldce,globalopt,ipsccp,instcombine,adce,function-attrs"
+		}
+		// Add LICM for SPMD compilations to hoist loop-invariant constants
+		// (LUT tables, mask bytes, shuffle masks) out of SPMD hot loops.
+		// loop-mssa is the MemorySSA-aware LICM variant required by LLVM 18+.
+		// loop-simplify and lcssa are prerequisites for loop-mssa.
+		if strings.Contains(config.GOExperiment(), "spmd") {
+			if llvmutil.Version() < 18 {
+				optPasses += ",function(loop-simplify,lcssa,licm)"
+			} else {
+				optPasses += ",function(loop-simplify,lcssa,loop-mssa(licm))"
+			}
 		}
 		err := mod.RunPasses(optPasses, llvm.TargetMachine{}, po)
 		if err != nil {
