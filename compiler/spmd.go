@@ -7832,35 +7832,40 @@ func (b *builder) createSPMDInterleaveStore(instr *ssa.SPMDInterleaveStore) llvm
 	dstSlice := b.getValue(instr.Addr, pos)
 	ptr := b.CreateExtractValue(dstSlice, 0, "ileave.ptr")
 
+	// Build per-position → value-index mapping from the first period of Indices.
+	posToValIdx := make([]int, period)
+	copy(posToValIdx, instr.Indices[:period])
+
 	if elemSize == 1 {
-		return b.createInterleaveStoreByte(ptr, vals, period, lanes, elemCount)
+		return b.createInterleaveStoreByte(ptr, vals, posToValIdx, period, lanes, elemCount)
 	}
-	return b.createInterleaveStoreWide(ptr, vals, period, lanes, elemCount)
+	return b.createInterleaveStoreWide(ptr, vals, posToValIdx, period, lanes, elemCount)
 }
 
 // createInterleaveStoreByte handles byte-width SPMDInterleaveStore.
-// N diagonal-extraction spmdSwizzle + (N-1) ORs + 1 compaction spmdSwizzle + 1 store.
-func (b *builder) createInterleaveStoreByte(ptr llvm.Value, vals []llvm.Value, period, lanes, elemCount int) llvm.Value {
+// N diagonal-extraction spmdSwizzle + (N-1) ORs + 1 compaction swizzle + 1 store.
+// posToValIdx maps each position within a period to its Value vector index.
+func (b *builder) createInterleaveStoreByte(ptr llvm.Value, vals []llvm.Value, posToValIdx []int, period, lanes, elemCount int) llvm.Value {
 	i8Type := b.ctx.Int8Type()
 	numValues := len(vals)
 
-	// Step 1: N diagonal-extraction swizzles.
-	// For value index r, the mask picks lane (g*period + r) from each group g, zeros others.
+	// Step 1: Per-value diagonal-extraction swizzles.
+	// For each value index v, extract the lanes where posToValIdx[posInGroup] == v.
 	parts := make([]llvm.Value, numValues)
-	for r := 0; r < numValues; r++ {
+	for v := 0; v < numValues; v++ {
 		maskElts := make([]llvm.Value, lanes)
 		for lane := 0; lane < lanes; lane++ {
 			posInGroup := lane % period
-			if posInGroup == r {
-				// Identity position — keep this lane.
+			if posToValIdx[posInGroup] == v {
+				// This position uses value v — keep this lane.
 				maskElts[lane] = llvm.ConstInt(i8Type, uint64(lane), false)
 			} else {
-				// Zero out — 0x80 is out-of-range for swizzle (produces 0).
+				// Zero out.
 				maskElts[lane] = llvm.ConstInt(i8Type, 0x80, false)
 			}
 		}
 		indexVec := llvm.ConstVector(maskElts, false)
-		parts[r] = b.spmdSwizzle(vals[r], indexVec)
+		parts[v] = b.spmdSwizzle(vals[v], indexVec)
 	}
 
 	// Step 2: OR all parts together.
@@ -7869,21 +7874,32 @@ func (b *builder) createInterleaveStoreByte(ptr llvm.Value, vals []llvm.Value, p
 		interleaved = b.CreateOr(interleaved, parts[r], "ileave.or")
 	}
 
-	// Step 3: Compaction swizzle — remove gap lanes, pack N active per group.
-	compactElts := make([]llvm.Value, lanes)
-	outIdx := 0
-	for lane := 0; lane < lanes; lane++ {
-		posInGroup := lane % period
-		if posInGroup < numValues {
-			compactElts[outIdx] = llvm.ConstInt(i8Type, uint64(lane), false)
-			outIdx++
+	// Step 3: Compaction — remove gap lanes, pack numValues active bytes per group.
+	//
+	// On AVX2 (lanes > 16), vpshufb operates within each 128-bit half independently.
+	// The compaction indices for the lower output half can exceed 15 (e.g. position 12
+	// needs source byte 16), which vpshufb cannot reach across the 128-bit lane boundary.
+	// Fix: use a within-half vpshufb (same relative mask for both halves, indices 0-15)
+	// followed by a shufflevector to place the upper-half compacted bytes after the
+	// lower-half bytes in the final output.
+	var output llvm.Value
+	if lanes > 16 {
+		output = b.createInterleaveStoreByteCompactAVX2(interleaved, posToValIdx, period, lanes, numValues)
+	} else {
+		compactElts := make([]llvm.Value, lanes)
+		outIdx := 0
+		for lane := 0; lane < lanes; lane++ {
+			if lane%period < numValues {
+				compactElts[outIdx] = llvm.ConstInt(i8Type, uint64(lane), false)
+				outIdx++
+			}
 		}
+		for i := outIdx; i < lanes; i++ {
+			compactElts[i] = llvm.ConstInt(i8Type, 0x80, false) // zero padding
+		}
+		compactVec := llvm.ConstVector(compactElts, false)
+		output = b.spmdSwizzle(interleaved, compactVec)
 	}
-	for i := outIdx; i < lanes; i++ {
-		compactElts[i] = llvm.ConstInt(i8Type, 0x80, false) // zero padding
-	}
-	compactVec := llvm.ConstVector(compactElts, false)
-	output := b.spmdSwizzle(interleaved, compactVec)
 
 	// Step 4: Full-width vector store (overwrite pattern).
 	st := b.CreateStore(output, ptr)
@@ -7892,18 +7908,114 @@ func (b *builder) createInterleaveStoreByte(ptr llvm.Value, vals []llvm.Value, p
 	return llvm.ConstInt(b.intType, uint64(elemCount), false)
 }
 
+// createInterleaveStoreByteCompactAVX2 performs the compaction step for lanes > 16.
+//
+// vpshufb on 256-bit registers (AVX2) shuffles each 128-bit half independently;
+// it cannot move bytes across the 128-bit lane boundary. The naive compaction mask
+// has indices >= 16 at output positions < 16, which vpshufb misinterprets as
+// within-half indices (index & 0x0F), producing wrong bytes.
+//
+// Fix (two steps):
+//  1. Within-half vpshufb: compact bytes within each 128-bit half using indices 0-15
+//     (relative to the start of that half). The mask is the same for both halves
+//     because the interleave pattern repeats with period dividing 16. After vpshufb,
+//     the lower half holds compacted bytes 0..halfOut-1 at positions 0..halfOut-1,
+//     the upper half holds compacted bytes halfOut..2*halfOut-1 at positions 16..16+halfOut-1.
+//  2. shufflevector: extract the two packed runs and concatenate them into positions
+//     0..2*halfOut-1, with undef (overwritten by next iteration) at the tail.
+func (b *builder) createInterleaveStoreByteCompactAVX2(interleaved llvm.Value, posToValIdx []int, period, lanes, numValues int) llvm.Value {
+	i8Type := b.ctx.Int8Type()
+	i32Type := b.ctx.Int32Type()
+	const halfSize = 16
+
+	// Count how many active bytes come from each 128-bit half.
+	// For well-behaved periods (period divides halfSize), both halves produce the
+	// same count (halfOut). For irregular periods, each half is computed individually.
+	halfLanes := lanes / 2 // always 16 for AVX2 256-bit
+
+	// Count active bytes per half.
+	halfOut0 := 0
+	for lane := 0; lane < halfLanes; lane++ {
+		if lane%period < numValues {
+			halfOut0++
+		}
+	}
+	halfOut1 := 0
+	for lane := halfLanes; lane < lanes; lane++ {
+		if lane%period < numValues {
+			halfOut1++
+		}
+	}
+
+	// Build the 32-byte within-half compaction mask.
+	// For each 128-bit half, build a 16-byte compaction mask using within-half
+	// relative indices (0-15). Byte positions in the upper half use local indices
+	// (lane - halfSize) so vpshufb can find them within the upper half.
+	maskElts := make([]llvm.Value, lanes)
+	// Lower half mask (positions 0-15 of the mask, applied to source bytes 0-15).
+	outIdx := 0
+	for lane := 0; lane < halfLanes; lane++ {
+		if lane%period < numValues {
+			maskElts[outIdx] = llvm.ConstInt(i8Type, uint64(lane), false)
+			outIdx++
+		}
+	}
+	for i := outIdx; i < halfSize; i++ {
+		maskElts[i] = llvm.ConstInt(i8Type, 0x80, false)
+	}
+	// Upper half mask (positions 16-31 of the mask, applied to source bytes 16-31).
+	// Indices must be relative to the start of the upper half (0-15 range) because
+	// vpshufb masks bit 7 and then offsets by 16 automatically for the upper half.
+	outIdx = halfSize
+	for lane := halfLanes; lane < lanes; lane++ {
+		if lane%period < numValues {
+			localIdx := lane - halfLanes // relative index within upper half (0-15)
+			maskElts[outIdx] = llvm.ConstInt(i8Type, uint64(localIdx), false)
+			outIdx++
+		}
+	}
+	for i := outIdx; i < lanes; i++ {
+		maskElts[i] = llvm.ConstInt(i8Type, 0x80, false)
+	}
+
+	compactVec := llvm.ConstVector(maskElts, false)
+	// Single vpshufb: compacts within lower half and within upper half simultaneously.
+	// Result: [compact0..halfOut0-1, zeros, compact_halfOut0..halfOut0+halfOut1-1, zeros]
+	//          positions 0..halfOut0-1 hold lower half output
+	//          positions 16..16+halfOut1-1 hold upper half output
+	swizzled := b.spmdSwizzle(interleaved, compactVec)
+
+	// shufflevector: concatenate the two packed runs.
+	// Take halfOut0 bytes from lower half (indices 0..halfOut0-1) and halfOut1 bytes
+	// from upper half (indices 16..16+halfOut1-1), then undef for the tail.
+	totalOut := halfOut0 + halfOut1
+	shuffleElts := make([]llvm.Value, lanes)
+	for i := 0; i < halfOut0; i++ {
+		shuffleElts[i] = llvm.ConstInt(i32Type, uint64(i), false)
+	}
+	for i := 0; i < halfOut1; i++ {
+		shuffleElts[halfOut0+i] = llvm.ConstInt(i32Type, uint64(halfSize+i), false)
+	}
+	for i := totalOut; i < lanes; i++ {
+		shuffleElts[i] = llvm.Undef(i32Type)
+	}
+	shuffleMask := llvm.ConstVector(shuffleElts, false)
+	return b.CreateShuffleVector(swizzled, llvm.Undef(swizzled.Type()), shuffleMask, "ileave.compact")
+}
+
 // createInterleaveStoreWide handles non-byte SPMDInterleaveStore via shufflevector.
-func (b *builder) createInterleaveStoreWide(ptr llvm.Value, vals []llvm.Value, period, lanes, elemCount int) llvm.Value {
+// posToValIdx maps each position within a period to its Value vector index.
+func (b *builder) createInterleaveStoreWide(ptr llvm.Value, vals []llvm.Value, posToValIdx []int, period, lanes, elemCount int) llvm.Value {
 	i32Type := b.ctx.Int32Type()
 	numValues := len(vals)
 
 	// Same algorithm as byte path but with LLVM shufflevector.
 	parts := make([]llvm.Value, numValues)
-	for r := 0; r < numValues; r++ {
+	for v := 0; v < numValues; v++ {
 		maskElts := make([]llvm.Value, lanes)
 		for lane := 0; lane < lanes; lane++ {
 			posInGroup := lane % period
-			if posInGroup == r {
+			if posToValIdx[posInGroup] == v {
 				maskElts[lane] = llvm.ConstInt(i32Type, uint64(lane), false)
 			} else {
 				// Select from second operand (zeroinitializer) at index 0.
@@ -7911,8 +8023,8 @@ func (b *builder) createInterleaveStoreWide(ptr llvm.Value, vals []llvm.Value, p
 			}
 		}
 		shuffleMask := llvm.ConstVector(maskElts, false)
-		zero := llvm.ConstNull(vals[r].Type())
-		parts[r] = b.CreateShuffleVector(vals[r], zero, shuffleMask, "ileave.diag")
+		zero := llvm.ConstNull(vals[v].Type())
+		parts[v] = b.CreateShuffleVector(vals[v], zero, shuffleMask, "ileave.diag")
 	}
 
 	interleaved := parts[0]
