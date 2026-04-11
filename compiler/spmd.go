@@ -8263,9 +8263,16 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 				}
 			}
 			vecType := llvm.VectorType(elemType, laneCount)
-			// Cap-based optimization: full load + select when safe.
 			var result llvm.Value
-			if !b.spmdIsConstAllOnesMask(mask) && (b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil()) {
+			if b.spmdIsConstAllOnesMask(mask) {
+				// Fast path: all-ones mask → unconditional vector load.
+				// The peeled main body always has ConstAllOnes mask.
+				elemAlign := int(b.targetData.TypeAllocSize(vecType.ElementType()))
+				ld := b.CreateLoad(vecType, ci.scalarPtr, "spmd.load.full")
+				ld.SetAlignment(elemAlign)
+				result = ld
+			} else if b.spmdIsAllocaOrigin(ci) || !ci.sliceCap.IsNil() {
+				// Cap-based optimization: full load + select when safe.
 				result = b.spmdFullLoadWithSelect(vecType, ci, mask)
 				b.currentBlockInfo.exit = b.GetInsertBlock()
 			} else {
