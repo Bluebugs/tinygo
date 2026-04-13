@@ -3377,10 +3377,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			ptrVec := llvm.Undef(llvm.VectorType(bufptr.Type(), laneCount))
 			for lane := 0; lane < laneCount; lane++ {
 				laneIdx := b.CreateExtractElement(index, llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false), "")
-				// Extend lane index to uintptr width
-				if laneIdx.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
-					laneIdx = b.CreateSExt(laneIdx, b.uintptrType, "")
-				}
+				// Extend lane index to uintptr width, respecting signedness.
+				laneIdx = b.spmdExtendIndex(laneIdx, expr.Index.Type(), b.uintptrType)
 				var gep llvm.Value
 				switch expr.X.Type().Underlying().(type) {
 				case *types.Pointer:
