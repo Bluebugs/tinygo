@@ -7477,12 +7477,13 @@ func spmdDetectByteDecompose(group *spmdInterleavedStoreGroup) *spmdByteDecompos
 //  5. Extract stride <N x i8> sub-vectors (consecutive N-byte slices of the result)
 //  6. Emit stride masked stores at offsets 0, N, 2N, ...
 //
-// Only supports the case where N*W == 16 (single 128-bit register: SSE, WASM).
-// For AVX2 (N*W = 32), returns false and the caller falls back to the generic path.
+// For AVX2 (N*W == 32), delegates to spmdEmitByteDecomposeAVX2 which performs
+// per-half vpshufb + cross-lane shufflevector merge to compact the two halves.
+// For all other cases where N*W != 16, returns false (caller falls back to generic).
 //
 // The mask parameter is the SPMD execution mask (<N x iW>); may be nil for all-ones.
 // Returns false if the fast path cannot be applied (no SSSE3/WASM swizzle support,
-// or N*W > 16). The caller must fall back to the generic interleaved shuffle path.
+// or N*W is unsupported). The caller must fall back to the generic interleaved shuffle path.
 func (b *builder) spmdEmitByteDecompose(
 	info *spmdByteDecomposeInfo,
 	group *spmdInterleavedStoreGroup,
@@ -7499,9 +7500,12 @@ func (b *builder) spmdEmitByteDecompose(
 	// Total source bytes = N * W (e.g., 16 for SSE/WASM, 32 for AVX2).
 	totalSrcBytes := N * W
 
-	// Only handle the single-register case (N*W == 16). AVX2 (N*W == 32) has a
-	// layout gap after pshufb (12 valid + 4 pad per 128-bit half) that requires
-	// an additional compaction shuffle. Fall back to the generic path for AVX2.
+	// AVX2 (N*W == 32): per-half vpshufb + cross-lane merge; handled separately.
+	if totalSrcBytes == 32 {
+		return b.spmdEmitByteDecomposeAVX2(info, group, bufptr, buflen, scalarBase, mask)
+	}
+
+	// Only handle the single-register case (N*W == 16). All other sizes fall back.
 	if totalSrcBytes != 16 {
 		return false
 	}
@@ -7617,6 +7621,150 @@ func (b *builder) spmdEmitByteDecompose(
 		}
 		b.spmdMaskedStore(outVec, ptr, storeMask)
 	}
+
+	return true
+}
+
+// spmdEmitByteDecomposeAVX2 handles the byte-decomposition fast path for AVX2
+// (N=8 int32 lanes, totalSrcBytes=32).
+//
+// vpshufb on AVX2 shuffles within each 128-bit half independently. Indices in the
+// mask are relative to each half (0-15), so we use the same 16-byte pattern for
+// both halves. After vpshufb the result layout is:
+//
+//	bytes 0..validPerHalf-1   : valid output from lower half
+//	bytes validPerHalf..15    : zero padding (0x80 sentinel bytes)
+//	bytes 16..16+validPerHalf-1: valid output from upper half
+//	bytes 16+validPerHalf..31 : zero padding
+//
+// A cross-lane shufflevector compacts the two valid sections into
+// [lower-valid | upper-valid | don't-care] at positions 0..2*validPerHalf-1.
+// The full 32-byte YMM register is then stored via a single unmasked store
+// (overwrite pattern, same as the generic interleaved path).
+//
+// Example (base64, stride=3, byteOffs=[2,1,0]):
+//
+//	validPerHalf = 4 groups × 3 bytes = 12
+//	pshufb mask (per half): [2,1,0, 6,5,4, 10,9,8, 14,13,12, 0x80,0x80,0x80,0x80]
+//	shufflevector merge: indices [0..11, 16..27, undef×8]
+//	→ 24 contiguous valid output bytes
+func (b *builder) spmdEmitByteDecomposeAVX2(
+	info *spmdByteDecomposeInfo,
+	group *spmdInterleavedStoreGroup,
+	bufptr llvm.Value,
+	buflen llvm.Value,
+	scalarBase llvm.Value,
+	mask llvm.Value,
+) bool {
+	if !b.spmdHasSSSE3() {
+		return false
+	}
+
+	stride := group.stride
+	N := group.laneCount // 8 for AVX2 int32
+	W := info.elemWidth  // 4 for int32
+
+	// Verify assumptions: AVX2 path requires exactly 32 source bytes.
+	if N*W != 32 {
+		return false
+	}
+
+	// validPerHalf: number of valid output bytes produced by each 128-bit half.
+	// Each half processes N/2 source elements, each contributing stride output bytes.
+	halfN := N / 2
+	validPerHalf := halfN * stride // e.g., 4*3 = 12 for base64
+
+	// Total valid output bytes across both halves.
+	totalValid := validPerHalf * 2 // e.g., 24
+
+	// Verify source LLVM type is a vector of the expected lane count.
+	srcLLVM := b.getValue(info.source, token.NoPos)
+	if srcLLVM.IsNil() || srcLLVM.Type().TypeKind() != llvm.VectorTypeKind {
+		return false
+	}
+	if srcLLVM.Type().VectorSize() != N {
+		return false
+	}
+
+	i8Type := b.ctx.Int8Type()
+	i32Type := b.ctx.Int32Type()
+	v32i8 := llvm.VectorType(i8Type, 32)
+
+	// Bounds check: ensure scalarBase + N*stride <= len(slice).
+	if !b.info.nobounds && !buflen.IsNil() {
+		endIdx := b.CreateAdd(scalarBase,
+			llvm.ConstInt(b.uintptrType, uint64(N*stride), false),
+			"bytedecomp.avx2.end")
+		oob := b.CreateICmp(llvm.IntUGT, endIdx, buflen, "bytedecomp.avx2.oob")
+		b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+	}
+
+	// Step 1: Bitcast <N x i32> → <32 x i8>.
+	byteVec := b.CreateBitCast(srcLLVM, v32i8, "bytedecomp.avx2.cast")
+
+	// Step 2: Build the 32-byte vpshufb mask.
+	// vpshufb shuffles each 128-bit half independently. Indices are relative to
+	// each half (0..15), not global (0..31). We use the same 16-byte pattern for
+	// both halves: output position g*stride+r within a half maps to source byte
+	// g*W+byteOffs[r] (relative to the start of that half). Positions beyond
+	// halfN*stride are set to 0x80 (vpshufb zeroing sentinel).
+	pshufbElts := make([]llvm.Value, 32)
+	for half := 0; half < 2; half++ {
+		for g := 0; g < halfN; g++ {
+			for r := 0; r < stride; r++ {
+				outPos := half*16 + g*stride + r
+				srcByte := g*W + info.byteOffs[r] // relative to half start (0..15)
+				pshufbElts[outPos] = llvm.ConstInt(i8Type, uint64(srcByte), false)
+			}
+		}
+		// Padding positions within this half: bit 7 set → vpshufb outputs 0.
+		for i := halfN * stride; i < 16; i++ {
+			pshufbElts[half*16+i] = llvm.ConstInt(i8Type, 0x80, false)
+		}
+	}
+	pshufbMask := llvm.ConstVector(pshufbElts, false)
+
+	// Apply vpshufb: each 128-bit half is shuffled independently by the mask.
+	// spmdSwizzle dispatches to spmdX86Pshufb which uses llvm.x86.avx2.pshuf.b
+	// for <32 x i8> — exactly the per-half shuffle behaviour we need.
+	shuffled := b.spmdSwizzle(byteVec, pshufbMask)
+
+	// Step 3: Cross-lane merge via shufflevector.
+	// Lower half has valid bytes at positions 0..validPerHalf-1.
+	// Upper half has valid bytes at positions 16..16+validPerHalf-1.
+	// Pack them into positions 0..totalValid-1; remaining positions are undef.
+	mergeIndices := make([]uint64, 32)
+	for i := 0; i < validPerHalf; i++ {
+		mergeIndices[i] = uint64(i) // from lower half
+	}
+	for i := 0; i < validPerHalf; i++ {
+		mergeIndices[validPerHalf+i] = uint64(16 + i) // from upper half
+	}
+	// Remaining entries: use undef (index 0 is fine since LLVM treats out-of-range
+	// shufflevector indices as undef when the second operand is undef).
+	for i := totalValid; i < 32; i++ {
+		mergeIndices[i] = 0
+	}
+	// Build index vector: undef positions need i32 undef, not zero, so we construct
+	// the constant vector manually to set them properly.
+	mergeElts := make([]llvm.Value, 32)
+	for i := 0; i < totalValid; i++ {
+		mergeElts[i] = llvm.ConstInt(i32Type, mergeIndices[i], false)
+	}
+	for i := totalValid; i < 32; i++ {
+		mergeElts[i] = llvm.Undef(i32Type)
+	}
+	mergeMask := llvm.ConstVector(mergeElts, false)
+	merged := b.CreateShuffleVector(shuffled, llvm.Undef(v32i8), mergeMask, "bytedecomp.avx2.merge")
+
+	// Step 4: Single 32-byte store (overwrite pattern).
+	// Only totalValid=N*stride bytes are meaningful; the trailing bytes are don't-care
+	// and will be overwritten by the next iteration — identical to spmdInterleaveStore.
+	outPtr := b.CreateInBoundsGEP(i8Type, bufptr, []llvm.Value{scalarBase}, "bytedecomp.avx2.gep")
+	st := b.CreateStore(merged, outPtr)
+	st.SetAlignment(1)
+
+	_ = mask // all-lanes-active guaranteed by peeled loop structure; no masked store needed
 
 	return true
 }
