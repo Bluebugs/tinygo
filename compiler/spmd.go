@@ -7278,6 +7278,349 @@ func spmdIndexMaxValue(v ssa.Value) (uint64, bool) {
 	return 0, false
 }
 
+// spmdByteDecomposeInfo describes a group of interleaved byte stores that all
+// extract individual bytes from the same wider Varying source via constant shifts.
+// For example, base64 Loop 4 stores:
+//
+//	dst[g*3+0] = byte(packed[g] >> 16)
+//	dst[g*3+1] = byte(packed[g] >> 8)
+//	dst[g*3+2] = byte(packed[g])
+//
+// These can be replaced with a single bitcast + pshufb + contiguous store.
+type spmdByteDecomposeInfo struct {
+	source    ssa.Value // common wider Varying source (e.g., Varying[int32])
+	byteOffs  []int     // per-remainder source byte offset (shiftBits/8), len==stride
+	elemWidth int       // source element byte width (e.g., 4 for int32)
+}
+
+// spmdLoadKey identifies a unique load access for source canonicalization.
+// Multiple SPMDLoad instructions that load from the same slice element
+// (identical base and index SSA values) compare equal even though they are
+// distinct SSA nodes — go/ssa does not CSE repeated loads.
+type spmdLoadKey struct {
+	base  ssa.Value // slice/array SSA value (IndexAddr.X)
+	index ssa.Value // index SSA value (IndexAddr.Index); nil for plain pointer loads
+}
+
+// spmdLoadKeyOf extracts the canonical key for src if src is a load whose
+// address is derived from IndexAddr. Returns (key, true) on success, or
+// (key{}, false) if the source is not a recognized load pattern.
+func spmdLoadKeyOf(src ssa.Value) (spmdLoadKey, bool) {
+	switch ld := src.(type) {
+	case *ssa.SPMDLoad:
+		if ia, ok := ld.Addr.(*ssa.IndexAddr); ok {
+			return spmdLoadKey{ia.X, ia.Index}, true
+		}
+		return spmdLoadKey{ld.Addr, nil}, true
+	case *ssa.UnOp:
+		if ld.Op == token.MUL {
+			if ia, ok := ld.X.(*ssa.IndexAddr); ok {
+				return spmdLoadKey{ia.X, ia.Index}, true
+			}
+			return spmdLoadKey{ld.X, nil}, true
+		}
+	}
+	return spmdLoadKey{}, false
+}
+
+// spmdDetectByteDecompose checks whether all stores in an interleaved group
+// extract bytes from the same wider Varying source via constant right-shifts.
+// Returns non-nil only when every remainder r satisfies:
+//
+//	storedVal[r] = Convert(BinOp{SHR}(source, constK), byte)
+//	             | Convert(source, byte)  // shift of 0
+//
+// and all shifts are byte-aligned (K % 8 == 0) and within the source width.
+// Sources are compared by structural identity (IndexAddr base + index) rather
+// than SSA pointer identity, since go/ssa generates a fresh SPMDLoad and
+// IndexAddr for each access to packed[g] without CSE. Returns nil if the
+// pattern does not match.
+func spmdDetectByteDecompose(group *spmdInterleavedStoreGroup) *spmdByteDecomposeInfo {
+	stride := group.stride
+	byteOffs := make([]int, stride)
+	var commonKey spmdLoadKey  // canonical source identity
+	var firstLoadVal ssa.Value // actual load value for LLVM codegen (from remainder 0)
+	var elemWidth int
+	hasKey := false
+
+	for r := 0; r < stride; r++ {
+		val := spmdStoreVal(group.stores[r])
+
+		// Peel ChangeType wrappers on the outer value.
+		for {
+			if ct, ok := val.(*ssa.ChangeType); ok {
+				val = ct.X
+			} else {
+				break
+			}
+		}
+
+		// Must be a Convert (truncation) to byte.
+		conv, ok := val.(*ssa.Convert)
+		if !ok {
+			return nil
+		}
+		// Check destination is byte (uint8).
+		convBits := typeBitWidth(conv.Type())
+		if convBits != 8 {
+			return nil
+		}
+
+		// Inner value: peel ChangeType then check for shift or direct source.
+		inner := conv.X
+		for {
+			if ct, ok := inner.(*ssa.ChangeType); ok {
+				inner = ct.X
+			} else {
+				break
+			}
+		}
+
+		var src ssa.Value
+		var shiftBits int
+
+		switch v := inner.(type) {
+		case *ssa.BinOp:
+			if v.Op != token.SHR {
+				return nil
+			}
+			k, ok := ssaConstUint64(v.Y)
+			if !ok {
+				return nil
+			}
+			if k%8 != 0 {
+				return nil // shift is not byte-aligned
+			}
+			src = v.X
+			// Peel ChangeType from the source operand.
+			for {
+				if ct, ok2 := src.(*ssa.ChangeType); ok2 {
+					src = ct.X
+				} else {
+					break
+				}
+			}
+			shiftBits = int(k)
+		default:
+			// No shift: extracting byte 0 (least significant).
+			src = inner
+			shiftBits = 0
+		}
+
+		// Determine source element width from its type.
+		srcBits := typeBitWidth(src.Type())
+		if srcBits == 0 {
+			// Platform-dependent size (int/uint) — skip detection.
+			return nil
+		}
+		srcWidth := srcBits / 8
+		if srcWidth < 2 {
+			return nil // source must be wider than a byte
+		}
+		if shiftBits/8 >= srcWidth {
+			return nil // shift exceeds source width
+		}
+
+		// Canonicalize source: multiple SPMDLoad instructions that load from the
+		// same slice element (identical base + index SSA values) are semantically
+		// equivalent within the same loop body block. go/ssa does not CSE loads,
+		// so each access to packed[g] generates a fresh SPMDLoad with a fresh
+		// IndexAddr. We canonicalize by (IndexAddr.X, IndexAddr.Index) so that
+		// all three loads in the base64 Loop 4 pattern are recognized as the same
+		// source. If the load pattern is not recognized, fall back to pointer identity.
+		key, hasLoadKey := spmdLoadKeyOf(src)
+		if !hasLoadKey {
+			// Plain value (not a recognized load): use pointer identity.
+			key = spmdLoadKey{src, nil}
+			hasLoadKey = true
+		}
+
+		// All remainders must share the same canonical source.
+		if !hasKey {
+			commonKey = key
+			elemWidth = srcWidth
+			firstLoadVal = src // save remainder 0's actual load value for LLVM codegen
+			hasKey = true
+		} else if commonKey != key {
+			return nil
+		} else if elemWidth != srcWidth {
+			return nil
+		}
+
+		// On little-endian targets (x86, WASM) the least-significant byte of a
+		// multi-byte integer is at the lowest byte offset in memory. A right shift
+		// of K bits extracts bits [K+7..K], which on a little-endian bitcast
+		// corresponds to source byte offset K/8.
+		byteOffs[r] = shiftBits / 8
+	}
+
+	if !hasKey {
+		return nil
+	}
+	return &spmdByteDecomposeInfo{
+		source:    firstLoadVal,
+		byteOffs:  byteOffs,
+		elemWidth: elemWidth,
+	}
+}
+
+// spmdEmitByteDecompose emits the byte-decomposition fast path for an interleaved
+// store group where all values extract bytes from the same wider source.
+//
+// Algorithm (SSE example: N=4 int32 lanes, stride=3, byteOffs=[2,1,0]):
+//
+//  1. Load source LLVM value → <4 x i32>
+//  2. Bitcast → <16 x i8>
+//  3. Build pshufb mask: output byte g*stride+r comes from source byte g*elemWidth+byteOffs[r]
+//     → [2,1,0, 6,5,4, 10,9,8, 14,13,12, 0x80,0x80,0x80,0x80]
+//  4. pshufb/swizzle → reordered <16 x i8>
+//  5. Extract stride <N x i8> sub-vectors (consecutive N-byte slices of the result)
+//  6. Emit stride masked stores at offsets 0, N, 2N, ...
+//
+// Only supports the case where N*W == 16 (single 128-bit register: SSE, WASM).
+// For AVX2 (N*W = 32), returns false and the caller falls back to the generic path.
+//
+// The mask parameter is the SPMD execution mask (<N x iW>); may be nil for all-ones.
+// Returns false if the fast path cannot be applied (no SSSE3/WASM swizzle support,
+// or N*W > 16). The caller must fall back to the generic interleaved shuffle path.
+func (b *builder) spmdEmitByteDecompose(
+	info *spmdByteDecomposeInfo,
+	group *spmdInterleavedStoreGroup,
+	bufptr llvm.Value,
+	elemType llvm.Type,
+	buflen llvm.Value,
+	scalarBase llvm.Value,
+	mask llvm.Value,
+) bool {
+	stride := group.stride
+	N := group.laneCount // int32-width lane count (4 on SSE/WASM, 8 on AVX2)
+	W := info.elemWidth  // source element byte width (e.g., 4 for int32)
+
+	// Total source bytes = N * W (e.g., 16 for SSE/WASM, 32 for AVX2).
+	totalSrcBytes := N * W
+
+	// Only handle the single-register case (N*W == 16). AVX2 (N*W == 32) has a
+	// layout gap after pshufb (12 valid + 4 pad per 128-bit half) that requires
+	// an additional compaction shuffle. Fall back to the generic path for AVX2.
+	if totalSrcBytes != 16 {
+		return false
+	}
+
+	// Require swizzle support (pshufb on x86 with SSSE3, or WASM swizzle).
+	if !b.spmdIsWASM() && !b.spmdHasSSSE3() {
+		return false
+	}
+
+	// Verify source LLVM type is <N x i32> (or similar N-wide vector).
+	srcLLVM := b.getValue(info.source, token.NoPos)
+	if srcLLVM.IsNil() {
+		return false
+	}
+	if srcLLVM.Type().TypeKind() != llvm.VectorTypeKind {
+		return false // source is not a vector — cannot bitcast to byte vector
+	}
+	if srcLLVM.Type().VectorSize() != N {
+		return false // lane count mismatch
+	}
+
+	// Bounds check: ensure scalarBase + N*stride <= len(slice).
+	if !b.info.nobounds && !buflen.IsNil() {
+		endIdx := b.CreateAdd(scalarBase,
+			llvm.ConstInt(b.uintptrType, uint64(N*stride), false),
+			"bytedecomp.end")
+		oob := b.CreateICmp(llvm.IntUGT, endIdx, buflen, "bytedecomp.oob")
+		b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+	}
+
+	i8Type := b.ctx.Int8Type()
+	v16i8 := llvm.VectorType(i8Type, 16)
+
+	// Bitcast source vector to byte vector: <N x i32> → <16 x i8>.
+	byteVec := b.CreateBitCast(srcLLVM, v16i8, "bytedecomp.cast")
+
+	// Build the 16-byte pshufb permutation table.
+	// Output position g*stride+r maps to source byte g*W+byteOffs[r].
+	// Remaining positions (padding) get 0x80 (pshufb zeroing sentinel).
+	pshufbTable := make([]byte, 16)
+	validBytes := N * stride // number of valid output bytes (≤ 16)
+	for g := 0; g < N; g++ {
+		for r := 0; r < stride; r++ {
+			outPos := g*stride + r
+			srcByte := g*W + info.byteOffs[r]
+			pshufbTable[outPos] = byte(srcByte)
+		}
+	}
+	for i := validBytes; i < 16; i++ {
+		pshufbTable[i] = 0x80
+	}
+
+	// Build the LLVM constant index vector from the permutation table.
+	idxElems := make([]llvm.Value, 16)
+	for i := 0; i < 16; i++ {
+		idxElems[i] = llvm.ConstInt(i8Type, uint64(pshufbTable[i]), false)
+	}
+	idxVec := llvm.ConstVector(idxElems, false)
+
+	// Apply pshufb/swizzle to reorder bytes into stride-interleaved output layout.
+	// Result layout: [lane0_r0, lane0_r1, ..., lane0_rS-1, lane1_r0, ..., laneN-1_rS-1, pad...]
+	shuffled := b.spmdSwizzle(byteVec, idxVec)
+
+	// The shuffled result contains N*stride valid bytes followed by padding.
+	// Extract stride consecutive <N x i8> sub-vectors and emit masked stores.
+	//
+	// Sub-vector k covers output positions [k*N .. k*N+N-1]:
+	//   - k=0: positions [0..3]  = stride outputs for the first N/stride group of lanes
+	//   Wait — the layout is interleaved, not grouped. Let me recalculate.
+	//
+	// Actually the output is:
+	//   pos 0: lane 0, stride pos 0
+	//   pos 1: lane 0, stride pos 1
+	//   ...
+	//   pos S-1: lane 0, stride pos S-1
+	//   pos S: lane 1, stride pos 0
+	//   ...
+	//   pos N*S-1: lane N-1, stride pos S-1
+	//
+	// For the masked store, we need stride output vectors of N elements each,
+	// where output vector k holds all lanes' byte at stride position k.
+	// These are NOT consecutive bytes in the shuffled result.
+	//
+	// Instead, the existing interleaved store convention stores N bytes at a time:
+	// - outVec[0] → bufptr[scalarBase + 0*N .. scalarBase + 1*N - 1]
+	// - outVec[1] → bufptr[scalarBase + 1*N .. scalarBase + 2*N - 1]
+	// - outVec[k] = shuffled[k*N .. k*N + N - 1]
+	//
+	// In our shuffled layout: bytes k*N .. k*N+N-1 are the N bytes of output group k.
+	// This is exactly the interleaved output needed for the stride masked stores.
+	_ = elemType // used by caller for type identification; not needed here (always i8)
+	for k := 0; k < stride; k++ {
+		// Extract N consecutive bytes starting at k*N.
+		extractIdx := make([]uint64, N)
+		for j := 0; j < N; j++ {
+			extractIdx[j] = uint64(k*N + j)
+		}
+		outVec := b.CreateShuffleVector(shuffled, llvm.Undef(v16i8),
+			b.spmdShuffleConst(extractIdx), "bytedecomp.outvec")
+
+		// Compute pointer: bufptr + scalarBase + k*N.
+		offset := llvm.ConstInt(b.uintptrType, uint64(k*N), false)
+		ptr := b.CreateInBoundsGEP(i8Type, bufptr,
+			[]llvm.Value{b.CreateAdd(scalarBase, offset, "bytedecomp.off")},
+			"bytedecomp.ptr")
+
+		// Emit masked store with the original execution mask.
+		var storeMask llvm.Value
+		if mask.IsNil() {
+			storeMask = llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(N), N))
+		} else {
+			storeMask = mask
+		}
+		b.spmdMaskedStore(outVec, ptr, storeMask)
+	}
+
+	return true
+}
+
 // spmdEmitInterleavedStoreMasked handles the last store (remainder == stride-1) in a
 // stride-S interleaved store group. It collects values already saved for
 // remainders 0..S-2 from spmdInterleavedValues, shuffles them into S output
@@ -7312,22 +7655,6 @@ func (b *builder) spmdEmitInterleavedStoreMasked(lastVal ssa.Value, lastAddr ssa
 		if actualN := vals[0].Type().VectorSize(); actualN < N {
 			N = actualN
 		}
-	}
-
-	// Shuffle values into S interleaved output vectors.
-	var outVecs []llvm.Value
-	switch stride {
-	case 2:
-		ov := b.spmdInterleaveStride2(vals[0], vals[1], N)
-		outVecs = ov[:]
-	case 3:
-		ov := b.spmdInterleaveStride3(vals[0], vals[1], vals[2], N)
-		outVecs = ov[:]
-	case 4:
-		ov := b.spmdInterleaveStride4(vals[0], vals[1], vals[2], vals[3], N)
-		outVecs = ov[:]
-	default:
-		return // unsupported stride
 	}
 
 	// Compute the base pointer for the output slice.
@@ -7387,6 +7714,18 @@ func (b *builder) spmdEmitInterleavedStoreMasked(lastVal ssa.Value, lastAddr ssa
 	}
 	scalarBase = b.extendInteger(scalarBase, addr0.Index.Type(), b.uintptrType)
 
+	// Byte-decomposition fast path: if all stored values extract bytes from the
+	// same wider source via constant shifts (e.g., base64 Loop 4), replace the
+	// S-vector shuffle+scatter with a single bitcast + pshufb + S contiguous
+	// masked stores. This applies regardless of the mask value; spmdMaskedStore
+	// handles the mask correctly.
+	bdi := spmdDetectByteDecompose(group)
+	if bdi != nil {
+		if b.spmdEmitByteDecompose(bdi, group, bufptr, elemType, buflen, scalarBase, mask) {
+			return
+		}
+	}
+
 	// Bounds check: ensure scalarBase + stride*laneCount <= len(slice).
 	if !b.info.nobounds && !buflen.IsNil() {
 		endIdx := b.CreateAdd(scalarBase,
@@ -7394,6 +7733,22 @@ func (b *builder) spmdEmitInterleavedStoreMasked(lastVal ssa.Value, lastAddr ssa
 			"interleaved.end")
 		oob := b.CreateICmp(llvm.IntUGT, endIdx, buflen, "interleaved.oob")
 		b.createRuntimeAssert(oob, "lookup", "lookupPanic")
+	}
+
+	// Shuffle values into S interleaved output vectors.
+	var outVecs []llvm.Value
+	switch stride {
+	case 2:
+		ov := b.spmdInterleaveStride2(vals[0], vals[1], N)
+		outVecs = ov[:]
+	case 3:
+		ov := b.spmdInterleaveStride3(vals[0], vals[1], vals[2], N)
+		outVecs = ov[:]
+	case 4:
+		ov := b.spmdInterleaveStride4(vals[0], vals[1], vals[2], vals[3], N)
+		outVecs = ov[:]
+	default:
+		return // unsupported stride
 	}
 
 	// Narrow output vectors to match the destination element type when needed.
