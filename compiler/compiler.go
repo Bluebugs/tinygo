@@ -2854,6 +2854,17 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				// A ChangeType from scalar aggregateT to [N x aggregateT] means
 				// "broadcast" the scalar value into all N array slots.
 				// For N=1 (serial/degenerate case), this inserts into slot 0.
+				//
+				// Special case: if x is already [M x T] (an aggregate-varying value
+				// produced by the SPMD loop with actual lane count M) but llvmType is
+				// [1 x T] (getLLVMType returns laneCount=1 for non-vectorizable elems),
+				// use x directly. The actual lane count comes from the loop, not the
+				// type system's conservative estimate.
+				if x.Type().TypeKind() == llvm.ArrayTypeKind &&
+					x.Type().ElementType() == llvmType.ElementType() {
+					changeTypeResult = x
+					break
+				}
 				n := llvmType.ArrayLength()
 				arr := llvm.Undef(llvmType)
 				for i := 0; i < n; i++ {

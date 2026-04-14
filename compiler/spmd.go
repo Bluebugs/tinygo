@@ -429,7 +429,13 @@ func (b *builder) spmdRangeIndexLaneCount(boundValue ssa.Value, bodyBlock *ssa.B
 			if len(call.Call.Args) == 1 {
 				arg := call.Call.Args[0]
 				if sliceType, ok := arg.Type().Underlying().(*types.Slice); ok {
-					elemLLVM := b.getLLVMType(sliceType.Elem())
+					elemType := sliceType.Elem()
+					// Peel through nested slices: for [][]T, use T's size.
+					// This enables N>1 for go-for over slice-of-slices.
+					if innerSlice, ok := elemType.Underlying().(*types.Slice); ok {
+						elemType = innerSlice.Elem()
+					}
+					elemLLVM := b.getLLVMType(elemType)
 					return b.spmdLaneCount(elemLLVM)
 				}
 			}
