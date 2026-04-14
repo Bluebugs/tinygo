@@ -2872,7 +2872,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 						if srcPtrT, ok := expr.X.Type().Underlying().(*types.Pointer); ok {
 							if spmdT, ok2 := srcPtrT.Elem().(*types.SPMDType); ok2 && spmdT.IsVarying() {
 								allocaElemType := b.getLLVMType(spmdT.Elem())
-								laneCount := llvmType.VectorSize()
+								laneCount := b.spmdLaneCount(allocaElemType)
 								changeTypeResult = b.spmdVaryingAllocToPerLanePtrs(x, allocaElemType, laneCount)
 								break
 							}
