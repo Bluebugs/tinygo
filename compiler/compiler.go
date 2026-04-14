@@ -3816,10 +3816,6 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		return b.createUnOp(expr)
 	case *ssa.SPMDSelect:
 		return b.createSPMDSelect(expr), nil
-	case *ssa.SPMDMux:
-		return b.createSPMDMux(expr), nil
-	case *ssa.SPMDInterleaveStore:
-		return b.createSPMDInterleaveStore(expr), nil
 	case *ssa.SPMDLoad:
 		return b.createSPMDLoad(expr), nil
 	case *ssa.SPMDIndex:
