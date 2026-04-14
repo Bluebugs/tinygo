@@ -2407,14 +2407,14 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 					if arg.IsNil() {
 						continue
 					}
-					if arg.Type().TypeKind() != llvm.VectorTypeKind {
-						continue
-					}
 					calleeIdx := calleeParamStart + i
 					if calleeIdx >= len(calleeParamTypes) {
 						break
 					}
 					expectedType := calleeParamTypes[calleeIdx]
+					if arg.Type().TypeKind() != llvm.VectorTypeKind {
+						continue
+					}
 					if expectedType.TypeKind() != llvm.VectorTypeKind {
 						continue
 					}
@@ -2862,6 +2862,22 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				changeTypeResult = arr
 			case llvm.VectorTypeKind:
 				if x.Type().TypeKind() != llvm.VectorTypeKind {
+					// SPMD: &Varying[T] → Varying[*T] per-lane pointer conversion.
+					// When the source type is *Varying[T] (pointer to a varying alloca)
+					// and the destination is Varying[*T] (vector of per-lane pointers),
+					// emit per-lane GEPs — one pointer to each lane's slot — instead of
+					// splatting the same alloca address to all lanes. Splatting would
+					// make every lane read/write through the same address (lane 0 only).
+					if llvmType.ElementType() == b.dataPtrType {
+						if srcPtrT, ok := expr.X.Type().Underlying().(*types.Pointer); ok {
+							if spmdT, ok2 := srcPtrT.Elem().(*types.SPMDType); ok2 && spmdT.IsVarying() {
+								allocaElemType := b.getLLVMType(spmdT.Elem())
+								laneCount := llvmType.VectorSize()
+								changeTypeResult = b.spmdVaryingAllocToPerLanePtrs(x, allocaElemType, laneCount)
+								break
+							}
+						}
+					}
 					// Scalar to vector: broadcast (splat) the scalar.
 					changeTypeResult = b.splatScalar(x, llvmType)
 				} else if x.Type().ElementType() == llvmType.ElementType() {

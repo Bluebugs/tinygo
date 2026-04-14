@@ -8666,6 +8666,34 @@ func (b *builder) spmdPerLaneGather(elemType llvm.Type, ptrs, mask llvm.Value, l
 	return result
 }
 
+// spmdVaryingAllocToPerLanePtrs produces a <laneCount x ptr> vector from an
+// alloca that stores a Varying[T] value (i.e., a <N x T> vector in LLVM).
+// Each element of the result vector is a pointer to the corresponding lane's
+// scalar storage slot within the alloca.
+//
+// The alloca is logically a flat array of N elements of laneElemType T.
+// GEP with a single index treats the alloca as *T, yielding &alloca[lane].
+// This is correct because the LLVM vector <N x T> is stored contiguously as
+// N consecutive T elements in memory.
+//
+// Used when &varyingVar produces Varying[*T] (via ChangeType in go/ssa):
+// instead of splatting the alloca's base address to all N lanes (which makes
+// all lanes access the same slot), emit per-lane GEPs so each lane has its
+// own pointer into the alloca storage.
+func (b *builder) spmdVaryingAllocToPerLanePtrs(alloca llvm.Value, laneElemType llvm.Type, laneCount int) llvm.Value {
+	i32Type := b.ctx.Int32Type()
+	ptrVecType := llvm.VectorType(b.dataPtrType, laneCount)
+	result := llvm.Undef(ptrVecType)
+	for lane := 0; lane < laneCount; lane++ {
+		laneIdx := llvm.ConstInt(i32Type, uint64(lane), false)
+		// Single-index GEP: treat alloca as *T and index by lane offset.
+		// Result is a pointer to the lane-th element in the contiguous storage.
+		gep := b.CreateInBoundsGEP(laneElemType, alloca, []llvm.Value{laneIdx}, "varyingaddr.gep")
+		result = b.CreateInsertElement(result, gep, laneIdx, "")
+	}
+	return result
+}
+
 // createSPMDLoad emits LLVM IR for an SPMDLoad instruction.
 // SPMDLoad loads from Addr only for lanes where Mask is active.
 // Inactive lanes receive a zero value. It is the predicated replacement
@@ -8930,7 +8958,9 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 	// may still be scalar (e.g., int32, *int32). SPMDStore needs vector
 	// operands, so splat scalar values using the active loop's lane count.
 	if val.Type().TypeKind() != llvm.VectorTypeKind {
-		// Scalar value: splat to vector.
+		// The predicated SSA pass copies Store operands directly; the SSA
+		// types may still be scalar (e.g., int32). Splat scalar values using
+		// the active loop's lane count.
 		val = b.splatScalar(val, llvm.VectorType(val.Type(), laneCount))
 	}
 
