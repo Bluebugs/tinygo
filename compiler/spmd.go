@@ -894,9 +894,10 @@ type spmdActiveLoop struct {
 	incrBinOp   *ssa.BinOp        // the ADD in the loop block
 
 	// Range-over-slice specific fields (isRangeIndex == true):
-	isRangeIndex  bool      // true for rangeindex pattern (range-over-slice)
-	bodyIterValue ssa.Value // value body uses as index: iterPhi (rangeint) or incrBinOp (rangeindex)
-	initEdgeIndex int       // phi edge index for the entry predecessor (rangeindex only; -1 for rangeint)
+	isRangeIndex     bool      // true for rangeindex pattern (range-over-slice)
+	bodyIterValue    ssa.Value // value body uses as index: iterPhi (rangeint) or incrBinOp (rangeindex)
+	initEdgeIndex    int       // phi edge index for the entry predecessor (rangeindex only; -1 for rangeint)
+	isDivergentInner bool      // true when boundValue has Varying type (each lane iterates its own slice)
 
 	// Decomposed index fields (isDecomposed == true):
 	// When laneCount > 4 on WASM (e.g., 16 for byte), a naive <16 x i32> index vector
@@ -1430,6 +1431,8 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			isDecomposed:  isDecomposed,
 			bodyIterValue: incrBinOp, // rangeindex: body uses the incr BinOp
 			initEdgeIndex: initEdgeIndex,
+			// isDivergentInner is set lazily in emitSPMDBodyPrologue when the
+			// compiled bound value turns out to be a vector (len(Varying[[]T])).
 		}
 
 		// Register both loopPhi and incrBinOp as keys so IndexAddr contiguous
@@ -1493,6 +1496,13 @@ func (b *builder) spmdRangeIndexInitOverride(phi *ssa.Phi, i int, val llvm.Value
 		return val
 	}
 	if i == loop.initEdgeIndex {
+		// For divergent inner loops (each lane iterates its own Varying[[]T] slice),
+		// the step is 1 (not laneCount), so the init stays -1 (standard rangeindex).
+		// For regular SPMD loops, the step is laneCount, so init must be -laneCount
+		// so the first body visit produces index 0 (= -laneCount + laneCount).
+		if loop.isDivergentInner {
+			return llvm.ConstInt(val.Type(), ^uint64(0), false) // -1 as unsigned
+		}
 		return llvm.ConstInt(val.Type(), uint64(int64(-loop.laneCount)), true)
 	}
 	return val
@@ -1593,31 +1603,56 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 				loop.tailMask = llvm.ConstAllOnes(maskType)
 			} else {
 				// Tail mask via <N x i8> comparison: offset < clamp(bound - base).
-				// All arithmetic is done in i32 regardless of target pointer width.
-				// On x86-64 the iterator phi is i64, so truncate both operands to i32
-				// before the subtraction. The result is always in [0, laneCount] which
-				// fits safely in i8 after clamping.
+				// All arithmetic is done in i32. For divergent inner loops
+				// (Varying[[]T] range), the bound is a <N x i32> vector and each
+				// lane's diff is computed independently.
 				i32Type := b.ctx.Int32Type()
-				boundScalar := b.spmdBoundScalar(loop, i32Type)
-				// Ensure boundScalar is i32 for the sub/clamp arithmetic.
-				if boundScalar.Type() != i32Type {
-					boundScalar = b.CreateTrunc(boundScalar, i32Type, "spmd.bound.narrow")
-				}
+				boundRaw := b.spmdBoundScalar(loop, i32Type)
 				scalarPhiI32 := scalarPhi
 				if scalarPhiI32.Type() != i32Type {
 					scalarPhiI32 = b.CreateTrunc(scalarPhiI32, i32Type, "spmd.base.narrow")
 				}
-				diff := b.CreateSub(boundScalar, scalarPhiI32, "spmd.diff")
 				zero32 := llvm.ConstInt(i32Type, 0, false)
 				lcConst := llvm.ConstInt(i32Type, uint64(laneCount), false)
-				diffClamped := b.CreateSelect(
-					b.CreateICmp(llvm.IntSGT, diff, lcConst, ""),
-					lcConst, diff, "spmd.diff.clamped")
-				diffClamped = b.CreateSelect(
-					b.CreateICmp(llvm.IntSLT, diffClamped, zero32, ""),
-					zero32, diffClamped, "spmd.diff.nonneg")
-				diffI8 := b.CreateTrunc(diffClamped, i8Type, "spmd.diff.i8")
-				diffVec := b.splatScalar(diffI8, llvm.VectorType(i8Type, laneCount))
+				i8VecType := llvm.VectorType(i8Type, laneCount)
+				var diffVec llvm.Value
+				if boundRaw.Type().TypeKind() == llvm.VectorTypeKind {
+					// Varying bound: per-lane diff.
+					var boundVec llvm.Value
+					if boundRaw.Type().ElementType() == i32Type {
+						boundVec = boundRaw
+					} else if b.targetData.TypeAllocSize(boundRaw.Type().ElementType()) > 4 {
+						boundVec = b.CreateTrunc(boundRaw, llvm.VectorType(i32Type, laneCount), "spmd.bound.narrow")
+					} else {
+						boundVec = b.CreateZExt(boundRaw, llvm.VectorType(i32Type, laneCount), "spmd.bound.zext")
+					}
+					baseVec := b.splatScalar(scalarPhiI32, llvm.VectorType(i32Type, laneCount))
+					diffI32Vec := b.CreateSub(boundVec, baseVec, "spmd.diff")
+					lcVec := b.splatScalar(lcConst, llvm.VectorType(i32Type, laneCount))
+					zeroVec := llvm.ConstNull(llvm.VectorType(i32Type, laneCount))
+					clampedVec := b.CreateSelect(
+						b.CreateICmp(llvm.IntSGT, diffI32Vec, lcVec, ""),
+						lcVec, diffI32Vec, "spmd.diff.clamped")
+					clampedVec = b.CreateSelect(
+						b.CreateICmp(llvm.IntSLT, clampedVec, zeroVec, ""),
+						zeroVec, clampedVec, "spmd.diff.nonneg")
+					diffVec = b.CreateTrunc(clampedVec, i8VecType, "spmd.diff.i8vec")
+				} else {
+					// Scalar (uniform) bound.
+					boundScalar := boundRaw
+					if boundScalar.Type() != i32Type {
+						boundScalar = b.CreateTrunc(boundScalar, i32Type, "spmd.bound.narrow")
+					}
+					diff := b.CreateSub(boundScalar, scalarPhiI32, "spmd.diff")
+					diffClamped := b.CreateSelect(
+						b.CreateICmp(llvm.IntSGT, diff, lcConst, ""),
+						lcConst, diff, "spmd.diff.clamped")
+					diffClamped = b.CreateSelect(
+						b.CreateICmp(llvm.IntSLT, diffClamped, zero32, ""),
+						zero32, diffClamped, "spmd.diff.nonneg")
+					diffI8 := b.CreateTrunc(diffClamped, i8Type, "spmd.diff.i8")
+					diffVec = b.splatScalar(diffI8, i8VecType)
+				}
 				tailMaskI1 := b.CreateICmp(llvm.IntULT, varyingOffset, diffVec, "spmd.tail.mask")
 				loop.tailMask = b.spmdWrapMask(tailMaskI1, laneCount)
 				if ssaLoop.TailMask != nil {
@@ -1649,7 +1684,20 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 		}
 		vecType := llvm.VectorType(narrowedElemType, loop.laneCount)
 		iterVec := b.splatScalar(narrowedPhi, vecType)
-		offsetVec := b.spmdLaneOffsetConst(loop.laneCount, narrowedElemType)
+		// For divergent inner loops (Varying[[]T] range), the bound is a <N x T>
+		// vector: each lane has its own length and iterates with the same counter.
+		// In that case all lanes share the same index (offsetVec = zero), so that
+		// tailMask[i] = iter < len[i] rather than iter+i < len[i].
+		boundRawPeek := b.spmdBoundScalar(loop, narrowedElemType)
+		isDivergentInner := boundRawPeek.Type().TypeKind() == llvm.VectorTypeKind
+		// Persist so spmdRangeIndexInitOverride can use it at phi-resolution time.
+		loop.isDivergentInner = isDivergentInner
+		var offsetVec llvm.Value
+		if isDivergentInner {
+			offsetVec = llvm.ConstNull(vecType)
+		} else {
+			offsetVec = b.spmdLaneOffsetConst(loop.laneCount, narrowedElemType)
+		}
 		laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
 		loop.laneIndices = laneIndices
 
@@ -1674,16 +1722,35 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 			}
 		} else {
 			// Tail body: compute tail mask (laneIndices < bound).
-			boundScalar := b.spmdBoundScalar(loop, narrowedElemType)
-			// Narrow or extend bound to match the (possibly narrowed) narrowedElemType.
-			if boundScalar.Type() != narrowedElemType {
-				if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(narrowedElemType) {
-					boundScalar = b.CreateTrunc(boundScalar, narrowedElemType, "spmd.bound.narrow")
+			// For divergent inner loops (Varying[[]T] range), the bound is already
+			// a <N x T> vector; use it directly instead of splatting a scalar.
+			boundRaw := b.spmdBoundScalar(loop, narrowedElemType)
+			var boundVec llvm.Value
+			if boundRaw.Type().TypeKind() == llvm.VectorTypeKind {
+				// Varying bound: narrow/extend element type if needed.
+				if boundRaw.Type().VectorSize() == loop.laneCount &&
+					boundRaw.Type().ElementType() == narrowedElemType {
+					boundVec = boundRaw
 				} else {
-					boundScalar = b.CreateZExt(boundScalar, narrowedElemType, "spmd.bound.zext")
+					targetVT := llvm.VectorType(narrowedElemType, loop.laneCount)
+					if b.targetData.TypeAllocSize(boundRaw.Type().ElementType()) > b.targetData.TypeAllocSize(narrowedElemType) {
+						boundVec = b.CreateTrunc(boundRaw, targetVT, "spmd.bound.narrow")
+					} else {
+						boundVec = b.CreateZExt(boundRaw, targetVT, "spmd.bound.zext")
+					}
 				}
+			} else {
+				// Scalar (uniform) bound: narrow/extend then splat.
+				boundScalar := boundRaw
+				if boundScalar.Type() != narrowedElemType {
+					if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(narrowedElemType) {
+						boundScalar = b.CreateTrunc(boundScalar, narrowedElemType, "spmd.bound.narrow")
+					} else {
+						boundScalar = b.CreateZExt(boundScalar, narrowedElemType, "spmd.bound.zext")
+					}
+				}
+				boundVec = b.splatScalar(boundScalar, vecType)
 			}
-			boundVec := b.splatScalar(boundScalar, vecType)
 			tailMaskI1 := b.CreateICmp(llvm.IntSLT, laneIndices, boundVec, "spmd.tail.mask")
 			loop.tailMask = b.spmdWrapMask(tailMaskI1, loop.laneCount)
 			// Register SSA TailMask so getValue() can resolve it directly.
@@ -1737,39 +1804,63 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 		}
 
 		// Compute tail mask using <N x i8> comparison to stay within the natural
-		// SIMD register. diff = bound - base (scalar i32); clamp to [0, laneCount];
-		// truncate to i8. Then compare: offset < clamp(diff) using unsigned <N x i8>.
-		// All arithmetic is done in i32 regardless of target pointer width. On
-		// x86-64 the iterator is i64, so both operands are truncated to i32 first.
-		// The result is always in [0, laneCount] which fits in i8 after clamping.
-		boundScalar := b.spmdBoundScalar(loop, i32Type)
-		// Ensure boundScalar is i32 for the sub/clamp arithmetic.
-		if boundScalar.Type() != i32Type {
-			boundScalar = b.CreateTrunc(boundScalar, i32Type, "spmd.bound.narrow")
-		}
+		// SIMD register. diff = bound - base (scalar or vector i32); clamp to
+		// [0, laneCount]; truncate to i8. Then compare: offset < clamp(diff).
+		// All arithmetic is done in i32. On x86-64 the iterator is i64, so
+		// both operands are truncated to i32 first.
+		// For divergent inner loops (Varying[[]T] range) the bound is a
+		// <N x i32> vector; each lane's diff is computed independently.
+		boundRaw := b.spmdBoundScalar(loop, i32Type)
 		scalarPhiI32 := scalarPhi
 		if scalarPhiI32.Type() != i32Type {
 			scalarPhiI32 = b.CreateTrunc(scalarPhiI32, i32Type, "spmd.base.narrow")
 		}
-		diff := b.CreateSub(boundScalar, scalarPhiI32, "spmd.diff")
-
-		// Clamp diff to [0, laneCount]: max(0, min(laneCount, diff)).
 		zero32 := llvm.ConstInt(i32Type, 0, false)
 		lcConst := llvm.ConstInt(i32Type, uint64(laneCount), false)
-		// min(laneCount, diff): if diff > laneCount, use laneCount
-		diffClamped := b.CreateSelect(
-			b.CreateICmp(llvm.IntSGT, diff, lcConst, ""),
-			lcConst, diff, "spmd.diff.clamped")
-		// max(0, clamped): if clamped < 0, use 0
-		diffClamped = b.CreateSelect(
-			b.CreateICmp(llvm.IntSLT, diffClamped, zero32, ""),
-			zero32, diffClamped, "spmd.diff.nonneg")
 
-		// Truncate clamped diff to i8 (safe: value is in [0, laneCount=16]).
-		diffI8 := b.CreateTrunc(diffClamped, i8Type, "spmd.diff.i8")
+		var diffVec llvm.Value
+		i8VecType := llvm.VectorType(i8Type, laneCount)
 
-		// Splat diffI8 to <N x i8> for vector comparison.
-		diffVec := b.splatScalar(diffI8, llvm.VectorType(i8Type, laneCount))
+		if boundRaw.Type().TypeKind() == llvm.VectorTypeKind {
+			// Varying bound: per-lane diff = boundVec[lane] - base.
+			// Ensure element type is i32.
+			var boundVec llvm.Value
+			if boundRaw.Type().ElementType() == i32Type {
+				boundVec = boundRaw
+			} else if b.targetData.TypeAllocSize(boundRaw.Type().ElementType()) > 4 {
+				boundVec = b.CreateTrunc(boundRaw, llvm.VectorType(i32Type, laneCount), "spmd.bound.narrow")
+			} else {
+				boundVec = b.CreateZExt(boundRaw, llvm.VectorType(i32Type, laneCount), "spmd.bound.zext")
+			}
+			baseVec := b.splatScalar(scalarPhiI32, llvm.VectorType(i32Type, laneCount))
+			diffI32Vec := b.CreateSub(boundVec, baseVec, "spmd.diff")
+			// Clamp per-lane: max(0, min(laneCount, diff)).
+			lcVec := b.splatScalar(lcConst, llvm.VectorType(i32Type, laneCount))
+			zeroVec := llvm.ConstNull(llvm.VectorType(i32Type, laneCount))
+			clampedVec := b.CreateSelect(
+				b.CreateICmp(llvm.IntSGT, diffI32Vec, lcVec, ""),
+				lcVec, diffI32Vec, "spmd.diff.clamped")
+			clampedVec = b.CreateSelect(
+				b.CreateICmp(llvm.IntSLT, clampedVec, zeroVec, ""),
+				zeroVec, clampedVec, "spmd.diff.nonneg")
+			diffVec = b.CreateTrunc(clampedVec, i8VecType, "spmd.diff.i8vec")
+		} else {
+			// Scalar (uniform) bound: original scalar diff path.
+			boundScalar := boundRaw
+			if boundScalar.Type() != i32Type {
+				boundScalar = b.CreateTrunc(boundScalar, i32Type, "spmd.bound.narrow")
+			}
+			diff := b.CreateSub(boundScalar, scalarPhiI32, "spmd.diff")
+			// Clamp diff to [0, laneCount]: max(0, min(laneCount, diff)).
+			diffClamped := b.CreateSelect(
+				b.CreateICmp(llvm.IntSGT, diff, lcConst, ""),
+				lcConst, diff, "spmd.diff.clamped")
+			diffClamped = b.CreateSelect(
+				b.CreateICmp(llvm.IntSLT, diffClamped, zero32, ""),
+				zero32, diffClamped, "spmd.diff.nonneg")
+			diffI8 := b.CreateTrunc(diffClamped, i8Type, "spmd.diff.i8")
+			diffVec = b.splatScalar(diffI8, i8VecType)
+		}
 
 		// Compute: offset < clamp(diff) using unsigned comparison.
 		tailMaskI1 := b.CreateICmp(llvm.IntULT, varyingOffset, diffVec, "spmd.tail.mask")
@@ -1811,23 +1902,53 @@ func (b *builder) emitSPMDBodyPrologue(loop *spmdActiveLoop) {
 	// Splat the scalar iterator across all lanes.
 	iterVec := b.splatScalar(narrowedPhi, vecType)
 
-	// Create the offset constant <0, 1, 2, ..., laneCount-1>.
-	offsetVec := b.spmdLaneOffsetConst(loop.laneCount, narrowedElemType)
-
-	// Compute lane indices: <iter, iter+1, iter+2, ..., iter+laneCount-1>.
-	laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
-
-	// Get the bound value and splat it.
+	// Get the bound value early so we can detect divergent inner loops.
+	// For divergent inner loops (Varying[[]T] range), the bound is already a
+	// <N x T> vector (one length per lane). In that case all lanes share the
+	// same iterator index (offsetVec = zero) so that
+	// tailMask[i] = iter < len[i] rather than iter+i < len[i].
 	boundScalar := b.spmdBoundScalar(loop, narrowedElemType)
-	// Narrow or extend bound to match the (possibly narrowed) narrowedElemType.
-	if boundScalar.Type() != narrowedElemType {
-		if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(narrowedElemType) {
-			boundScalar = b.CreateTrunc(boundScalar, narrowedElemType, "spmd.bound.narrow")
-		} else {
-			boundScalar = b.CreateZExt(boundScalar, narrowedElemType, "spmd.bound.zext")
-		}
+	isDivergentInner := boundScalar.Type().TypeKind() == llvm.VectorTypeKind
+	// Persist so spmdRangeIndexInitOverride can use it at phi-resolution time.
+	loop.isDivergentInner = isDivergentInner
+
+	var offsetVec llvm.Value
+	if isDivergentInner {
+		offsetVec = llvm.ConstNull(vecType)
+	} else {
+		// Create the offset constant <0, 1, 2, ..., laneCount-1>.
+		offsetVec = b.spmdLaneOffsetConst(loop.laneCount, narrowedElemType)
 	}
-	boundVec := b.splatScalar(boundScalar, vecType)
+
+	// Compute lane indices: <iter, iter+1, ..., iter+laneCount-1> for regular
+	// loops, or <iter, iter, ..., iter> for divergent inner loops.
+	laneIndices := b.CreateAdd(iterVec, offsetVec, "spmd.lane.idx")
+	var boundVec llvm.Value
+	if boundScalar.Type().TypeKind() == llvm.VectorTypeKind {
+		// Varying bound: each lane has its own length.
+		if boundScalar.Type().VectorSize() == loop.laneCount &&
+			boundScalar.Type().ElementType() == narrowedElemType {
+			boundVec = boundScalar
+		} else {
+			// Truncate or extend element type to match narrowedElemType.
+			targetVecType := llvm.VectorType(narrowedElemType, loop.laneCount)
+			if b.targetData.TypeAllocSize(boundScalar.Type().ElementType()) > b.targetData.TypeAllocSize(narrowedElemType) {
+				boundVec = b.CreateTrunc(boundScalar, targetVecType, "spmd.bound.narrow")
+			} else {
+				boundVec = b.CreateZExt(boundScalar, targetVecType, "spmd.bound.zext")
+			}
+		}
+	} else {
+		// Narrow or extend bound to match the (possibly narrowed) narrowedElemType.
+		if boundScalar.Type() != narrowedElemType {
+			if b.targetData.TypeAllocSize(boundScalar.Type()) > b.targetData.TypeAllocSize(narrowedElemType) {
+				boundScalar = b.CreateTrunc(boundScalar, narrowedElemType, "spmd.bound.narrow")
+			} else {
+				boundScalar = b.CreateZExt(boundScalar, narrowedElemType, "spmd.bound.zext")
+			}
+		}
+		boundVec = b.splatScalar(boundScalar, vecType)
+	}
 
 	// Compute tail mask: laneIndices < bound (per-lane comparison).
 	// Use IntSLT for signed comparison since Go's int is signed.
@@ -2747,6 +2868,60 @@ func (b *builder) spmdIsVaryingBoolPhi(phi *ssa.Phi) bool {
 	elem := spmdType.Elem().Underlying()
 	basic, ok := elem.(*types.Basic)
 	return ok && basic.Info()&types.IsBoolean != 0
+}
+
+// spmdPhiNeedsVectorPromotion reports whether a scalar phi should be promoted
+// to a vector phi because one or more of its back-edge values traces through
+// an element access on a Varying[[]T] slice. This occurs in divergent inner
+// loops: "for _, v := range secondLevel" where secondLevel is Varying[[]T].
+// Each SPMD lane accesses a different element, producing a per-lane (vector)
+// value that accumulates into the phi.
+func (b *builder) spmdPhiNeedsVectorPromotion(phi *ssa.Phi) bool {
+	// Only scalar-typed phis are candidates (vector types don't need promotion).
+	if _, ok := phi.Type().(*types.SPMDType); ok {
+		return false // already SPMD-typed
+	}
+	// Check each back-edge value: does it trace to a Varying[[]T] element access?
+	for _, edge := range phi.Edges {
+		if spmdEdgeIsVaryingSliceElem(edge, 0) {
+			return true
+		}
+	}
+	return false
+}
+
+// spmdEdgeIsVaryingSliceElem reports whether val traces back to an element
+// access on a Varying[[]T] slice (i.e., *IndexAddr(Varying[[]T], _)). Uses a
+// depth-limited search through BinOp/ChangeType chains to avoid recursion blowup.
+func spmdEdgeIsVaryingSliceElem(val ssa.Value, depth int) bool {
+	if depth > 8 {
+		return false
+	}
+	switch v := val.(type) {
+	case *ssa.UnOp:
+		if v.Op != token.MUL {
+			return false
+		}
+		// Dereference: check if the pointer came from IndexAddr(Varying[[]T], _).
+		return spmdEdgeIsVaryingSliceElem(v.X, depth+1)
+	case *ssa.IndexAddr:
+		// IndexAddr(X, _) where X.Type().Underlying() is a Varying[[]T].
+		xType := v.X.Type()
+		if spmdT, ok := xType.(*types.SPMDType); ok && spmdT.IsVarying() {
+			if _, ok := spmdT.Elem().Underlying().(*types.Slice); ok {
+				return true
+			}
+		}
+		return false
+	case *ssa.BinOp:
+		return spmdEdgeIsVaryingSliceElem(v.X, depth+1) || spmdEdgeIsVaryingSliceElem(v.Y, depth+1)
+	case *ssa.ChangeType:
+		return spmdEdgeIsVaryingSliceElem(v.X, depth+1)
+	case *ssa.Phi:
+		// Phi back-edges can form cycles — limit to depth 0 (don't recurse into phis).
+		return false
+	}
+	return false
 }
 
 // spmdFindActiveLoopForBlock returns the active SPMD loop for the given SSA

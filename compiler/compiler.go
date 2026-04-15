@@ -206,6 +206,13 @@ type builder struct {
 	// inside the body block where spmdValueOverride is active). This map is never cleared
 	// between blocks (unlike spmdValueOverride) so it is always accessible at phi resolution.
 	spmdPeeledScalarIncr map[ssa.Value]llvm.Value
+	// spmdVaryingSliceGatherMask maps an IndexAddr SSA value (of type Varying[[]T]) to the
+	// <N x i1> per-lane active mask computed as "scalarIndex < len[lane]". Used by the
+	// UnOp MUL (dereference) handler to supply the correct masked-gather mask for divergent
+	// inner loops where each SPMD lane iterates over its own varying-length slice.
+	// Without this, the outer loop's tailMask (all-active) would be used, causing inactive
+	// lanes to load garbage in x86 (WASM memory is zero-init so that target is unaffected).
+	spmdVaryingSliceGatherMask map[ssa.Value]llvm.Value
 	// spmdVecShadow tracks shadow vector values for allocas promoted by
 	// spmdPromoteByteArrayCopyToVector. Nil when no such alloca exists.
 	spmdVecShadow *spmdVecShadowState
@@ -1688,6 +1695,14 @@ func (b *builder) createFunction() {
 	// Resolve phi nodes
 	for _, phi := range b.phis {
 		block := phi.ssa.Block()
+
+		// Pre-compute all incoming LLVM values and blocks so we can detect
+		// SPMD scalar-phi-needs-vector-promotion before calling AddIncoming.
+		type phiIncoming struct {
+			val   llvm.Value
+			block llvm.BasicBlock
+		}
+		incoming := make([]phiIncoming, len(phi.ssa.Edges))
 		for i, edge := range phi.ssa.Edges {
 			llvmVal := b.getValue(edge, getPos(phi.ssa))
 			// SPMD: for peeled rangeindex loops, the incrBinOp (mainIterPhi + laneCount)
@@ -1746,9 +1761,33 @@ func (b *builder) createFunction() {
 					b.SetInsertPointAtEnd(savedBlock)
 				}
 			}
-			phi.llvm.AddIncoming([]llvm.Value{llvmVal}, []llvm.BasicBlock{llvmBlock})
+			incoming[i] = phiIncoming{val: llvmVal, block: llvmBlock}
 		}
 
+		// SPMD divergent inner loop: if the phi was promoted to a vector type
+		// (e.g., accumulator "t" in "for range Varying[[]T]"), scalar incoming values
+		// (such as the initial "t := 0") must be splatted to match the vector phi type.
+		if b.spmdLoopState != nil && phi.llvm.Type().TypeKind() == llvm.VectorTypeKind {
+			vecType := phi.llvm.Type()
+			for i, inc := range incoming {
+				if inc.val.Type().TypeKind() != llvm.VectorTypeKind {
+					// Splat scalar incoming value to vector in the predecessor block.
+					savedBlock := b.GetInsertBlock()
+					terminator := inc.block.LastInstruction()
+					if !terminator.IsNil() {
+						b.SetInsertPointBefore(terminator)
+					} else {
+						b.SetInsertPointAtEnd(inc.block)
+					}
+					incoming[i].val = b.splatScalar(b.spmdConvertScalarToElem(inc.val, vecType.ElementType(), false), vecType)
+					b.SetInsertPointAtEnd(savedBlock)
+				}
+			}
+		}
+
+		for _, inc := range incoming {
+			phi.llvm.AddIncoming([]llvm.Value{inc.val}, []llvm.BasicBlock{inc.block})
+		}
 	}
 
 	if b.NeedsStackObjects {
@@ -1893,6 +1932,13 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			b.CreateCondBr(combinedExit, blockElse, blockThen)
 			return
 		}
+		// SPMD divergent inner loop: if the loop-back-edge condition is a vector
+		// (e.g., "i < len(Varying[[]T])"), reduce it to a scalar i1 via anyTrue.
+		// The loop continues while at least one lane still has elements; inactive
+		// lanes are masked out by the tailMask computed in emitSPMDBodyPrologue.
+		if cond.Type().TypeKind() == llvm.VectorTypeKind {
+			cond = b.spmdVectorAnyTrue(cond)
+		}
 		b.CreateCondBr(cond, blockThen, blockElse)
 	case *ssa.Jump:
 		succIdx := instr.Block().Succs[0].Index
@@ -2014,10 +2060,25 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		case *types.Chan:
 			llvmCap = b.createRuntimeCall("chanCap", []llvm.Value{value}, "cap")
 		case *types.Slice:
-			// Varying[[]T] lowers to [N x sliceStruct]; extract cap from lane 0.
+			// Varying[[]T] lowers to [N x sliceStruct] (array, not vector) because
+			// LLVM forbids vectors of aggregate types. Extract cap from each lane.
 			if value.Type().TypeKind() == llvm.ArrayTypeKind {
-				lane0 := b.CreateExtractValue(value, 0, "lane0.slice")
-				llvmCap = b.CreateExtractValue(lane0, 2, "cap")
+				laneCount := value.Type().ArrayLength()
+				if laneCount > 1 {
+					i32Type := b.ctx.Int32Type()
+					capType := b.CreateExtractValue(b.CreateExtractValue(value, 0, ""), 2, "").Type()
+					vecCap := llvm.Undef(llvm.VectorType(capType, laneCount))
+					for lane := 0; lane < laneCount; lane++ {
+						laneSlice := b.CreateExtractValue(value, lane, "")
+						laneCap := b.CreateExtractValue(laneSlice, 2, "cap.lane")
+						vecCap = b.CreateInsertElement(vecCap, laneCap,
+							llvm.ConstInt(i32Type, uint64(lane), false), "")
+					}
+					llvmCap = vecCap
+				} else {
+					lane0 := b.CreateExtractValue(value, 0, "lane0.slice")
+					llvmCap = b.CreateExtractValue(lane0, 2, "cap")
+				}
 			} else {
 				llvmCap = b.CreateExtractValue(value, 2, "cap")
 			}
@@ -2130,10 +2191,24 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		case *types.Basic, *types.Slice:
 			// string or slice — but Varying[[]T] lowers to [N x sliceStruct] (array,
 			// not vector) because LLVM forbids vectors of aggregate types.
-			// Extract lane 0's slice header and read its length field.
+			// Extract len from each lane to build a <N x lenType> vector.
 			if value.Type().TypeKind() == llvm.ArrayTypeKind {
-				lane0 := b.CreateExtractValue(value, 0, "lane0.slice")
-				llvmLen = b.CreateExtractValue(lane0, 1, "len")
+				laneCount := value.Type().ArrayLength()
+				if laneCount > 1 {
+					i32Type := b.ctx.Int32Type()
+					lenType := b.CreateExtractValue(b.CreateExtractValue(value, 0, ""), 1, "").Type()
+					vecLen := llvm.Undef(llvm.VectorType(lenType, laneCount))
+					for lane := 0; lane < laneCount; lane++ {
+						laneSlice := b.CreateExtractValue(value, lane, "")
+						laneLen := b.CreateExtractValue(laneSlice, 1, "len.lane")
+						vecLen = b.CreateInsertElement(vecLen, laneLen,
+							llvm.ConstInt(i32Type, uint64(lane), false), "")
+					}
+					llvmLen = vecLen
+				} else {
+					lane0 := b.CreateExtractValue(value, 0, "lane0.slice")
+					llvmLen = b.CreateExtractValue(lane0, 1, "len")
+				}
 			} else {
 				llvmLen = b.CreateExtractValue(value, 1, "len")
 			}
@@ -3425,16 +3500,61 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		var bufptr, buflen llvm.Value
 		var bufType llvm.Type
 		// SPMD: Varying[[]T] lowers to [N x sliceStruct] (array, not vector).
-		// For N=1 (degenerate scalar case), extract lane 0's slice header and
-		// index it as a regular scalar slice. N>1 divergent inner loops are
-		// deferred — emit a plausible but potentially incorrect address for now.
+		// Build per-lane GEPs so each lane addresses its own slice data.
+		// For N=1 (degenerate scalar), fall through to the standard scalar path.
 		if val.Type().TypeKind() == llvm.ArrayTypeKind {
 			if slicePtrTyp, ok := expr.X.Type().Underlying().(*types.Slice); ok {
+				laneCount := val.Type().ArrayLength()
+				elemType := b.getLLVMType(slicePtrTyp.Elem())
+				index = b.extendInteger(index, expr.Index.Type(), b.uintptrType)
+
+				if laneCount > 1 {
+					// Per-lane GEPs: each lane has its own slice data pointer.
+					i32Type := b.ctx.Int32Type()
+					ptrVec := llvm.Undef(llvm.VectorType(b.dataPtrType, laneCount))
+					// Build <N x lenType> from per-lane slice.len (field 1) and compute
+					// the gather mask "index < len[lane]". This mask is stored so that
+					// the subsequent UnOp{MUL} dereference can use it instead of the
+					// outer loop's tailMask, preventing OOB reads from inactive lanes.
+					lenType := b.CreateExtractValue(b.CreateExtractValue(val, 0, ""), 1, "").Type()
+					lenVec := llvm.Undef(llvm.VectorType(lenType, laneCount))
+					for lane := 0; lane < laneCount; lane++ {
+						laneSlice := b.CreateExtractValue(val, lane, "")
+						lanePtr := b.CreateExtractValue(laneSlice, 0, "indexaddr.ptr.lane")
+						gep := b.CreateInBoundsGEP(elemType, lanePtr, []llvm.Value{index}, "indexaddr.gep.lane")
+						ptrVec = b.CreateInsertElement(ptrVec, gep,
+							llvm.ConstInt(i32Type, uint64(lane), false), "")
+						laneLen := b.CreateExtractValue(laneSlice, 1, "indexaddr.len.lane")
+						lenVec = b.CreateInsertElement(lenVec, laneLen,
+							llvm.ConstInt(i32Type, uint64(lane), false), "")
+					}
+					// index is already extended to uintptr width; extend lenVec to match.
+					idxType := index.Type()
+					if lenVec.Type().ElementType() != idxType {
+						if b.targetData.TypeAllocSize(lenVec.Type().ElementType()) < b.targetData.TypeAllocSize(idxType) {
+							lenVec = b.CreateZExt(lenVec, llvm.VectorType(idxType, laneCount), "indexaddr.len.zext")
+						} else {
+							lenVec = b.CreateTrunc(lenVec, llvm.VectorType(idxType, laneCount), "indexaddr.len.trunc")
+						}
+					}
+					idxVec := llvm.Undef(llvm.VectorType(idxType, laneCount))
+					for lane := 0; lane < laneCount; lane++ {
+						idxVec = b.CreateInsertElement(idxVec, index,
+							llvm.ConstInt(i32Type, uint64(lane), false), "")
+					}
+					gatherMaskI1 := b.CreateICmp(llvm.IntULT, idxVec, lenVec, "indexaddr.gather.mask")
+					if b.spmdVaryingSliceGatherMask == nil {
+						b.spmdVaryingSliceGatherMask = make(map[ssa.Value]llvm.Value)
+					}
+					b.spmdVaryingSliceGatherMask[expr] = gatherMaskI1
+					return ptrVec, nil
+				}
+
+				// N=1 fallback (scalar degeneration).
 				lane0 := b.CreateExtractValue(val, 0, "lane0.slice")
 				bufptr = b.CreateExtractValue(lane0, 0, "indexaddr.ptr")
 				buflen = b.CreateExtractValue(lane0, 1, "indexaddr.len")
-				bufType = b.getLLVMType(slicePtrTyp.Elem())
-				index = b.extendInteger(index, expr.Index.Type(), b.uintptrType)
+				bufType = elemType
 				b.createLookupBoundsCheck(buflen, index)
 				return b.CreateInBoundsGEP(bufType, bufptr, []llvm.Value{index}, ""), nil
 			}
@@ -3635,6 +3755,19 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					if laneCount > 0 {
 						maskElem := b.spmdMaskElemType(laneCount)
 						phiType = llvm.VectorType(maskElem, laneCount)
+					}
+				}
+			}
+		}
+		// SPMD divergent inner loop: if this scalar phi accumulates values from
+		// per-lane element access on Varying[[]T] (e.g., "t += secondLevel[i]"),
+		// promote it to a vector phi so per-lane results are not lost.
+		// Detection: any back-edge value traces through operations on Varying[[]T] elements.
+		if b.spmdLoopState != nil && phiType.TypeKind() != llvm.VectorTypeKind {
+			if activeLoop := b.spmdFindActiveLoopForBlock(expr.Block()); activeLoop != nil {
+				if laneCount := activeLoop.laneCount; laneCount > 1 {
+					if b.spmdPhiNeedsVectorPromotion(expr) {
+						phiType = llvm.VectorType(phiType, laneCount)
 					}
 				}
 			}
@@ -4865,21 +4998,52 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 				return llvm.Value{}, b.makeError(unop.Pos(), "cgo function not found: "+name)
 			}
 			return fn, nil
-		} else if x.Type().TypeKind() == llvm.VectorTypeKind &&
-			(valueType.TypeKind() == llvm.StructTypeKind || valueType.TypeKind() == llvm.ArrayTypeKind) {
-			// SPMD: vector of pointers (<N x ptr>) dereferencing an aggregate type.
-			// LLVM cannot load a struct through a vector of pointers directly.
-			// Perform N individual scalar loads and pack results into [N x valueType].
+		} else if x.Type().TypeKind() == llvm.VectorTypeKind {
+			// SPMD: vector of pointers (<N x ptr>) from a per-lane IndexAddr.
 			n := x.Type().VectorSize()
-			arrType := llvm.ArrayType(valueType, n)
-			arr := llvm.Undef(arrType)
-			for i := 0; i < n; i++ {
-				idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
-				ptr := b.CreateExtractElement(x, idx, "")
-				val := b.CreateLoad(valueType, ptr, "")
-				arr = b.CreateInsertValue(arr, val, i, "")
+			if valueType.TypeKind() == llvm.StructTypeKind || valueType.TypeKind() == llvm.ArrayTypeKind {
+				// Aggregate element: LLVM cannot gather structs/arrays directly.
+				// Perform N individual scalar loads and pack into [N x valueType].
+				arrType := llvm.ArrayType(valueType, n)
+				arr := llvm.Undef(arrType)
+				for i := 0; i < n; i++ {
+					idx := llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+					ptr := b.CreateExtractElement(x, idx, "")
+					val := b.CreateLoad(valueType, ptr, "")
+					arr = b.CreateInsertValue(arr, val, i, "")
+				}
+				return arr, nil
 			}
-			return arr, nil
+			// Scalar element (e.g., int, float32): use masked gather.
+			// Priority 1: a per-element mask stored by the IndexAddr handler for
+			// Varying[[]T] gathers ("index < len[lane]"). This is the precise mask
+			// for divergent inner loops where each lane iterates its own slice.
+			// Priority 2: the active SPMD loop's tailMask (for normal SPMD loops).
+			// Inactive lanes receive 0 (the passthrough in spmdMaskedGather).
+			vecType := llvm.VectorType(valueType, n)
+			var gatherMask llvm.Value
+			if b.spmdVaryingSliceGatherMask != nil {
+				if mask, ok := b.spmdVaryingSliceGatherMask[unop.X]; ok {
+					gatherMask = mask
+					if gatherMask.Type() != llvm.VectorType(b.ctx.Int1Type(), n) {
+						// Shouldn't happen, but guard against type mismatch.
+						gatherMask = llvm.Value{}
+					}
+				}
+			}
+			if gatherMask.IsNil() {
+				if b.spmdLoopState != nil && b.currentBlock != nil {
+					if loop, ok := b.spmdLoopState.bodyBlocks[b.currentBlock.Index]; ok {
+						if !loop.tailMask.IsNil() {
+							gatherMask = b.spmdUnwrapMaskForIntrinsic(loop.tailMask, n)
+						}
+					}
+				}
+			}
+			if gatherMask.IsNil() {
+				gatherMask = llvm.ConstAllOnes(llvm.VectorType(b.ctx.Int1Type(), n))
+			}
+			return b.spmdMaskedGather(vecType, x, gatherMask), nil
 		} else {
 			b.createNilCheck(unop.X, x, "deref")
 			load := b.CreateLoad(valueType, x, "")
