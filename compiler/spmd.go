@@ -1101,20 +1101,37 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			isPeeled:      true,
 			isRangeIndex:  ssaLoop.IsRangeIndex,
 			isDecomposed:  isDecomposed,
+			// Peeled phi inits are literal constants (0 for mainIterPhi, mainIncr for
+			// tailIterPhi), not the -1 sentinel used by the non-peeled rangeindex
+			// pattern. Set initEdgeIndex = -1 so spmdRangeIndexInitOverride never
+			// alters them.
+			initEdgeIndex: -1,
 		}
 
-		// Map main body: activeLoops[phi] triggers emitSPMDBodyPrologue via phi handler.
+		// Register mainIterPhi in activeLoops for contiguous IndexAddr detection.
+		// The phi handler (compiler.go:1650) is gated by spmdValueOverride != nil,
+		// which is only set for body blocks. mainLoopBlock is NOT a body block, so
+		// the phi handler will not fire there — but we must ensure mainLoopBlock is
+		// excluded from spmdRegisterBodyBlocks so it isn't accidentally added to bodyBlocks.
 		state.activeLoops[mainIterPhi] = loop
 		state.loopBlocks[ssaLoop.MainBodyBlock.Index] = loop
 
 		// Register all blocks reachable from the main body within the loop scope.
 		// After predication, body may span multiple blocks (body → if.done).
+		// For rangeindex peeled loops, mainBody's Succs include mainLoopBlock (the back
+		// edge). Exclude it from body-block registration to prevent the phi handler from
+		// firing emitSPMDBodyPrologue in the loop-header block.
 		peeledStopBlocks := map[int]bool{ssaLoop.MainBodyBlock.Index: true}
 		if ssaLoop.DoneBlock != nil {
 			peeledStopBlocks[ssaLoop.DoneBlock.Index] = true
 		}
 		if ssaLoop.TailCheckBlock != nil {
 			peeledStopBlocks[ssaLoop.TailCheckBlock.Index] = true
+		}
+		if ssaLoop.IsRangeIndex && ssaLoop.BackEdgeBlock != nil {
+			// Prevent mainLoopBlock from being added to bodyBlocks during the walk
+			// from mainBody (since mainBody.Succs includes mainLoopBlock).
+			peeledStopBlocks[ssaLoop.BackEdgeBlock.Index] = true
 		}
 		spmdRegisterBodyBlocks(state, ssaLoop.MainBodyBlock, loop, peeledStopBlocks)
 

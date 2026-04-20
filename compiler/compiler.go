@@ -1707,11 +1707,17 @@ func (b *builder) createFunction() {
 			llvmVal := b.getValue(edge, getPos(phi.ssa))
 			// SPMD: for peeled rangeindex loops, the incrBinOp (mainIterPhi + laneCount)
 			// is compiled inside the body block where spmdValueOverride makes it produce a
-			// vector. The loop phi back-edge expects a scalar. Use the pre-computed scalar
-			// increment value stored during emitSPMDBodyPrologue instead.
+			// vector. The mainIterPhi back-edge (predecessor = mainBody) expects a scalar.
+			// Use the pre-computed scalar increment stored during emitSPMDBodyPrologue.
+			// Only apply when the predecessor is a body block — for the tailIterPhi whose
+			// predecessor is mainLoopBlock (where spmdValueOverride is nil), mainIncr is
+			// already compiled as a scalar and must be used directly.
 			if b.spmdPeeledScalarIncr != nil {
 				if scalarIncr, ok := b.spmdPeeledScalarIncr[edge]; ok {
-					llvmVal = scalarIncr
+					pred := block.Preds[i]
+					if b.spmdLoopState == nil || b.spmdLoopState.bodyBlocks[pred.Index] != nil {
+						llvmVal = scalarIncr
+					}
 				}
 			}
 			llvmVal = b.spmdRangeIndexInitOverride(phi.ssa, i, llvmVal)
