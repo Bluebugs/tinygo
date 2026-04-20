@@ -2352,7 +2352,8 @@ func (b *builder) spmdVectorAnyTrue(mask llvm.Value) llvm.Value {
 		// and crashes with "Do not know how to promote this operator's operand".
 		// Convert to mask format (<N x iW>) first so we call
 		// llvm.wasm.anytrue.v4i32 (or similar), which WASM can lower natively.
-		// On x86, spmdAnyTrue bitcasts to <16 x i8> internally via pmovmskb.
+		// On x86, spmdAnyTrue extracts a bitmask via movmskps/pd (i32/i64 lanes) or
+		// pmovmskb (i8 lanes) then compares against zero.
 		laneCount := mask.Type().VectorSize()
 		if mask.Type().ElementType() == b.ctx.Int1Type() {
 			mask = b.spmdWrapMask(mask, laneCount)
@@ -2386,12 +2387,13 @@ func (b *builder) spmdVectorAllTrue(mask llvm.Value) llvm.Value {
 	if b.spmdUsesSIMD() {
 		// Normalize <N x i1> to mask format before calling the intrinsic.
 		// See spmdVectorAnyTrue for the rationale.
-		// On x86, spmdAllTrue bitcasts to <16 x i8> internally via pmovmskb.
+		// On x86, spmdAllTrue extracts a bitmask via movmskps/pd (i32/i64 lanes) or
+		// pmovmskb (i8 lanes) then compares against the all-ones mask.
 		laneCount := mask.Type().VectorSize()
 		if mask.Type().ElementType() == b.ctx.Int1Type() {
 			mask = b.spmdWrapMask(mask, laneCount)
 		}
-		// Use native all_true (WASM) or pmovmskb+icmp (x86).
+		// Use native all_true (WASM) or bitmask+icmp (x86).
 		i32Result := b.spmdAllTrue(mask)
 		zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
 		return b.CreateICmp(llvm.IntNE, i32Result, zero, "")
@@ -2591,11 +2593,17 @@ func (b *builder) spmdSwizzleScalarFallback(table, indices llvm.Value) llvm.Valu
 
 // spmdX86BitmaskI32 extracts one bit per logical lane from vec into a scalar i32.
 // vec must be a mask vector in the all-ones/all-zeros lane format (<N x iW>).
-// For <N x i8> (byte elements, 1 byte per lane), pmovmskb maps directly: 1 bit
-// per byte = 1 bit per lane. For wider elements (<N x i16>, <N x i32>), pmovmskb
-// on the raw bytes gives multiple bits per lane (garbage). Instead we reduce to
-// <N x i1> (icmp ne 0) then bitcast to iN: this always yields exactly 1 bit per
-// logical lane regardless of element width.
+//
+// Fast paths (1 instruction each):
+//   - <N x i8>:  pmovmskb — direct 1-bit-per-byte extraction (1 bit per lane).
+//   - <4 x i32>, <8 x i32>:  movmskps — reinterpret as float, extract sign bits.
+//   - <2 x i64>, <4 x i64>:  movmskpd — reinterpret as double, extract sign bits.
+//
+// The movmskps/pd fast paths work because the mask invariant guarantees each lane
+// is either 0x00000000 (false) or 0xFFFFFFFF (true), so the MSB of each float/double
+// lane equals the lane's truth value — no comparison needed.
+//
+// General path (for <N x i16> or other widths): icmp ne 0 → <N x i1> → bitcast to iN.
 func (b *builder) spmdX86BitmaskI32(vec llvm.Value) llvm.Value {
 	laneCount := vec.Type().VectorSize()
 	elemType := vec.Type().ElementType()
@@ -2603,6 +2611,11 @@ func (b *builder) spmdX86BitmaskI32(vec llvm.Value) llvm.Value {
 	if elemType == b.ctx.Int8Type() {
 		// Fast path: <N x i8> — pmovmskb is a direct 1-bit-per-lane extraction.
 		i32bitmask = b.spmdX86Pmovmskb(vec)
+	} else if (elemType == b.ctx.Int32Type() && (laneCount == 4 || laneCount == 8)) ||
+		(elemType == b.ctx.Int64Type() && (laneCount == 2 || laneCount == 4)) {
+		// Fast path: movmskps/pd extracts the MSB of each float/double lane.
+		// Mask invariant: lanes are all-ones or zero, so MSB == truth value.
+		i32bitmask = b.spmdX86Movmskps(vec)
 	} else {
 		// General path: collapse to <N x i1> (one true/false per lane), then
 		// bitcast to iN to get a compact bitmask. LLVM typically lowers this
@@ -2618,9 +2631,9 @@ func (b *builder) spmdX86BitmaskI32(vec llvm.Value) llvm.Value {
 
 // spmdBitmask extracts one bit per logical lane into a scalar i32 bitmask.
 // On WASM: llvm.wasm.bitmask on the vector in WASM mask format.
-// On x86: for <N x i8> uses pmovmskb (1 bit per byte = 1 bit per lane).
-// For wider elements (<N x i16>, <N x i32>) uses icmp+bitcast to avoid
-// pmovmskb producing multiple bits per lane.
+// On x86: dispatches to spmdX86BitmaskI32 which selects the fastest available
+// intrinsic — pmovmskb for i8 lanes, movmskps/pd for i32/i64 lanes, or the
+// general icmp+bitcast path for other widths.
 func (b *builder) spmdBitmask(vec llvm.Value) llvm.Value {
 	if b.spmdIsWASM() {
 		return b.spmdWasmBitmask(vec)

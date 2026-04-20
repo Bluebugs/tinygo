@@ -54,6 +54,55 @@ func (b *builder) spmdX86Pmovmskb(vec llvm.Value) llvm.Value {
 	return b.createCall(fnType, fn, []llvm.Value{vec}, "x86.pmovmskb")
 }
 
+// spmdX86Movmskps extracts the sign bit of each float/double lane into a scalar
+// i32 bitmask. Dispatches based on element bit-width and lane count:
+//
+//   - <4 x i32>  → bitcast to <4 x float>  → llvm.x86.sse.movmsk.ps       (SSE)
+//   - <8 x i32>  → bitcast to <8 x float>  → llvm.x86.avx.movmsk.ps.256   (AVX)
+//   - <2 x i64>  → bitcast to <2 x double> → llvm.x86.sse2.movmsk.pd      (SSE2)
+//   - <4 x i64>  → bitcast to <4 x double> → llvm.x86.avx.movmsk.pd.256   (AVX)
+//
+// The input must be a mask vector in all-ones-or-all-zeros lane format. Because
+// 0xFFFFFFFF and 0xFFFFFFFFFFFFFFFF both have their MSB set, the sign bit of each
+// reinterpreted float/double lane equals the lane's truth value, so movmskps/pd
+// is a correct 1-instruction bitmask extraction without any comparison.
+func (b *builder) spmdX86Movmskps(vec llvm.Value) llvm.Value {
+	i32Type := b.ctx.Int32Type()
+	vecType := vec.Type()
+	elemType := vecType.ElementType()
+	laneCount := vecType.VectorSize()
+
+	var intrinsicName string
+	var floatVecType llvm.Type
+
+	switch {
+	case elemType == b.ctx.Int32Type() && laneCount == 8:
+		// AVX 256-bit: vmovmskps ymm — 8 float lanes → 8-bit mask in i32.
+		floatVecType = llvm.VectorType(b.ctx.FloatType(), 8)
+		intrinsicName = "llvm.x86.avx.movmsk.ps.256"
+	case elemType == b.ctx.Int32Type():
+		// SSE 128-bit: movmskps xmm — 4 float lanes → 4-bit mask in i32.
+		floatVecType = llvm.VectorType(b.ctx.FloatType(), 4)
+		intrinsicName = "llvm.x86.sse.movmsk.ps"
+	case elemType == b.ctx.Int64Type() && laneCount == 4:
+		// AVX 256-bit: vmovmskpd ymm — 4 double lanes → 4-bit mask in i32.
+		floatVecType = llvm.VectorType(b.ctx.DoubleType(), 4)
+		intrinsicName = "llvm.x86.avx.movmsk.pd.256"
+	default:
+		// SSE2 128-bit: movmskpd xmm — 2 double lanes → 2-bit mask in i32.
+		floatVecType = llvm.VectorType(b.ctx.DoubleType(), 2)
+		intrinsicName = "llvm.x86.sse2.movmsk.pd"
+	}
+
+	floatVec := b.CreateBitCast(vec, floatVecType, "movmsk.cast")
+	fnType := llvm.FunctionType(i32Type, []llvm.Type{floatVecType}, false)
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	return b.createCall(fnType, fn, []llvm.Value{floatVec}, "x86.movmskps")
+}
+
 // spmdX86Pmaddubsw emits pmaddubsw: multiply unsigned×signed bytes, horizontal
 // add adjacent pairs → i16. Dispatches to SSSE3 (128-bit) or AVX2 (256-bit).
 // Input: <N x i8> × <N x i8> where N=16 (SSE) or N=32 (AVX2)
