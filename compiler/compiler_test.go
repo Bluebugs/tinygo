@@ -235,6 +235,12 @@ func testCompilePackage(t *testing.T, options *compileopts.Options, file string)
 		AutomaticStackSize: config.AutomaticStackSize(),
 		DefaultStackSize:   config.StackSize(),
 		NeedsStackObjects:  config.NeedsStackObjects(),
+		// SIMDEnabled and SIMDRegisterBytes are propagated so that SPMD tests
+		// (which use GOExperiment="spmd" in options) get the correct SIMD lane
+		// count. For non-SPMD tests, SIMDEnabled() returns false and
+		// SIMDRegisterBytes has no effect on the generated IR.
+		SIMDEnabled:       config.SIMDEnabled(),
+		SIMDRegisterBytes: int(config.SIMDRegisterSize()),
 	}
 	machine, err := NewTargetMachine(compilerConfig)
 	if err != nil {
@@ -244,7 +250,8 @@ func testCompilePackage(t *testing.T, options *compileopts.Options, file string)
 
 	// Load entire program AST into memory.
 	lprogram, err := loader.Load(config, "./testdata/"+file, types.Config{
-		Sizes: Sizes(machine),
+		Sizes:            Sizes(machine),
+		SIMDRegisterSize: config.SIMDRegisterSize(),
 	})
 	if err != nil {
 		t.Fatal("failed to create target machine:", err)

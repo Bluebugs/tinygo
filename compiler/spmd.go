@@ -4951,6 +4951,13 @@ func (b *builder) spmdFieldAddrPerLane(ptrVec llvm.Value, structType llvm.Type, 
 //
 // This enables SPMDLoad/SPMDStore on the field to use masked vector load/store
 // instead of falling back to per-lane scatter/gather.
+//
+// When fieldGEP is a vector-of-pointers (<N x ptr>, i.e., the result of
+// spmdFieldAddrPerLane), the contiguous propagation cannot use it directly as
+// scalarPtr (masked load/store requires a scalar address). In that case we
+// compute the scalar field GEP from baseCI.scalarPtr — the scalar pointer to
+// the base struct — so the contiguous store emits a single masked.store to the
+// field within that base struct.
 func (b *builder) spmdFieldAddrForVaryingPtr(expr *ssa.FieldAddr, fieldGEP llvm.Value) {
 	if b.spmdContiguousPtr == nil {
 		return
@@ -4960,9 +4967,47 @@ func (b *builder) spmdFieldAddrForVaryingPtr(expr *ssa.FieldAddr, fieldGEP llvm.
 		return
 	}
 	// Propagate: the field is contiguous because the base struct is contiguous.
-	// Inherit all metadata from the base entry but point scalarPtr at the field GEP.
+	// Inherit all metadata from the base entry but update scalarPtr.
 	fieldCI := *baseCI
-	fieldCI.scalarPtr = fieldGEP
+	if fieldGEP.Type().TypeKind() == llvm.VectorTypeKind {
+		// fieldGEP is a <N x ptr> vector (from spmdFieldAddrPerLane in a non-uniform
+		// Case D FieldAddr). We cannot use it as a scalar masked-store address.
+		// Derive the scalar field ptr from baseCI.scalarPtr by GEP-ing into the struct.
+		// The struct type comes from the base pointer element type.
+		var structLLVMType llvm.Type
+		switch bt := expr.X.Type().(type) {
+		case *types.SPMDType:
+			// Case D: Varying[*S] — inner pointer elem is S.
+			if innerPtr, ok2 := bt.Elem().(*types.Pointer); ok2 {
+				structLLVMType = b.getLLVMType(innerPtr.Elem())
+			}
+		default:
+			// Cases A/B: *Varying[S] or *S — pointer elem is S (or Varying[S]).
+			if ptr, ok2 := expr.X.Type().Underlying().(*types.Pointer); ok2 {
+				elem := ptr.Elem()
+				if sv, ok3 := elem.(*types.SPMDType); ok3 {
+					structLLVMType = b.getLLVMType(sv.Elem())
+				} else {
+					structLLVMType = b.getLLVMType(elem)
+				}
+			}
+		}
+		if structLLVMType.IsNil() {
+			// Cannot determine struct type; fall back to using the vector — this
+			// will produce scatter rather than masked.store, which is still correct.
+			fieldCI.scalarPtr = fieldGEP
+		} else {
+			// GEP from the scalar base ptr to the specific field.
+			scalarFieldPtr := b.CreateInBoundsGEP(structLLVMType, baseCI.scalarPtr, []llvm.Value{
+				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+				llvm.ConstInt(b.ctx.Int32Type(), uint64(expr.Field), false),
+			}, "fieldaddr.scalar")
+			fieldCI.scalarPtr = scalarFieldPtr
+		}
+	} else {
+		// fieldGEP is already a scalar pointer (from A/B uniform path).
+		fieldCI.scalarPtr = fieldGEP
+	}
 	b.spmdContiguousPtr[expr] = &fieldCI
 }
 

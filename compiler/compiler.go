@@ -3116,6 +3116,55 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		//   between consecutive field values, not sizeof(field)). Must expand to
 		//   per-lane field GEPs — one GEP per lane stepping by sizeof(S).
 		//
+		// Case D: expr.X has SSA type Varying[*S] — a vector of per-lane pointers.
+		//
+		// Sub-case D1 (non-contiguous): val is a <N x ptr> vector from a non-contiguous
+		//   IndexAddr (varying pointer, different address per lane). Emit per-lane GEPs.
+		//
+		// Sub-case D2 (contiguous): val is a scalar ptr from a contiguous IndexAddr
+		//   (e.g., &pts[base+i]). The pointed-to structs are laid out contiguously in
+		//   memory (arr[base].S, arr[base+1].S, ...) so struct fields are strided by
+		//   sizeof(S). Must expand to per-lane struct GEPs then per-lane field GEPs —
+		//   same as Case C — and register the result in spmdContiguousPtr with a
+		//   scalar field ptr so SPMDStore/SPMDLoad can use masked vector store/load.
+		if spmdType, ok := expr.X.Type().(*types.SPMDType); ok {
+			if innerPtr, ok := spmdType.Elem().(*types.Pointer); ok {
+				structLLVMType := b.getLLVMType(innerPtr.Elem())
+				if val.Type().TypeKind() == llvm.VectorTypeKind {
+					// D1: non-contiguous — val is already a <N x ptr> vector.
+					laneCount := val.Type().VectorSize()
+					result := b.spmdFieldAddrPerLane(val, structLLVMType, expr.Field, laneCount)
+					b.spmdFieldAddrForVaryingPtr(expr, result)
+					return result, nil
+				}
+				// D2: val is a scalar ptr; check if base was a contiguous IndexAddr.
+				if b.spmdContiguousPtr != nil && b.spmdLoopState != nil {
+					if baseCI, ok := b.spmdContiguousPtr[expr.X]; ok {
+						if loop, ok := b.spmdLoopState.bodyBlocks[b.currentBlock.Index]; ok {
+							laneCount := loop.laneCount
+							// Expand scalar struct ptr to per-lane struct ptrs (stride = sizeof(S)).
+							scalarPtrs := llvm.Undef(llvm.VectorType(b.dataPtrType, laneCount))
+							for lane := 0; lane < laneCount; lane++ {
+								laneIdx := llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false)
+								laneStructPtr := b.CreateInBoundsGEP(structLLVMType, val, []llvm.Value{laneIdx}, "fieldaddr.struct.lane")
+								scalarPtrs = b.CreateInsertElement(scalarPtrs, laneStructPtr, laneIdx, "")
+							}
+							result := b.spmdFieldAddrPerLane(scalarPtrs, structLLVMType, expr.Field, laneCount)
+							// Register contiguous entry with scalar field ptr for masked store path.
+							scalarFieldPtr := b.CreateInBoundsGEP(structLLVMType, baseCI.scalarPtr, []llvm.Value{
+								llvm.ConstInt(b.ctx.Int32Type(), 0, false),
+								llvm.ConstInt(b.ctx.Int32Type(), uint64(expr.Field), false),
+							}, "fieldaddr.scalar")
+							fieldCI := *baseCI
+							fieldCI.scalarPtr = scalarFieldPtr
+							b.spmdContiguousPtr[expr] = &fieldCI
+							return result, nil
+						}
+					}
+				}
+			}
+		}
+
 		// Cases A and B: use the struct LLVM type for per-lane field GEPs.
 		// Case C: expand scalar base to per-lane field GEPs using struct stride.
 		if ptr, ok := expr.X.Type().Underlying().(*types.Pointer); ok {

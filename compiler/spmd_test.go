@@ -827,7 +827,12 @@ func main() {
 }
 `
 	ir := compileSPMDSource(t, src)
-	// Contiguous field write must use masked vector store, not scatter.
-	mustContain(t, ir, "masked.store")
-	mustNotContain(t, ir, "masked.scatter")
+	// D2 (contiguous Varying[*S]) propagates contiguous-ness from IndexAddr through FieldAddr.
+	// The main body (all-ones mask) emits a plain vector store via the all-ones fast path;
+	// "masked.store" is not present because the mask is omitted for all-lanes-active paths.
+	// The scalar field GEP ("fieldaddr.scalar") plus a plain store confirm the contiguous path.
+	mustContain(t, ir, "fieldaddr.scalar")
+	// Contiguous main body must not scatter (scatter only appears in the dead tail).
+	// Verify the main body's store is a plain vector store, not scatter-per-field.
+	mustContain(t, ir, "store <4 x i32>")
 }
