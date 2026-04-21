@@ -8,10 +8,13 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"unsafe"
 
+	"github.com/tinygo-org/tinygo/compileopts"
 	"github.com/tinygo-org/tinygo/loader"
 	"golang.org/x/tools/go/ssa"
 )
@@ -667,4 +670,164 @@ func createTestPackage(t *testing.T, files []*ast.File, funcs map[string]*types.
 		Files: files,
 		Pkg:   pkg,
 	}
+}
+
+// compileSPMDSource compiles Go source (with GOEXPERIMENT=spmd) through
+// testCompilePackage and returns the LLVM IR as a string.
+// The source must have package main and a main function.
+// Uses the wasm target so that SIMD128 is available for the SPMD backend.
+func compileSPMDSource(t *testing.T, src string) string {
+	t.Helper()
+	// The SPMD parser gating in go/parser reads buildcfg.Experiment.SPMD
+	// which is set at process init from GOEXPERIMENT. Ensure the env var is
+	// present for any sub-processes and for the in-process parser call.
+	t.Setenv("GOEXPERIMENT", "spmd")
+
+	// Write source to a temp file under the testdata directory so that
+	// testCompilePackage (which expects ./testdata/<file>) can load it.
+	dir := "./testdata"
+	f, err := os.CreateTemp(dir, "spmd_test_*.go")
+	if err != nil {
+		t.Fatalf("failed to create temp source file: %v", err)
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	if _, err := f.WriteString(src); err != nil {
+		f.Close()
+		t.Fatalf("failed to write source: %v", err)
+	}
+	f.Close()
+
+	// Use just the filename relative to ./testdata/ as testCompilePackage expects.
+	relName := strings.TrimPrefix(name, dir+"/")
+
+	options := &compileopts.Options{
+		Target:       "wasm",
+		GOExperiment: "spmd",
+	}
+	mod, errs := testCompilePackage(t, options, relName)
+	if len(errs) > 0 {
+		msgs := make([]string, len(errs))
+		for i, e := range errs {
+			msgs[i] = e.Error()
+		}
+		t.Fatalf("compile errors:\n%s", strings.Join(msgs, "\n"))
+	}
+	return mod.String()
+}
+
+// mustContain fails the test if ir does not contain substr.
+func mustContain(t *testing.T, ir, substr string) {
+	t.Helper()
+	if !strings.Contains(ir, substr) {
+		t.Errorf("IR missing expected pattern %q", substr)
+	}
+}
+
+// mustNotContain fails the test if ir contains substr.
+func mustNotContain(t *testing.T, ir, substr string) {
+	t.Helper()
+	if strings.Contains(ir, substr) {
+		t.Errorf("IR contains unexpected pattern %q", substr)
+	}
+}
+
+// mustContainAny fails the test if ir contains none of the given substrings.
+func mustContainAny(t *testing.T, ir string, substrs ...string) {
+	t.Helper()
+	for _, s := range substrs {
+		if strings.Contains(ir, s) {
+			return
+		}
+	}
+	t.Errorf("IR missing all of: %v", substrs)
+}
+
+// TestSPMDVaryingPointerFieldAddr_Gather verifies that a field read through a
+// Varying[*Struct] value compiles to per-lane GEPs (via spmdFieldAddrPerLane)
+// followed by a masked gather or masked vector load.
+//
+// Case D in the *ssa.FieldAddr handler does not exist yet, so this test
+// is expected to FAIL until Task 8 adds it.
+func TestSPMDVaryingPointerFieldAddr_Gather(t *testing.T) {
+	src := `package main
+
+import "lanes"
+
+type Point struct{ X, Y int }
+
+var pts [16]Point
+
+func main() {
+	var acc lanes.Varying[int]
+	go for i := range 16 {
+		p := &pts[i]  // Varying[*Point]
+		acc += p.X    // gather read of field X
+	}
+	_ = acc
+}
+`
+	ir := compileSPMDSource(t, src)
+	// spmdFieldAddrPerLane emits extract/GEP/insert for each lane of the pointer vector.
+	mustContain(t, ir, "extractelement")
+	mustContain(t, ir, "getelementptr")
+	mustContain(t, ir, "insertelement")
+	// The field address vector feeds a gather load or masked vector load.
+	mustContainAny(t, ir, "masked.gather", "masked.load")
+}
+
+// TestSPMDVaryingPointerFieldAddr_Scatter verifies that a field write through a
+// Varying[*Struct] value compiles to a masked scatter or masked vector store.
+//
+// Case D in the *ssa.FieldAddr handler does not exist yet, so this test
+// is expected to FAIL until Task 8 adds it.
+func TestSPMDVaryingPointerFieldAddr_Scatter(t *testing.T) {
+	src := `package main
+
+type Point struct{ X, Y int }
+
+var pts [16]Point
+
+func main() {
+	go for i := range 16 {
+		p := &pts[i]  // Varying[*Point]
+		p.Y = i       // scatter write to field Y
+	}
+}
+`
+	ir := compileSPMDSource(t, src)
+	mustContain(t, ir, "extractelement")
+	mustContain(t, ir, "getelementptr")
+	mustContain(t, ir, "insertelement")
+	mustContainAny(t, ir, "masked.scatter", "masked.store")
+}
+
+// TestSPMDVaryingPointerFieldAddr_Contiguous verifies that when the base
+// access is contiguous (uniform base + laneIndex), the FieldAddr propagates
+// contiguous-ness and the backend emits a masked vector store rather than scatter.
+//
+// Case D in the *ssa.FieldAddr handler does not exist yet, so this test
+// is expected to FAIL until Task 8 adds it.
+func TestSPMDVaryingPointerFieldAddr_Contiguous(t *testing.T) {
+	src := `package main
+
+type Point struct{ X, Y int }
+
+var pts [32]Point
+
+func kernel(base int) {
+	go for i := range 16 {
+		p := &pts[base+i]  // contiguous: uniform base + varying lane index
+		p.X = i
+	}
+}
+
+func main() {
+	kernel(0)
+}
+`
+	ir := compileSPMDSource(t, src)
+	// Contiguous field write must use masked vector store, not scatter.
+	mustContain(t, ir, "masked.store")
+	mustNotContain(t, ir, "masked.scatter")
 }
