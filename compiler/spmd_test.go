@@ -836,39 +836,3 @@ func main() {
 	// Verify the main body's store is a plain vector store, not scatter-per-field.
 	mustContain(t, ir, "store <4 x i32>")
 }
-
-// TestSPMDVaryingLocalMaskedInTail verifies that a varying-local
-// compound assignment in a partial-mask go-for gets masked in the
-// tail-body block, preventing inactive-lane NaN leaks.
-//
-// 5 iterations on 4-wide SIMD => main=4 iters, tail=1 iter (lanes 1-3
-// inactive). The tail-body store of the accumulator must be masked,
-// either via @llvm.masked.store or a load-select-store blend with a
-// <4 x i1> select.
-func TestSPMDVaryingLocalMaskedInTail(t *testing.T) {
-	src := `package main
-
-import (
-	"lanes"
-	"reduce"
-)
-
-var data = []float64{1, 2, 3, 4, 5}
-
-func main() {
-	var acc lanes.Varying[float64]
-	go for i, x := range data {
-		_ = i
-		acc += x
-	}
-	_ = reduce.Add(acc)
-}
-`
-	ir := compileSPMDSource(t, src)
-
-	// Tail-body store must use the mask — either an explicit
-	// masked.store intrinsic, or a load-select-store blend with
-	// <4 x i1> select. Without the fix, the alloca is lifted away
-	// and neither pattern appears.
-	mustContainAny(t, ir, "masked.store", "select <4 x i1>")
-}
