@@ -3487,14 +3487,18 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 			[]llvm.Value{b.getValue(instr.Args[0], getPos(instr))}, getPos(instr))
 
 	case strings.HasPrefix(name, "lanes.Min["):
-		return b.createSpmdMathIntrinsic("minnum",
+		// @llvm.minimum (not @llvm.minnum): matches Go's min() and math.Min
+		// semantics (NaN propagates) and maps directly to WASM f64x2.min and
+		// x86 vminpd without libc fallback.
+		return b.createSpmdMathIntrinsic("minimum",
 			[]llvm.Value{
 				b.getValue(instr.Args[0], getPos(instr)),
 				b.getValue(instr.Args[1], getPos(instr)),
 			}, getPos(instr))
 
 	case strings.HasPrefix(name, "lanes.Max["):
-		return b.createSpmdMathIntrinsic("maxnum",
+		// @llvm.maximum (not @llvm.maxnum): see lanes.Min comment above.
+		return b.createSpmdMathIntrinsic("maximum",
 			[]llvm.Value{
 				b.getValue(instr.Args[0], getPos(instr)),
 				b.getValue(instr.Args[1], getPos(instr)),
