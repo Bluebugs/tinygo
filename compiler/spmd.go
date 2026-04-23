@@ -3228,6 +3228,57 @@ func spmdIsFloat(t types.Type) bool {
 	return false
 }
 
+// createSpmdMathIntrinsic emits a call to an LLVM vector math intrinsic
+// (@llvm.<name>.vNf{32,64}) with the given arguments. All args must have
+// matching vector types with floating-point element kind; the result type
+// matches the args. In scalar mode (-simd=false) it emits the scalar form
+// @llvm.<name>.f{32,64}.
+//
+// Used by Sqrt, Abs, Floor, Ceil, Round, Trunc, Min, Max, FMA dispatcher
+// cases in createLanesBuiltin.
+func (b *builder) createSpmdMathIntrinsic(name string, args []llvm.Value, pos token.Pos) (llvm.Value, error) {
+	if len(args) == 0 {
+		return llvm.Value{}, b.makeError(pos, "lanes."+name+": no arguments")
+	}
+	vecType := args[0].Type()
+	elemType := vecType
+	if vecType.TypeKind() == llvm.VectorTypeKind {
+		elemType = vecType.ElementType()
+	}
+
+	// Determine intrinsic suffix from element type.
+	var bits int
+	switch elemType.TypeKind() {
+	case llvm.FloatTypeKind:
+		bits = 32
+	case llvm.DoubleTypeKind:
+		bits = 64
+	default:
+		return llvm.Value{}, b.makeError(pos, "lanes."+name+": unsupported element type")
+	}
+
+	// Build the intrinsic name. Vector: llvm.<name>.vNfBITS. Scalar: llvm.<name>.fBITS.
+	var intrinsicName string
+	if vecType.TypeKind() == llvm.VectorTypeKind {
+		intrinsicName = fmt.Sprintf("llvm.%s.v%df%d", name, vecType.VectorSize(), bits)
+	} else {
+		intrinsicName = fmt.Sprintf("llvm.%s.f%d", name, bits)
+	}
+
+	// Build LLVM function type: (vecType, vecType, ...) -> vecType.
+	paramTypes := make([]llvm.Type, len(args))
+	for i := range args {
+		paramTypes[i] = vecType
+	}
+	fnType := llvm.FunctionType(vecType, paramTypes, false)
+
+	fn := b.mod.NamedFunction(intrinsicName)
+	if fn.IsNil() {
+		fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+	}
+	return b.createCall(fnType, fn, args, "lanes."+name), nil
+}
+
 // createLanesBuiltin handles interception of lanes.* function calls.
 // Returns the LLVM value result and nil error on success.
 func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
