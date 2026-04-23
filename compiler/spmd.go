@@ -3462,6 +3462,52 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 	case strings.HasPrefix(name, "lanes.SwizzleWithin["):
 		return b.createSwizzleWithin(instr, name)
 
+	case strings.HasPrefix(name, "lanes.Sqrt["):
+		return b.createSpmdMathIntrinsic("sqrt",
+			[]llvm.Value{b.getValue(instr.Args[0], getPos(instr))}, getPos(instr))
+
+	case strings.HasPrefix(name, "lanes.Abs["):
+		return b.createSpmdMathIntrinsic("fabs",
+			[]llvm.Value{b.getValue(instr.Args[0], getPos(instr))}, getPos(instr))
+
+	case strings.HasPrefix(name, "lanes.Floor["):
+		return b.createSpmdMathIntrinsic("floor",
+			[]llvm.Value{b.getValue(instr.Args[0], getPos(instr))}, getPos(instr))
+
+	case strings.HasPrefix(name, "lanes.Ceil["):
+		return b.createSpmdMathIntrinsic("ceil",
+			[]llvm.Value{b.getValue(instr.Args[0], getPos(instr))}, getPos(instr))
+
+	case strings.HasPrefix(name, "lanes.Round["):
+		return b.createSpmdMathIntrinsic("round",
+			[]llvm.Value{b.getValue(instr.Args[0], getPos(instr))}, getPos(instr))
+
+	case strings.HasPrefix(name, "lanes.Trunc["):
+		return b.createSpmdMathIntrinsic("trunc",
+			[]llvm.Value{b.getValue(instr.Args[0], getPos(instr))}, getPos(instr))
+
+	case strings.HasPrefix(name, "lanes.Min["):
+		return b.createSpmdMathIntrinsic("minnum",
+			[]llvm.Value{
+				b.getValue(instr.Args[0], getPos(instr)),
+				b.getValue(instr.Args[1], getPos(instr)),
+			}, getPos(instr))
+
+	case strings.HasPrefix(name, "lanes.Max["):
+		return b.createSpmdMathIntrinsic("maxnum",
+			[]llvm.Value{
+				b.getValue(instr.Args[0], getPos(instr)),
+				b.getValue(instr.Args[1], getPos(instr)),
+			}, getPos(instr))
+
+	case strings.HasPrefix(name, "lanes.FMA["):
+		return b.createSpmdMathIntrinsic("fma",
+			[]llvm.Value{
+				b.getValue(instr.Args[0], getPos(instr)),
+				b.getValue(instr.Args[1], getPos(instr)),
+				b.getValue(instr.Args[2], getPos(instr)),
+			}, getPos(instr))
+
 	default:
 		return llvm.Value{}, b.makeError(getPos(instr), "unsupported lanes builtin: "+name)
 	}
