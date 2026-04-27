@@ -2743,7 +2743,26 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 
 	switch expr := expr.(type) {
 	case *ssa.Alloc:
-		typ := b.getLLVMType(expr.Type().Underlying().(*types.Pointer).Elem())
+		elemType := expr.Type().Underlying().(*types.Pointer).Elem()
+
+		// SPMD v3: when the alloca's element is a varying type and the SSA
+		// predication pass has annotated the lane count, materialize the
+		// element as a vector of that width rather than consulting the
+		// function's spmdMinLaneCount or the type's natural width. This
+		// keeps the alloca's vector width aligned with the surrounding SPMD
+		// loop's iteration width — required for IndexAddr / load lane
+		// consistency when the alloca's loaded value is fed into address
+		// arithmetic. See *ssa.Alloc.SPMDLaneCount and
+		// docs/superpowers/specs/2026-04-25-varying-local-mask-threading-v3-design.md.
+		var typ llvm.Type
+		if expr.SPMDLaneCount > 0 {
+			if spmdElem, ok := elemType.(*types.SPMDType); ok {
+				typ = llvm.VectorType(b.getLLVMType(spmdElem.Elem()), expr.SPMDLaneCount)
+			}
+		}
+		if typ.IsNil() {
+			typ = b.getLLVMType(elemType)
+		}
 		size := b.targetData.TypeAllocSize(typ)
 		// Move all "large" allocations to the heap.
 		if expr.Heap || size > b.MaxStackAlloc {
@@ -5034,6 +5053,15 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 		}
 	case token.MUL: // *x, dereference pointer
 		valueType := b.getLLVMType(unop.X.Type().Underlying().(*types.Pointer).Elem())
+		// Alloca lane-count override for plain dereferences outside SPMD scope
+		// (e.g., reduce.Add(acc) in rangeindex.done). When the pointer is a
+		// Varying[T] alloca with SPMDLaneCount < getLLVMType's natural width,
+		// use the alloca width so the load does not overread the stack slot.
+		if allocLC := spmdAddrAllocaLaneCount(unop.X); allocLC > 0 {
+			if valueType.TypeKind() == llvm.VectorTypeKind && valueType.VectorSize() != allocLC {
+				valueType = llvm.VectorType(valueType.ElementType(), allocLC)
+			}
+		}
 		if b.targetData.TypeAllocSize(valueType) == 0 {
 			// zero-length data
 			return llvm.ConstNull(valueType), nil

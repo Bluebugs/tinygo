@@ -8412,6 +8412,25 @@ func (b *builder) spmdVaryingAllocToPerLanePtrs(alloca llvm.Value, laneElemType 
 	return result
 }
 
+// spmdAddrAllocaLaneCount returns the SPMDLaneCount annotation from the *ssa.Alloc
+// that backs ssaAddr, or 0 if ssaAddr is not an annotated alloca. Used by
+// createSPMDLoad and createSPMDStore to override the function-natural lane count
+// with the narrower width demanded by the alloca's surrounding SPMD loop.
+//
+// Background: spmdAnnotateAllocaLaneCount (in x-tools-spmd) stamps every
+// Varying[T] alloca with the lane count of the enclosing go-for loop. For a
+// go-for over []float64, that is 2 on WASM SIMD128 (128 bits / 64 bits per
+// element), not int's register-natural 4. Without this override, createSPMDLoad
+// would emit a <4 x i32> load from a <2 x i32> (8-byte) alloca slot — an
+// out-of-bounds access.
+func spmdAddrAllocaLaneCount(ssaAddr ssa.Value) int {
+	alloc, ok := ssaAddr.(*ssa.Alloc)
+	if !ok {
+		return 0
+	}
+	return alloc.SPMDLaneCount
+}
+
 // createSPMDLoad emits LLVM IR for an SPMDLoad instruction.
 // SPMDLoad loads from Addr only for lanes where Mask is active.
 // Inactive lanes receive a zero value. It is the predicated replacement
@@ -8437,6 +8456,27 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// Derive lane count from the mask vector, which always has the correct
 	// target-specific width. instr.Lanes may use host int sizes.
 	laneCount := mask.Type().VectorSize()
+
+	// Alloca lane-count override: when the address is a Varying[T] alloca
+	// annotated by spmdAnnotateAllocaLaneCount, the alloca's vector width
+	// may differ from int's register-natural getLLVMType width. For example,
+	// a Varying[int] accumulator in a go-for over []float64 has SPMDLaneCount=2
+	// on WASM128 (128 bits / 64 bits per float64), while getLLVMType(Varying[int])
+	// returns <4 x i32>. Without this override, the load reads 16 bytes from an
+	// 8-byte alloca — an out-of-bounds stack access.
+	//
+	// We check resultType lane count (not laneCount from mask) because the mask
+	// is already derived from the surrounding SPMD context and may already be
+	// correct width; it is the resultType from getLLVMType that carries the
+	// wrong natural-register width.
+	if allocLC := spmdAddrAllocaLaneCount(instr.Addr); allocLC > 0 {
+		if resultType.TypeKind() == llvm.VectorTypeKind && resultType.VectorSize() != allocLC {
+			resultType = llvm.VectorType(resultType.ElementType(), allocLC)
+		}
+		if laneCount != allocLC {
+			laneCount = allocLC
+		}
+	}
 
 	// WASM swizzle fast path: IndexAddr detected a byte array ≤ 16 on WASM,
 	// loaded it as <16 x i8>, and ran i8x16.swizzle eagerly. Return the
@@ -8650,6 +8690,16 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 	// target-specific width. instr.Lanes may use host int sizes (e.g., 8 bytes
 	// on amd64 host) rather than target sizes (4 bytes on WASM).
 	laneCount := mask.Type().VectorSize()
+
+	// Alloca lane-count override: mirror of createSPMDLoad. When the destination
+	// is a Varying[T] alloca annotated with an SPMDLaneCount that differs from
+	// laneCount (derived from the mask), use the alloca's width for both laneCount
+	// and the mask. The mask may be wider than the alloca (e.g., widened by
+	// spmdConvertMaskFormat from <2 x i1> → <4 x i1>); narrow it back.
+	if allocLC := spmdAddrAllocaLaneCount(instr.Addr); allocLC > 0 && allocLC != laneCount {
+		mask = b.spmdNarrowVector(mask, allocLC)
+		laneCount = allocLC
+	}
 
 	// Non-vectorizable types (structs, interfaces, slice headers, closures)
 	// cannot be LLVM vector elements. LLVM only supports integer, float, and
