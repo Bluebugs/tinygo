@@ -298,6 +298,25 @@ func (c *compilerContext) spmdEffectiveLaneCount(spmdType *types.SPMDType, elemL
 	return c.spmdLaneCount(elemLLVM)
 }
 
+// spmdAddrBlockLaneCount returns the SPMDLaneCount annotation of the containing
+// block for an *ssa.Alloc address. Returns 0 if ssaAddr is not an *ssa.Alloc,
+// or if its block carries no annotation.
+//
+// Use this when emitting a load or store from an SSA address that may be a
+// varying alloca declared in a block annotated by spmdPropagateBlockLaneCount —
+// to size the load/store to match the alloca's stored vector width and avoid
+// width mismatches between alloca size and load/store element count.
+func spmdAddrBlockLaneCount(ssaAddr ssa.Value) int {
+	alloc, ok := ssaAddr.(*ssa.Alloc)
+	if !ok {
+		return 0
+	}
+	if alloc.Block() == nil {
+		return 0
+	}
+	return alloc.Block().SPMDLaneCount
+}
+
 // spmdMinLaneCountForSig returns the minimum lane count across all varying
 // parameters and results in a function signature. On architectures where
 // different element sizes produce different lane counts (e.g., AVX2: float32→8,
@@ -8437,6 +8456,16 @@ func (b *builder) createSPMDLoad(instr *ssa.SPMDLoad) llvm.Value {
 	// Derive lane count from the mask vector, which always has the correct
 	// target-specific width. instr.Lanes may use host int sizes.
 	laneCount := mask.Type().VectorSize()
+
+	// SPMD v4: when getLLVMType returns an element-natural vector width that
+	// disagrees with the loop's actual lane count (e.g., Varying[int] → <4 x i32>
+	// on WASM128, but the loop is float64-driven with 2 lanes), override resultType
+	// so that all loads and stores use the loop's width consistently. Without this,
+	// a <4 x i32> load from a <2 x i32> alloca causes IR type mismatches and
+	// reads uninitialised memory in lanes 2–3.
+	if resultType.TypeKind() == llvm.VectorTypeKind && resultType.VectorSize() != laneCount {
+		resultType = llvm.VectorType(resultType.ElementType(), laneCount)
+	}
 
 	// WASM swizzle fast path: IndexAddr detected a byte array ≤ 16 on WASM,
 	// loaded it as <16 x i8>, and ran i8x16.swizzle eagerly. Return the

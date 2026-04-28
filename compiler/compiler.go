@@ -5100,6 +5100,18 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 			}
 			return b.spmdMaskedGather(vecType, x, gatherMask), nil
 		} else {
+			// SPMD v4: when the dereference target is a varying alloca whose
+			// containing block was annotated by spmdPropagateBlockLaneCount with
+			// a lane count that differs from the element-natural width that
+			// getLLVMType produces, override valueType to match the annotation.
+			// This ensures that post-loop reads (e.g., reduce.Add reading an
+			// accumulator alloca) use the same vector width that the in-loop
+			// SPMDStore used to write the alloca.
+			if valueType.TypeKind() == llvm.VectorTypeKind {
+				if allocLC := spmdAddrBlockLaneCount(unop.X); allocLC > 0 && allocLC != valueType.VectorSize() {
+					valueType = llvm.VectorType(valueType.ElementType(), allocLC)
+				}
+			}
 			b.createNilCheck(unop.X, x, "deref")
 			load := b.CreateLoad(valueType, x, "")
 			return load, nil
