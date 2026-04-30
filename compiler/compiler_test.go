@@ -235,6 +235,11 @@ func testCompilePackage(t *testing.T, options *compileopts.Options, file string)
 		AutomaticStackSize: config.AutomaticStackSize(),
 		DefaultStackSize:   config.StackSize(),
 		NeedsStackObjects:  config.NeedsStackObjects(),
+		// MaxStackAlloc is propagated so that alloca vs heap
+		// decisions match the real compiler. Without it (0 default),
+		// every non-zero alloca goes to the heap, masking alloca
+		// instructions from IR pattern checks.
+		MaxStackAlloc: config.MaxStackAlloc(),
 		// SIMDEnabled and SIMDRegisterBytes are propagated so that SPMD tests
 		// (which use GOExperiment="spmd" in options) get the correct SIMD lane
 		// count. For non-SPMD tests, SIMDEnabled() returns false and
