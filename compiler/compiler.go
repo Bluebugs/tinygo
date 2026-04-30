@@ -566,17 +566,7 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 				}
 				return llvm.ArrayType(elemType, n)
 			default:
-				// SPMD v5: prefer the type-encoded lane count when set by the SSA
-				// predication or propagation pass. This is the canonical source for
-				// values inside SPMD loop scope. Falls back to spmdEffectiveLaneCount
-				// for width-free types (function signatures, global vars, abstract
-				// types from compilerContext-level queries).
-				var laneCount int
-				if typ.Lanes() > 0 {
-					laneCount = typ.Lanes()
-				} else {
-					laneCount = c.spmdEffectiveLaneCount(typ, elemType)
-				}
+				laneCount := c.spmdEffectiveLaneCount(typ, elemType)
 				// Scalar fallback: laneCount==1 means Varying[T] == T (no vector).
 				if laneCount <= 1 {
 					return elemType
