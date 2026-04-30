@@ -836,3 +836,101 @@ func main() {
 	// Verify the main body's store is a plain vector store, not scatter-per-field.
 	mustContain(t, ir, "store <4 x i32>")
 }
+
+// TestSPMDV5VaryingAllocaLLVMType verifies that a Varying[int] alloca
+// inside a go-for over []float64 is materialized at the loop's
+// iteration width (2 on WASM SIMD128), and ALL load/reduce ops on the
+// alloca are also at that width. v5 expects this without any
+// TinyGo-side audit because the type itself carries the width.
+func TestSPMDV5VaryingAllocaLLVMType(t *testing.T) {
+	src := `package main
+
+import (
+	"lanes"
+	"reduce"
+)
+
+var data = []float64{1, 2, 3, 4, 5, 6, 7, 8}
+
+func main() {
+	var acc lanes.Varying[int]
+	acc = 0
+	go for i, _ := range data {
+		acc += i
+	}
+	_ = reduce.Add(acc)
+}
+`
+	ir := compileSPMDSource(t, src)
+	mustContain(t, ir, "alloca <2 x i32>")
+	mustContain(t, ir, "load <2 x i32>, ptr %acc")
+	mustContain(t, ir, "reduce.add.v2i32")
+	mustNotContain(t, ir, "load <4 x i32>, ptr %acc")
+	mustNotContain(t, ir, "reduce.add.v4i32")
+}
+
+// TestSPMDV5VaryingByteIndexAddr verifies that b[i] = c in a []byte
+// loop produces matching <N x ptr> address and <N x i8> value vectors,
+// where N is the loop's lane count (16 on WASM128). This is the
+// to-upper bug -- v3/v4 broke this because the IndexAddr address vector
+// was sized at int's natural width, not the loop width.
+func TestSPMDV5VaryingByteIndexAddr(t *testing.T) {
+	src := `package main
+
+var src = []byte("hello world")
+
+func main() {
+	b := make([]byte, len(src))
+	go for i, c := range src {
+		if 'a' <= c && c <= 'z' {
+			b[i] = c - 32
+		} else {
+			b[i] = c
+		}
+	}
+	_ = b
+}
+`
+	ir := compileSPMDSource(t, src)
+	// On WASM128, byte iter = 16 lanes. Address and value vectors must
+	// agree at <16 x ptr> / <16 x i8>. Check absence of int-natural
+	// width leak.
+	mustNotContain(t, ir, "<4 x ptr>")
+	mustNotContain(t, ir, "scatter.v16i8.v4p0")
+}
+
+// TestSPMDV5LoContainsReduceAny verifies that reduce.Any on a varying
+// comparison result produces the right-width reduce intrinsic.
+// lo-contains failed in v3/v4 because reduce.Any read element-natural
+// width.
+func TestSPMDV5LoContainsReduceAny(t *testing.T) {
+	src := `package main
+
+import (
+	"lanes"
+	"reduce"
+)
+
+var data = []int32{1, 2, 3, 4, 5, 6, 7, 8}
+
+func find(target int32) bool {
+	var found lanes.Varying[bool]
+	go for _, x := range data {
+		if x == target {
+			found = true
+		}
+	}
+	return reduce.Any(found)
+}
+
+func main() {
+	_ = find(5)
+}
+`
+	ir := compileSPMDSource(t, src)
+	// On WASM128, int32 iter = 4 lanes. reduce.Any over a <4 x i1>-based
+	// mask is lowered via sext to <4 x i32> then llvm.wasm.anytrue.v4i32.
+	// The v4 width must appear: a width mismatch (e.g. v4i1 on 8-wide
+	// accumulator) would produce anytrue.v8i32 instead.
+	mustContainAny(t, ir, "anytrue.v4i32", "reduce.or.v4i1")
+}
