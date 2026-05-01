@@ -3127,6 +3127,39 @@ func (b *builder) spmdConvertMaskFormat(mask llvm.Value, targetType llvm.Type) l
 	return b.CreateSExt(i1Vec, targetType, "spmd.mask.cvt.sext")
 }
 
+// spmdReshapeVector reshapes a vector from its current lane count to the lane
+// count of targetType using shufflevector. When expanding (srcLanes < dstLanes),
+// upper lane slots receive the last element of the source (repeat-extend); when
+// shrinking (srcLanes > dstLanes), only the first dstLanes elements are kept.
+//
+// This is used by createSPMDStore to reconcile val lane count with addr lane
+// count in the scatter path. The element type of targetType must match the
+// element type of val (only the lane count changes).
+func (b *builder) spmdReshapeVector(val llvm.Value, targetType llvm.Type) llvm.Value {
+	if val.Type() == targetType {
+		return val
+	}
+	srcLanes := val.Type().VectorSize()
+	dstLanes := targetType.VectorSize()
+
+	// Build a shufflevector mask: indices into [val | undef] of length srcLanes.
+	// For indices i < srcLanes: take element i (identity).
+	// For indices i >= srcLanes (expand case): clamp to srcLanes-1 (repeat last).
+	// For shrink: only emit dstLanes indices, all < srcLanes.
+	maskElems := make([]llvm.Value, dstLanes)
+	i32Type := b.ctx.Int32Type()
+	for i := 0; i < dstLanes; i++ {
+		idx := i
+		if idx >= srcLanes {
+			idx = srcLanes - 1 // clamp: repeat last element in expansion
+		}
+		maskElems[i] = llvm.ConstInt(i32Type, uint64(idx), false)
+	}
+	shuffleMask := llvm.ConstVector(maskElems, false)
+	undef := llvm.Undef(val.Type())
+	return b.CreateShuffleVector(val, undef, shuffleMask, "spmd.val.reshape")
+}
+
 // spmdCallMask returns the mask value to pass when calling an SPMD function
 // in cases where no SSA-level CallCommon.SPMDMask was set. This handles SPMD
 // function bodies (varying-param functions) where the entry mask is the active mask.
@@ -8654,20 +8687,16 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 	// Non-vectorizable types (structs, interfaces, slice headers, closures)
 	// cannot be LLVM vector elements. LLVM only supports integer, float, and
 	// pointer element types in vectors. Use per-lane scalar fallbacks instead
-	// of vector intrinsics.
+	// of vector intrinsics. The vector-address case is handled inside the
+	// addr-is-vector block below (using addrLaneCount, not laneCount).
 	valElemType := val.Type()
 	if valElemType.TypeKind() == llvm.VectorTypeKind {
 		valElemType = valElemType.ElementType()
 	}
-	if !spmdIsVectorizableElemType(valElemType) {
-		if addr.Type().TypeKind() == llvm.VectorTypeKind {
-			// Varying address: per-lane conditional scatter.
-			b.spmdPerLaneScatterStore(val, addr, mask, laneCount)
-		} else {
-			// Scalar address: store if any lane is active. All active lanes
-			// share the same destination, so a single conditional store suffices.
-			b.spmdConditionalStore(val, addr, mask)
-		}
+	if !spmdIsVectorizableElemType(valElemType) && addr.Type().TypeKind() != llvm.VectorTypeKind {
+		// Scalar address: store if any lane is active. All active lanes
+		// share the same destination, so a single conditional store suffices.
+		b.spmdConditionalStore(val, addr, mask)
 		return
 	}
 
@@ -8732,9 +8761,26 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 	// If the address is a vector (varying pointers), emit a masked scatter.
 	// spmdMaskedScatter handles mask format unwrapping internally.
 	if addr.Type().TypeKind() == llvm.VectorTypeKind {
+		// The scatter must have exactly one value element per address pointer.
+		// addrLaneCount is the canonical lane count for this scatter — one ptr
+		// per data element. laneCount (from the mask, derived from the enclosing
+		// i32 loop context) may differ for narrower element types: e.g., on AVX2
+		// Varying[byte] gives <16 x ptr> while the loop mask is <8 x i32>.
+		addrLaneCount := addr.Type().VectorSize()
+
+		// Non-vectorizable types (structs, interfaces) use per-lane conditional
+		// stores. Pass addrLaneCount so each pointer in the address vector is
+		// visited — using laneCount would leave the upper pointers unhandled.
+		if !spmdIsVectorizableElemType(valElemType) {
+			b.spmdPerLaneScatterStore(val, addr, mask, addrLaneCount)
+			return
+		}
+
 		// Narrow widened values before scatter: when the value is <N x i32> but the
 		// destination pointer type implies a narrower element (e.g., *uint8 → i8), truncate
 		// so each lane scatter-writes only the correct number of bytes.
+		// Use addrLaneCount for the target vector width — not laneCount — because
+		// the scatter intrinsic requires val and ptrs to have the same lane count.
 		if val.Type().TypeKind() == llvm.VectorTypeKind {
 			var narrowBits uint64
 			if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
@@ -8747,9 +8793,21 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 			}
 			if narrowBits > 0 {
 				narrowType := b.ctx.IntType(int(narrowBits))
-				val = b.CreateTrunc(val, llvm.VectorType(narrowType, laneCount), "scatter.trunc")
+				val = b.CreateTrunc(val, llvm.VectorType(narrowType, addrLaneCount), "scatter.trunc")
 			}
 		}
+
+		// Reshape val to match addrLaneCount if they differ. This occurs when
+		// val was splatted or constructed with laneCount (the enclosing loop's
+		// i32-lane count) but the element type has a different natural lane
+		// count (e.g., Varying[byte] → 16 lanes on AVX2 vs 8 for i32).
+		// Mirror of the symmetric gather fix in createSPMDLoad lines 8553-8560.
+		if val.Type().TypeKind() == llvm.VectorTypeKind && val.Type().VectorSize() != addrLaneCount {
+			valElem := val.Type().ElementType()
+			targetVecType := llvm.VectorType(valElem, addrLaneCount)
+			val = b.spmdReshapeVector(val, targetVecType)
+		}
+
 		b.spmdMaskedScatter(val, addr, mask)
 		return
 	}
