@@ -4741,7 +4741,19 @@ func (b *builder) spmdMaskedStore(val, ptr, mask llvm.Value) {
 	// SIMD masked store intrinsic. Pack the sub-vector into a scalar integer and use
 	// a load-blend-store pattern instead.
 	if b.spmdUsesSIMD() {
-		vecBits := uint64(b.targetData.TypeAllocSize(vecType)) * 8
+		// Compute the true bit width of the vector for the scalar packing type.
+		// TypeAllocSize rounds up to a byte boundary (e.g., <4 x i1> → 1 byte = 8
+		// bits), but the actual packed bit width is laneCount × IntTypeWidth.
+		// Using TypeAllocSize would produce an i8 scalar for <4 x i1>, but
+		// bitcast <4 x i1> to i8 is invalid since the sizes differ (4 bits vs 8).
+		var elemBits uint64
+		elemLLVM := vecType.ElementType()
+		if elemLLVM.TypeKind() == llvm.IntegerTypeKind {
+			elemBits = uint64(elemLLVM.IntTypeWidth())
+		} else {
+			elemBits = uint64(b.targetData.TypeAllocSize(elemLLVM)) * 8
+		}
+		vecBits := uint64(laneCount) * elemBits
 		if vecBits < 128 {
 			scalarType := b.ctx.IntType(int(vecBits))
 			scalarVal := b.CreateBitCast(val, scalarType, "spmd.pack")
@@ -4749,7 +4761,6 @@ func (b *builder) spmdMaskedStore(val, ptr, mask llvm.Value) {
 			// Build a scalar mask by OR-ing each active lane bit into the full mask.
 			// For 4 lanes of i8: mask is 0x000000FF, 0x0000FF00, etc. for each lane.
 			scalarMaskVal := llvm.ConstNull(scalarType)
-			elemBits := uint64(b.targetData.TypeAllocSize(vecType.ElementType())) * 8
 			allBits := llvm.ConstAllOnes(b.ctx.IntType(int(elemBits)))
 			for lane := 0; lane < laneCount; lane++ {
 				laneIdx := llvm.ConstInt(b.ctx.Int32Type(), uint64(lane), false)
@@ -4994,27 +5005,81 @@ func (b *builder) spmdMaskedScatter(val, ptrs, mask llvm.Value) {
 // is a scalar (uniform) expression. Returns the loop and scalar base offset.
 // This generalizes contiguous detection beyond just the raw loop iter phi
 // to cover patterns like output[j*width + i] where j*width is scalar.
+//
+// Also handles the v5/v6 lift-guard pattern where the iter phi is stored
+// into a Varying[T] alloca and loaded back as an SPMDLoad. In that case the
+// IndexAddr sees SPMDLoad(i_alloca) as its index rather than the iter phi
+// directly. We trace through the single-store alloca to recover the phi.
 func (b *builder) spmdAnalyzeContiguousIndex(index ssa.Value) (*spmdActiveLoop, llvm.Value, bool) {
-	// Direct iter phi match (existing fast path).
-	if loop, ok := b.spmdLoopState.activeLoops[index]; ok {
+	// spmdUnwrapSPMDLoad traces through an SPMDLoad from a single-store alloca
+	// to find the stored value. This handles the v5/v6 lift guard that keeps
+	// Varying[T] allocas un-promoted: the iter phi is stored into an alloca
+	// and subsequent loads appear as *ssa.SPMDLoad rather than the phi itself.
+	// Returns the stored value, or v unchanged if tracing is not possible.
+	var unwrapLoad func(v ssa.Value) ssa.Value
+	unwrapLoad = func(v ssa.Value) ssa.Value {
+		load, ok := v.(*ssa.SPMDLoad)
+		if !ok {
+			return v
+		}
+		// Find the single store value for this alloca (mirrors spmdAllocaStoredValue
+		// in x-tools-spmd/go/ssa/spmd_predicate.go but local to avoid package export).
+		alloc, ok := load.Addr.(*ssa.Alloc)
+		if !ok || alloc.Referrers() == nil {
+			return v
+		}
+		var stored ssa.Value
+		for _, ref := range *alloc.Referrers() {
+			switch op := ref.(type) {
+			case *ssa.SPMDStore:
+				if op.Addr == alloc {
+					if stored != nil {
+						return v // multiple stores; cannot canonicalize
+					}
+					stored = op.Val
+				}
+			case *ssa.Store:
+				if op.Addr == alloc {
+					if stored != nil {
+						return v
+					}
+					stored = op.Val
+				}
+			}
+		}
+		if stored == nil {
+			return v
+		}
+		// Recurse: the stored value might itself be an SPMDLoad (rare, but safe).
+		return unwrapLoad(stored)
+	}
+
+	// Unwrap the index through any SPMDLoad-from-alloca chain.
+	unwrapped := unwrapLoad(index)
+
+	// Direct iter phi match (existing fast path), with SPMDLoad unwrapping.
+	if loop, ok := b.spmdLoopState.activeLoops[unwrapped]; ok {
 		return loop, loop.scalarIterVal, true
 	}
 
-	// Check BinOp: scalar + iter or iter + scalar.
-	binop, ok := index.(*ssa.BinOp)
+	// Check BinOp: scalar + iter or iter + scalar, with unwrapping on both sides.
+	binop, ok := unwrapped.(*ssa.BinOp)
 	if !ok || binop.Op != token.ADD {
 		return nil, llvm.Value{}, false
 	}
 
+	xUnwrapped := unwrapLoad(binop.X)
+	yUnwrapped := unwrapLoad(binop.Y)
+
 	// Try X=iter, Y=scalar.
-	if loop, ok := b.spmdLoopState.activeLoops[binop.X]; ok {
+	if loop, ok := b.spmdLoopState.activeLoops[xUnwrapped]; ok {
 		if scalarVal, ok := b.spmdUnwrapScalar(binop.Y); ok {
 			scalarBase := b.CreateAdd(scalarVal, loop.scalarIterVal, "spmd.contiguous.base")
 			return loop, scalarBase, true
 		}
 	}
 	// Try X=scalar, Y=iter.
-	if loop, ok := b.spmdLoopState.activeLoops[binop.Y]; ok {
+	if loop, ok := b.spmdLoopState.activeLoops[yUnwrapped]; ok {
 		if scalarVal, ok := b.spmdUnwrapScalar(binop.X); ok {
 			scalarBase := b.CreateAdd(scalarVal, loop.scalarIterVal, "spmd.contiguous.base")
 			return loop, scalarBase, true
@@ -8709,6 +8774,52 @@ func (b *builder) createSPMDStore(instr *ssa.SPMDStore) {
 		// types may still be scalar (e.g., int32). Splat scalar values using
 		// the active loop's lane count.
 		val = b.splatScalar(val, llvm.VectorType(val.Type(), laneCount))
+	}
+
+	// Bool-varying store normalization: Varying[bool] allocas use <N x i1>
+	// (packed 1 bit per lane) as the in-memory representation. Comparison
+	// results produced by createBinOp are wrapped to mask format (<N x i8>
+	// on WASM, <N x i32> on x86) for efficient SIMD select/and/or. Storing
+	// a wrapped mask to a <N x i1> alloca writes the wrong number of bytes
+	// (16 bytes to a 2-byte slot on WASM 16-lane) and corrupts adjacent
+	// stack data. LLVM's store-forwarding then reloads 2 bytes and
+	// reinterprets them as 16 bits, producing bogus boolean lane values.
+	// Fix: truncate the wrapped mask back to <N x i1> so the store size
+	// matches the alloca size. CreateTrunc i8→i1 takes the LSB, which is
+	// correct for 0xFF (active) → 1 and 0x00 (inactive) → 0.
+	if val.Type().TypeKind() == llvm.VectorTypeKind &&
+		val.Type().ElementType() != b.ctx.Int1Type() {
+		if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
+			destElemType := b.getLLVMType(addrPtrType.Elem())
+			if destElemType.TypeKind() == llvm.VectorTypeKind &&
+				destElemType.ElementType() == b.ctx.Int1Type() &&
+				destElemType.VectorSize() == val.Type().VectorSize() {
+				val = b.CreateTrunc(val, destElemType, "spmd.bool.store.trunc")
+			}
+		}
+	}
+
+	// Width-narrowing normalization: the identity load path widens sub-128-bit
+	// vectors to avoid invalid WASM IR (e.g., <4 x i16> → <4 x i32>). When
+	// storing the widened result back to a narrower alloca (e.g., the range
+	// loop variable has SSA type Varying[uint16] → alloca <4 x i16>), truncate
+	// to the destination element width before the store so the sizes match.
+	// Without this, a <4 x i32> (16-byte) store to a <4 x i16> (8-byte) alloca
+	// writes past the alloca boundary and corrupts adjacent stack variables.
+	if val.Type().TypeKind() == llvm.VectorTypeKind &&
+		val.Type().ElementType().TypeKind() == llvm.IntegerTypeKind {
+		if addrPtrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); ok {
+			destElemType := b.getLLVMType(addrPtrType.Elem())
+			if destElemType.TypeKind() == llvm.VectorTypeKind &&
+				destElemType.ElementType().TypeKind() == llvm.IntegerTypeKind &&
+				destElemType.VectorSize() == val.Type().VectorSize() {
+				srcWidth := val.Type().ElementType().IntTypeWidth()
+				dstWidth := destElemType.ElementType().IntTypeWidth()
+				if srcWidth > dstWidth {
+					val = b.CreateTrunc(val, destElemType, "spmd.widen.store.trunc")
+				}
+			}
+		}
 	}
 
 	// Contiguous access: use vector store instead of scatter.

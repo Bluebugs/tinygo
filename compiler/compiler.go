@@ -2034,6 +2034,25 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 			// nothing to store
 			return
 		}
+		// SPMD: if the address is a vector-of-pointers (scatter GEP from a Varying[T]
+		// index), emit a masked scatter instead of a plain store. This occurs in
+		// divergent inner loops where each SPMD lane writes to a distinct location
+		// (e.g., result[i] = t inside a go-for loop body). The plain store instruction
+		// type-checks fail when val is scalar and addr is <N x ptr>, or when val is
+		// <N x T> and addr is <N x ptr> — both are scatter semantics.
+		if b.spmdLoopState != nil && llvmAddr.Type().TypeKind() == llvm.VectorTypeKind {
+			laneCount := llvmAddr.Type().VectorSize()
+			if llvmVal.Type().TypeKind() != llvm.VectorTypeKind {
+				// Scalar value: broadcast to all lanes.
+				vecType := llvm.VectorType(llvmVal.Type(), laneCount)
+				llvmVal = b.splatScalar(llvmVal, vecType)
+			}
+			// All-lanes-active mask (no varying control flow at this point).
+			maskElem := b.spmdMaskElemType(laneCount)
+			allOnes := llvm.ConstAllOnes(llvm.VectorType(maskElem, laneCount))
+			b.spmdMaskedScatter(llvmVal, llvmAddr, allOnes)
+			return
+		}
 		b.CreateStore(llvmVal, llvmAddr)
 		// SPMD: keep shadow vectors in sync when scalar byte stores write to
 		// constant indices of a tracked alloca. Skip when the store was handled
@@ -3422,19 +3441,65 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		// SPMD: detect contiguous access patterns for vector load/store optimization.
 		// When the index is a known SPMD loop iterator (or a scalar+iter expression),
 		// generate a scalar GEP for masked load/store instead of per-lane gather/scatter.
+		//
+		// Contiguous detection is only valid when ALL referrers of this IndexAddr are
+		// memory operations (SPMDLoad/SPMDStore/Store/UnOp{MUL}). If the address
+		// is also consumed as a value — e.g., to form a Varying[*T] via ChangeType
+		// for scatter — a scalar GEP is wrong. In that case the per-lane vector GEP
+		// path below must run instead.
 		if b.spmdLoopState != nil && b.spmdValueOverride != nil {
-			// Fast path: index is directly the loop iter phi (overridden to lane indices).
-			if _, isOverridden := b.spmdValueOverride[expr.Index]; isOverridden {
-				if loop, ok := b.spmdLoopState.activeLoops[expr.Index]; ok {
-					if result, err := b.spmdContiguousIndexAddr(expr, loop); err == nil {
-						return result, nil
+			onlyMemOps := true
+			if refs := expr.Referrers(); refs != nil {
+				for _, ref := range *refs {
+					switch r := ref.(type) {
+					case *ssa.SPMDLoad:
+						// load through this address — memory op, ok
+					case *ssa.SPMDStore:
+						if r.Addr == expr {
+							// store to this address — memory op, ok
+						} else {
+							onlyMemOps = false
+						}
+					case *ssa.Store:
+						if r.Addr == expr {
+							// store to this address — memory op, ok
+						} else {
+							onlyMemOps = false
+						}
+					case *ssa.UnOp:
+						if r.Op == token.MUL {
+							// pointer dereference — memory op, ok
+						} else {
+							onlyMemOps = false
+						}
+					case *ssa.DebugRef:
+						// Debug metadata reference — not a real use; safe.
+					default:
+						// Any other referrer (ChangeType, BinOp, etc.) means
+						// the address is used as a value; scalar GEP is wrong.
+						onlyMemOps = false
+					}
+					if !onlyMemOps {
+						break
 					}
 				}
 			}
-			// Generalized path: index is scalar_expr + iter (e.g., j*width + i).
-			if loop, scalarBase, ok := b.spmdAnalyzeContiguousIndex(expr.Index); ok {
-				if result, err := b.spmdContiguousIndexAddrCore(expr, loop, scalarBase); err == nil {
-					return result, nil
+			if onlyMemOps {
+				// Fast path: index is directly the loop iter phi (overridden to lane indices).
+				if _, isOverridden := b.spmdValueOverride[expr.Index]; isOverridden {
+					if loop, ok := b.spmdLoopState.activeLoops[expr.Index]; ok {
+						if result, err := b.spmdContiguousIndexAddr(expr, loop); err == nil {
+							return result, nil
+						}
+					}
+				}
+				// Generalized path: index is scalar_expr + iter (e.g., j*width + i).
+				// Also handles the v5/v6 lift-guard pattern where iter is stored into
+				// a Varying[T] alloca and loaded back via SPMDLoad.
+				if loop, scalarBase, ok := b.spmdAnalyzeContiguousIndex(expr.Index); ok {
+					if result, err := b.spmdContiguousIndexAddrCore(expr, loop, scalarBase); err == nil {
+						return result, nil
+					}
 				}
 			}
 		}
@@ -3489,28 +3554,44 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			// spmdSwizzleResult; SPMDLoad returns it directly.
 			// No bounds check needed — both swizzle and pshufb return 0 for
 			// indices with bit 7 set (i.e., indices >= 128, including 0xFF).
+			//
+			// Only applies when this IndexAddr is ONLY used for reads (loads).
+			// If any referrer is a store/SPMDStore, fall through to the scatter GEP
+			// path so the actual address is computed and the write succeeds.
 			if b.spmdUsesSIMD() && b.spmdSwizzleResult != nil {
 				if ptrTyp, ok := expr.X.Type().Underlying().(*types.Pointer); ok {
 					if arrTyp, ok := ptrTyp.Elem().Underlying().(*types.Array); ok {
 						if b.getLLVMType(arrTyp.Elem()) == b.ctx.Int8Type() && arrTyp.Len() <= 16 {
-							// SPMD gather coalescing: if this IndexAddr is part of a gather
-							// group, emit one merged swizzle for the whole group on first
-							// access and extract the per-member column on subsequent accesses.
-							if expr.SPMDGatherGroup != nil {
-								result, err := b.spmdCoalescedGather(expr, val, index, laneCount)
-								if err == nil {
-									b.spmdSwizzleResult[expr] = result
-									return llvm.Undef(b.dataPtrType), nil
+							// Check: does any referrer write to this IndexAddr?
+							hasStore := false
+							if refs := expr.Referrers(); refs != nil {
+								for _, ref := range *refs {
+									switch ref.(type) {
+									case *ssa.Store, *ssa.SPMDStore:
+										hasStore = true
+									}
 								}
-								// Fall through to individual swizzle on error.
 							}
+							if !hasStore {
+								// SPMD gather coalescing: if this IndexAddr is part of a gather
+								// group, emit one merged swizzle for the whole group on first
+								// access and extract the per-member column on subsequent accesses.
+								if expr.SPMDGatherGroup != nil {
+									result, err := b.spmdCoalescedGather(expr, val, index, laneCount)
+									if err == nil {
+										b.spmdSwizzleResult[expr] = result
+										return llvm.Undef(b.dataPtrType), nil
+									}
+									// Fall through to individual swizzle on error.
+								}
 
-							result, err := b.spmdSwizzleFromPtr(val, index, int(arrTyp.Len()), laneCount)
-							if err != nil {
-								return llvm.Value{}, err
+								result, err := b.spmdSwizzleFromPtr(val, index, int(arrTyp.Len()), laneCount)
+								if err != nil {
+									return llvm.Value{}, err
+								}
+								b.spmdSwizzleResult[expr] = result
+								return llvm.Undef(b.dataPtrType), nil
 							}
-							b.spmdSwizzleResult[expr] = result
-							return llvm.Undef(b.dataPtrType), nil
 						}
 					}
 				}
