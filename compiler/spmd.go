@@ -988,6 +988,66 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 	// vice versa).
 	seenLoopInfo := make(map[*SPMDLoopInfo]bool)
 
+	// Map each AST SPMDLoopInfo to the SSA-side IsRangeIndex flag. This
+	// requires correlating SSA SPMDLoopInfo entries (from x-tools-spmd) with
+	// the AST SPMDLoopInfo entries (from extractSPMDLoops). Used by Pass 1/Pass 2
+	// structural filters to avoid the rangeint-vs-rangeindex first-claim race
+	// when source has nested loops (e.g., bit-counting: outer rangeindex loop
+	// containing inner rangeint loop — both body blocks have positions inside the
+	// outer SPMD loop's source range, so isInSPMDLoop returns the outer loopInfo
+	// for both; the IsRangeIndex flag distinguishes them).
+	//
+	// Two strategies for the correlation:
+	//   Strategy A (rangeint): body block instructions have positions inside
+	//   [BodyStart, BodyEnd] — isInSPMDLoop works directly.
+	//   Strategy B (rangeindex): body instructions are positioned at the range
+	//   expression / variable declaration, BEFORE the opening brace (BodyStart).
+	//   Use BoundValue.Pos() to find the AST loop whose [ForPos, BodyStart)
+	//   bracket contains it.
+	loopInfoIsRangeIndex := make(map[*SPMDLoopInfo]bool)
+	if b.compilerContext.spmdInfo != nil {
+		for _, ssaLoop := range b.fn.SPMDLoops {
+			// Strategy A: search body/loop/entry block instructions for a position inside the AST loop body.
+			candidateBlocks := []*ssa.BasicBlock{ssaLoop.BodyBlock, ssaLoop.LoopBlock, ssaLoop.EntryBlock}
+			mapped := false
+			for _, lookupBlock := range candidateBlocks {
+				if lookupBlock == nil || mapped {
+					continue
+				}
+				for _, instr := range lookupBlock.Instrs {
+					if pos := instr.(interface{ Pos() token.Pos }).Pos(); pos != token.NoPos {
+						if info := b.isInSPMDLoop(pos); info != nil {
+							loopInfoIsRangeIndex[info] = ssaLoop.IsRangeIndex
+							mapped = true
+							break
+						}
+					}
+				}
+			}
+			if mapped {
+				continue
+			}
+
+			// Strategy B: BoundValue.Pos() falls in the range header (before BodyStart).
+			// Find the AST loop whose ForPos <= boundPos < BodyStart.
+			if ssaLoop.BoundValue == nil {
+				continue
+			}
+			boundPos := ssaLoop.BoundValue.Pos()
+			if boundPos == token.NoPos {
+				continue
+			}
+			for _, r := range b.compilerContext.spmdInfo.loopRanges {
+				// r.start = BodyStart (the '{'), r.info.ForPos = 'for' keyword.
+				// The bound value is positioned in the loop header: ForPos <= boundPos < r.start.
+				if r.info.ForPos <= boundPos && boundPos < r.start {
+					loopInfoIsRangeIndex[r.info] = ssaLoop.IsRangeIndex
+					break
+				}
+			}
+		}
+	}
+
 	// Pass 0: Handle SSA-peeled loops directly from metadata.
 	// When peelSPMDLoops runs in go/ssa, it creates MainBodyBlock, TailBodyBlock,
 	// etc. The original body block becomes unreachable but is still in fn.Blocks.
@@ -1188,6 +1248,13 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			continue
 		}
 
+		// v6.1 structural filter: this rangeint.body's containing SPMD loop is
+		// actually a rangeindex (outer go for ... range slice). The rangeint is
+		// a NESTED scalar loop; let Pass 2 below claim the outer rangeindex.body.
+		if loopInfoIsRangeIndex[loopInfo] {
+			continue
+		}
+
 		// Deduplicate: if this SPMDLoopInfo was already claimed (by either
 		// pass), the current block is a nested regular loop — skip it.
 		if seenLoopInfo[loopInfo] {
@@ -1331,10 +1398,38 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 			}
 		}
 		if loopInfo == nil {
-			// No SPMD loop found via body instruction positions. This can happen
-			// if the body block contains only synthetic instructions with no source
-			// position. In practice, go for range-over-slice bodies always contain
-			// at least one user instruction (IndexAddr, etc.).
+			// Fallback for rangeindex loops: body block instructions are positioned
+			// at the range expression / variable declaration, BEFORE the opening
+			// brace (BodyStart). isInSPMDLoop searches [BodyStart, BodyEnd] and
+			// misses these. Search loopRanges for a range whose header bracket
+			// [ForPos, BodyStart) contains the instruction position.
+			if b.compilerContext.spmdInfo != nil {
+				for _, instr := range block.Instrs {
+					pos := instr.Pos()
+					if !pos.IsValid() {
+						continue
+					}
+					for i := range b.compilerContext.spmdInfo.loopRanges {
+						r := &b.compilerContext.spmdInfo.loopRanges[i]
+						if r.info.ForPos <= pos && pos < r.start {
+							loopInfo = r.info
+							break
+						}
+					}
+					if loopInfo != nil {
+						break
+					}
+				}
+			}
+		}
+		if loopInfo == nil {
+			continue
+		}
+
+		// v6.1 structural filter: this rangeindex.body's containing SPMD loop is
+		// actually a rangeint (outer go for i := range N). The rangeindex is
+		// a NESTED scalar loop; Pass 1 already claimed the outer rangeint.body.
+		if !loopInfoIsRangeIndex[loopInfo] {
 			continue
 		}
 
