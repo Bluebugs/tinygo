@@ -558,9 +558,18 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 				// LLVM does not support vectors of aggregate types (structs, arrays).
 				// Slices, interfaces, and other composite Go types lower to structs.
 				// Use [N x elemType] array representation so the LLVM IR stays valid.
-				// N=1 means serial (scalar) execution; the lane count is still correct
-				// but SIMD hardware acceleration is not achieved.
-				n := c.spmdLaneCount(elemType)
+				//
+				// SPMD v7: prefer the type-encoded lane count when set by Pass A's
+				// classifier in the SSA predication pass — this is the canonical
+				// source for varying values inside SPMD loop scope. Falls back to
+				// spmdLaneCount(elemType) (the elem-natural width) for width-free
+				// types (function signatures, global vars, abstract types).
+				var n int
+				if typ.Lanes() > 0 {
+					n = typ.Lanes()
+				} else {
+					n = c.spmdLaneCount(elemType)
+				}
 				if n < 1 {
 					n = 1
 				}

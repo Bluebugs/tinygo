@@ -934,3 +934,62 @@ func main() {
 	// accumulator) would produce anytrue.v8i32 instead.
 	mustContainAny(t, ir, "anytrue.v4i32", "reduce.or.v4i1")
 }
+
+// TestSPMDVaryingSliceAllocaSize asserts that a Varying[[]int] alloca
+// inside a SPMD loop is sized [N x slice_struct] where N is the loop's
+// lane count, not [1 x slice_struct]. The latter caused the v6.1
+// array-counting UB (write 4 lanes into 1-lane alloca).
+func TestSPMDVaryingSliceAllocaSize(t *testing.T) {
+	src := `package main
+
+var arrays = [][]int{
+	{1, 2, 3},
+	{4, 5},
+	{6},
+	{7, 8, 9, 10},
+}
+
+func countArrays(arrays [][]int) []int {
+	result := make([]int, len(arrays))
+	go for i, secondLevel := range arrays {
+		t := 0
+		for _, v := range secondLevel {
+			t += v
+		}
+		result[i] = t
+	}
+	return result
+}
+
+func main() {
+	_ = countArrays(arrays)
+}
+`
+	ir := compileSPMDSource(t, src)
+	// On WASM128, [][]int outer range is 4-wide (int = i32 = 4 lanes).
+	// The secondLevel Varying[[]int] alloca must be [4 x { ptr, i32, i32 }],
+	// not [1 x { ptr, i32, i32 }] (the pre-fix size from spmdLaneCount=1).
+	if !strings.Contains(ir, "alloca [4 x { ptr, i32, i32 }]") {
+		t.Errorf("expected secondLevel alloca [4 x { ptr, i32, i32 }] in IR; full IR snippet:\n%s",
+			extractAllocaLines(ir))
+	}
+	if strings.Contains(ir, "alloca [1 x { ptr, i32, i32 }]") {
+		t.Errorf("found stale [1 x { ptr, i32, i32 }] alloca (pre-fix size); full IR snippet:\n%s",
+			extractAllocaLines(ir))
+	}
+}
+
+// extractAllocaLines returns lines from ir that contain "alloca [" for
+// diagnostic output in test failures.
+func extractAllocaLines(ir string) string {
+	var lines []string
+	for _, line := range strings.Split(ir, "\n") {
+		if strings.Contains(line, "alloca [") {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return "(no alloca [ lines found)"
+	}
+	return strings.Join(lines, "\n")
+}
