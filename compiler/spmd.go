@@ -3755,6 +3755,59 @@ func (b *builder) createSwizzle(instr *ssa.CallCommon) (llvm.Value, error) {
 	return llvm.Value{}, b.makeError(pos, "lanes.Swizzle: unsupported value type")
 }
 
+// spmdCanonicalSSAIndex traces SSA wrappers back to the underlying value.
+//
+// The v5/v6 lift guard keeps Varying[T] allocas un-promoted, so a
+// constant-folded index expression ends up stored into an alloca and reloaded
+// as an *ssa.SPMDLoad by the time the builtin call site is reached.
+// Additionally, arithmetic type conversions (Varying[int32] → Varying[int])
+// appear as *ssa.ChangeType or *ssa.Convert wrappers around the constant.
+// This function peels all three wrapper kinds so that
+// spmdExtractConstVectorInt64s sees the underlying LLVM constant.
+func spmdCanonicalSSAIndex(v ssa.Value) ssa.Value {
+	for {
+		switch u := v.(type) {
+		case *ssa.SPMDLoad:
+			// Trace through a single-store alloca to recover the stored value.
+			alloc, ok := u.Addr.(*ssa.Alloc)
+			if !ok || alloc.Referrers() == nil {
+				return v
+			}
+			var stored ssa.Value
+			for _, ref := range *alloc.Referrers() {
+				switch op := ref.(type) {
+				case *ssa.SPMDStore:
+					if op.Addr == alloc {
+						if stored != nil {
+							return v // multiple stores; cannot canonicalize
+						}
+						stored = op.Val
+					}
+				case *ssa.Store:
+					if op.Addr == alloc {
+						if stored != nil {
+							return v
+						}
+						stored = op.Val
+					}
+				}
+			}
+			if stored == nil {
+				return v
+			}
+			v = stored
+		case *ssa.ChangeType:
+			v = u.X
+		case *ssa.Convert:
+			// Varying[int32] → Varying[int] arithmetic conversions on
+			// constant-folded values preserve the underlying constant.
+			v = u.X
+		default:
+			return v
+		}
+	}
+}
+
 // createSwizzleWithin permutes values within independent groups using compile-time constant indices.
 //
 // For a vector of totalLanes elements divided into groups of groupSize, each group
@@ -3766,7 +3819,11 @@ func (b *builder) createSwizzle(instr *ssa.CallCommon) (llvm.Value, error) {
 func (b *builder) createSwizzleWithin(instr *ssa.CallCommon, name string) (llvm.Value, error) {
 	pos := getPos(instr)
 	value := b.getValue(instr.Args[0], pos)
-	indices := b.getValue(instr.Args[1], pos)
+	// v5/v6 lift guard: the index expression may be alloca-mediated (SPMDLoad)
+	// and wrapped by ChangeType/Convert. Trace back to the underlying constant
+	// so that spmdExtractConstVectorInt64s can extract the integer values.
+	indicesSSA := spmdCanonicalSSAIndex(instr.Args[1])
+	indices := b.getValue(indicesSSA, pos)
 
 	groupSize, ok := spmdExtractIntConst(instr.Args[2])
 	if !ok {
