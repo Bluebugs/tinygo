@@ -9101,8 +9101,18 @@ func (b *builder) createSPMDIndex(instr *ssa.SPMDIndex) llvm.Value {
 // mask element width. The SSA result type is <N x T> vector.
 func (b *builder) createTypeAssertSPMD(itf llvm.Value, expr *ssa.TypeAssert, spmdType *types.SPMDType, vecType llvm.Type) llvm.Value {
 	// Build the struct type that matches the type code used in boxing.
+	// Honor spmdType.Lanes() when set, mirroring createMakeInterface
+	// (interface.go:131-145). Without this symmetry, a Varying[T]_N
+	// width-fixed by the SSA predication pass would be boxed with a
+	// [N]T typecode but looked up here with a [native]T typecode,
+	// breaking the runtime type assertion. In practice nothing today
+	// puts Lanes()>0 on a TypeAssert.AssertedType, so this is a
+	// forward-compatibility safety net.
 	elemLLVM := b.getLLVMType(spmdType.Elem())
-	laneCount := b.spmdEffectiveLaneCount(spmdType, elemLLVM)
+	laneCount := spmdType.Lanes()
+	if laneCount <= 0 {
+		laneCount = b.spmdEffectiveLaneCount(spmdType, elemLLVM)
+	}
 	boxedGoType := b.spmdBoxedVaryingGoType(spmdType, laneCount)
 	// Build the LLVM struct type directly so the mask array element type matches
 	// the platform-specific mask element (i32 for 4-lane, i16 for 8-lane, i8 for
