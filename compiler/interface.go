@@ -130,7 +130,18 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 	// callers can recover which lanes were active when the value was boxed.
 	if spmdType, ok := typ.(*types.SPMDType); ok && spmdType.IsVarying() {
 		elemLLVM := c.getLLVMType(spmdType.Elem())
-		laneCount := c.spmdEffectiveLaneCount(spmdType, elemLLVM)
+		// Prefer the type-encoded lane count when set (loop-fixed width
+		// from Pass A/B in the SSA predication pass). This matches the
+		// rule in getLLVMType (compiler.go:568-587, covering both the
+		// Struct/Array branch and the default vector branch) so the typecode
+		// describes the same [N]T array shape as the LLVM vector value
+		// being boxed. Falls back to spmdEffectiveLaneCount for
+		// abstract Varying[T] (Lanes()==0) from function signatures,
+		// globals, and other width-free contexts.
+		laneCount := spmdType.Lanes()
+		if laneCount <= 0 {
+			laneCount = c.spmdEffectiveLaneCount(spmdType, elemLLVM)
+		}
 		return c.getTypeCode(c.spmdBoxedVaryingGoType(spmdType, laneCount))
 	}
 
