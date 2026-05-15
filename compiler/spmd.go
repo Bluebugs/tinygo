@@ -3356,6 +3356,50 @@ func spmdIsFloat(t types.Type) bool {
 	return false
 }
 
+// createSpmdFMA emits a fused multiply-add: result = a*b + c.
+//
+// On WASM with +relaxed-simd over a float vector, it emits
+// llvm.wasm.relaxed.madd (WebAssembly relaxed-SIMD fused multiply-add).
+// This is an implementation-defined fused-or-unfused operation — rounding
+// may differ from IEEE 754 single-rounding FMA on some WASM runtimes — but
+// it avoids scalarization to libcall $fmaf that @llvm.fma forces on WASM
+// (which has no native vector FMA instruction).
+//
+// On x86 with +fma the existing @llvm.fma path already emits vfmadd213ps
+// (exact IEEE 754 single-rounding); that path is unchanged.
+//
+// On WASM without +relaxed-simd, or for non-float/non-vector types, falls
+// back to the generic @llvm.fma intrinsic via createSpmdMathIntrinsic.
+func (b *builder) createSpmdFMA(args []llvm.Value, pos token.Pos) (llvm.Value, error) {
+	if len(args) != 3 {
+		return llvm.Value{}, b.makeError(pos, "lanes.FMA: expected 3 arguments")
+	}
+	vecType := args[0].Type()
+	// Use llvm.wasm.relaxed.madd only for WASM relaxed-SIMD float vectors.
+	// Integer types and non-vector types fall through to the standard path.
+	if b.spmdHasRelaxedSIMD() && vecType.TypeKind() == llvm.VectorTypeKind {
+		elemKind := vecType.ElementType().TypeKind()
+		if elemKind == llvm.FloatTypeKind || elemKind == llvm.DoubleTypeKind {
+			// llvm.wasm.relaxed.madd is overloaded: mangled as
+			// llvm.wasm.relaxed.madd.vNf32 or llvm.wasm.relaxed.madd.vNf64.
+			var bits int
+			if elemKind == llvm.FloatTypeKind {
+				bits = 32
+			} else {
+				bits = 64
+			}
+			intrinsicName := fmt.Sprintf("llvm.wasm.relaxed.madd.v%df%d", vecType.VectorSize(), bits)
+			fnType := llvm.FunctionType(vecType, []llvm.Type{vecType, vecType, vecType}, false)
+			fn := b.mod.NamedFunction(intrinsicName)
+			if fn.IsNil() {
+				fn = llvm.AddFunction(b.mod, intrinsicName, fnType)
+			}
+			return b.createCall(fnType, fn, args, "lanes.FMA"), nil
+		}
+	}
+	return b.createSpmdMathIntrinsic("fma", args, pos)
+}
+
 // createSpmdMathIntrinsic emits a call to an LLVM vector math intrinsic
 // (@llvm.<name>.vNf{32,64}) with the given arguments. All args must have
 // matching vector types with floating-point element kind; the result type
@@ -3633,7 +3677,10 @@ func (b *builder) createLanesBuiltin(instr *ssa.CallCommon, name string) (llvm.V
 			}, getPos(instr))
 
 	case strings.HasPrefix(name, "lanes.FMA["):
-		return b.createSpmdMathIntrinsic("fma",
+		// createSpmdFMA selects llvm.wasm.relaxed.madd on WASM+relaxed-simd
+		// (avoids scalarization to $fmaf libcalls) or @llvm.fma elsewhere
+		// (emits vfmadd213ps on x86+fma).
+		return b.createSpmdFMA(
 			[]llvm.Value{
 				b.getValue(instr.Args[0], getPos(instr)),
 				b.getValue(instr.Args[1], getPos(instr)),

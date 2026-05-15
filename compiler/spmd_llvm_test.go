@@ -7004,6 +7004,103 @@ func TestSPMDRelaxedSwizzleUsedWhenAvailable(t *testing.T) {
 	}
 }
 
+// TestSPMDFMARelaxedMadd verifies that createSpmdFMA emits llvm.wasm.relaxed.madd
+// when the target supports +relaxed-simd (WASM), and falls back to @llvm.fma on
+// WASM without relaxed-simd and on x86 (which correctly lowers to vfmadd213ps).
+func TestSPMDFMARelaxedMadd(t *testing.T) {
+	buildVec4f32 := func(t *testing.T, c *compilerContext) llvm.Value {
+		t.Helper()
+		f32Type := c.ctx.FloatType()
+		vec := llvm.Undef(llvm.VectorType(f32Type, 4))
+		for i := 0; i < 4; i++ {
+			vec = c.ctx.NewBuilder().CreateInsertElement(vec,
+				llvm.ConstFloat(f32Type, float64(i+1)),
+				llvm.ConstInt(c.ctx.Int32Type(), uint64(i), false), "")
+		}
+		return vec
+	}
+
+	t.Run("WASM_with_relaxed_simd_emits_relaxed_madd", func(t *testing.T) {
+		c := newTestCompilerContextRelaxed(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+		vec := buildVec4f32(t, c)
+		result, err := b.createSpmdFMA([]llvm.Value{vec, vec, vec}, token.NoPos)
+		if err != nil {
+			t.Fatalf("createSpmdFMA: %v", err)
+		}
+		if result.IsNil() {
+			t.Fatal("createSpmdFMA returned nil value")
+		}
+		modIR := b.mod.String()
+		if !strings.Contains(modIR, "llvm.wasm.relaxed.madd") {
+			t.Error("expected llvm.wasm.relaxed.madd in module IR for WASM+relaxed-simd")
+		}
+		if strings.Contains(modIR, "llvm.fma.") {
+			t.Error("unexpected llvm.fma in module IR when relaxed-simd is available on WASM")
+		}
+	})
+
+	t.Run("WASM_without_relaxed_simd_emits_llvm_fma", func(t *testing.T) {
+		target, err := llvm.GetTargetFromTriple("wasm32-unknown-wasi")
+		if err != nil {
+			t.Skipf("WASM target not available: %v", err)
+		}
+		machine := target.CreateTargetMachine("wasm32-unknown-wasi", "", "+simd128",
+			llvm.CodeGenLevelDefault, llvm.RelocDefault, llvm.CodeModelDefault)
+		config := &Config{Triple: "wasm32-unknown-wasi", Features: "+simd128"}
+		c := newCompilerContext("test", machine, config, false)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+		vec := buildVec4f32(t, c)
+		result, err := b.createSpmdFMA([]llvm.Value{vec, vec, vec}, token.NoPos)
+		if err != nil {
+			t.Fatalf("createSpmdFMA: %v", err)
+		}
+		if result.IsNil() {
+			t.Fatal("createSpmdFMA returned nil value")
+		}
+		modIR := b.mod.String()
+		if strings.Contains(modIR, "llvm.wasm.relaxed.madd") {
+			t.Error("unexpected llvm.wasm.relaxed.madd in module IR when relaxed-simd is absent")
+		}
+		if !strings.Contains(modIR, "llvm.fma.v4f32") {
+			t.Error("expected llvm.fma.v4f32 in module IR for WASM without relaxed-simd")
+		}
+	})
+
+	t.Run("x86_emits_llvm_fma_not_relaxed_madd", func(t *testing.T) {
+		target, err := llvm.GetTargetFromTriple("x86_64-unknown-linux-gnu")
+		if err != nil {
+			t.Skipf("x86_64 target not available: %v", err)
+		}
+		machine := target.CreateTargetMachine("x86_64-unknown-linux-gnu", "", "+sse4.2,+avx2,+fma",
+			llvm.CodeGenLevelDefault, llvm.RelocDefault, llvm.CodeModelDefault)
+		config := &Config{Triple: "x86_64-unknown-linux-gnu", Features: "+sse4.2,+avx2,+fma"}
+		c := newCompilerContext("test", machine, config, false)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+		vec := buildVec4f32(t, c)
+		result, err := b.createSpmdFMA([]llvm.Value{vec, vec, vec}, token.NoPos)
+		if err != nil {
+			t.Fatalf("createSpmdFMA: %v", err)
+		}
+		if result.IsNil() {
+			t.Fatal("createSpmdFMA returned nil value")
+		}
+		modIR := b.mod.String()
+		if strings.Contains(modIR, "llvm.wasm.relaxed.madd") {
+			t.Error("unexpected llvm.wasm.relaxed.madd in x86 module IR")
+		}
+		if !strings.Contains(modIR, "llvm.fma.v4f32") {
+			t.Error("expected llvm.fma.v4f32 in module IR for x86 target")
+		}
+	})
+}
+
 // TestSPMDRotateFullWidth verifies that createRotate emits a shufflevector with the
 // correct full-width rotation mask for both positive and negative offsets.
 func TestSPMDRotateFullWidth(t *testing.T) {
