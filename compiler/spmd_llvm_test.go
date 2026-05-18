@@ -8077,3 +8077,67 @@ func TestSPMDConstTableSwizzle32Lane(t *testing.T) {
 		t.Error("unexpected 128-bit pshufb for 32-lane AVX2 swizzle")
 	}
 }
+
+// TestSPMDSubVectorElemType verifies that sub-128-bit varying-indexed gather
+// results keep their natural element width on x86 (valid SSE/AVX2 sub-vectors)
+// and are only widened to the mask element type on WASM (which cannot lower
+// sub-128-bit vector types). Regression guard for Bug 2.b.
+func TestSPMDSubVectorElemType(t *testing.T) {
+	t.Run("x86 keeps natural width", func(t *testing.T) {
+		c := newTestCompilerContextX86(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		i8 := c.ctx.Int8Type()
+		i16 := c.ctx.Int16Type()
+		if got := b.spmdSubVectorElemType(i8, 4); got != i8 {
+			t.Errorf("x86 spmdSubVectorElemType(i8,4) = %v, want i8 (no widening)", got)
+		}
+		if got := b.spmdSubVectorElemType(i16, 4); got != i16 {
+			t.Errorf("x86 spmdSubVectorElemType(i16,4) = %v, want i16 (no widening)", got)
+		}
+	})
+
+	t.Run("WASM widens sub-128-bit", func(t *testing.T) {
+		c := newTestCompilerContext(t) // WASM
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		i8 := c.ctx.Int8Type()
+		want := c.spmdMaskElemType(4)
+		if got := b.spmdSubVectorElemType(i8, 4); got != want {
+			t.Errorf("WASM spmdSubVectorElemType(i8,4) = %v, want %v", got, want)
+		}
+		if got := b.spmdSubVectorElemType(i8, 16); got != i8 {
+			t.Errorf("WASM spmdSubVectorElemType(i8,16) = %v, want i8 (128-bit, no widen)", got)
+		}
+	})
+
+	t.Run("WASM scalar mode keeps natural width", func(t *testing.T) {
+		// In scalar fallback mode (-simd=false) spmdMaskElemType returns i1.
+		// spmdSubVectorElemType must NOT widen to i1, so the guard requires
+		// both spmdIsWASM() AND spmdUsesSIMD().
+		target, err := llvm.GetTargetFromTriple("wasm32-unknown-wasi")
+		if err != nil {
+			t.Fatalf("failed to get WASM target: %v", err)
+		}
+		machine := target.CreateTargetMachine("wasm32-unknown-wasi", "", "+simd128",
+			llvm.CodeGenLevelDefault, llvm.RelocDefault, llvm.CodeModelDefault)
+		config := &Config{
+			Triple:      "wasm32-unknown-wasi",
+			Features:    "+simd128",
+			SIMDEnabled: false, // scalar fallback mode
+		}
+		c := newCompilerContext("test", machine, config, false)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+
+		i8 := c.ctx.Int8Type()
+		if got := b.spmdSubVectorElemType(i8, 4); got != i8 {
+			t.Errorf("WASM scalar spmdSubVectorElemType(i8,4) = %v, want i8 (no widening in scalar mode)", got)
+		}
+	})
+}

@@ -2796,6 +2796,32 @@ func (b *builder) spmdIsConstAllOnesMask(mask llvm.Value) bool {
 	return mask.C == allOnes.C
 }
 
+// spmdSubVectorElemType returns the element type in which to build a
+// varying-indexed gather result vector of laneCount lanes.
+//
+// WASM SIMD128 cannot lower sub-128-bit vector types (e.g. <4 x i8> = 32 bits,
+// <4 x i16> = 64 bits), so on WASM with SIMD enabled such results are widened
+// to the mask element type (e.g. <4 x i32>), zero-extending each loaded element.
+//
+// On x86 (SSE/AVX2) sub-128-bit vectors are valid LLVM types that lower to
+// SSE sub-registers; widening there spuriously promotes byte/half results to
+// the register-width integer (e.g. <4 x i64> on AVX2), forcing 64-bit
+// compares (vpcmpeqq) and scalar reconstruction. Keep the natural width.
+func (b *builder) spmdSubVectorElemType(elemType llvm.Type, laneCount int) llvm.Type {
+	// Widening is a WASM-SIMD-only requirement. Non-WASM targets and WASM
+	// scalar mode (-simd=false, where spmdMaskElemType would yield i1) keep
+	// the natural element width — matching the original spmdUsesSIMD()-gated
+	// behavior this helper replaced.
+	if !b.spmdIsWASM() || !b.spmdUsesSIMD() {
+		return elemType
+	}
+	vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(elemType, laneCount))) * 8
+	if vecBits < 128 {
+		return b.spmdMaskElemType(laneCount)
+	}
+	return elemType
+}
+
 // spmdMaskElemType returns the LLVM element type for SPMD mask vectors.
 // On SIMD targets, the mask element type is sized to fill the register:
 // regBits/laneCount bits per lane (e.g., 256-bit AVX2 with 8 lanes → i32,
@@ -6322,13 +6348,7 @@ func (b *builder) spmdVectorIndexString(expr *ssa.Index, collection, index llvm.
 	// sub-128-bit vectors (e.g., <4 x i8> = 32 bits) which WASM cannot lower.
 	// Each loaded i8 byte is zero-extended to the wider element type during insertion.
 	bufElemType := b.ctx.Int8Type()
-	resultElemType := bufElemType
-	if b.spmdUsesSIMD() {
-		vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(bufElemType, laneCount))) * 8
-		if vecBits < 128 {
-			resultElemType = b.spmdMaskElemType(laneCount)
-		}
-	}
+	resultElemType := b.spmdSubVectorElemType(bufElemType, laneCount)
 	result := llvm.Undef(llvm.VectorType(resultElemType, laneCount))
 	for lane := 0; lane < laneCount; lane++ {
 		ptr := b.CreateInBoundsGEP(bufElemType, buf, []llvm.Value{laneIdxs[lane]}, "")
@@ -6377,14 +6397,10 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 		// index, the per-lane gather would just return each element in order.
 		// Skip the gather and load the array directly as a <N x T> vector.
 		if totalSize <= 16 && int64(xType.Len()) == int64(laneCount) && b.spmdIsLoopLaneIndex(index, expr.Index) {
-			// Determine result element type: widen sub-128-bit vectors to avoid
-			// WASM lowering failures (e.g., <4 x i8>=32-bit or <4 x i16>=64-bit).
-			// Matches the same widening logic used in the GEP fallback path below.
-			resultElemType := elemType
-			vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(elemType, laneCount))) * 8
-			if vecBits < 128 {
-				resultElemType = b.spmdMaskElemType(laneCount)
-			}
+			// Determine result element type: widen sub-128-bit vectors on WASM to avoid
+			// lowering failures (e.g., <4 x i8>=32-bit or <4 x i16>=64-bit).
+			// On x86 (SSE/AVX2), sub-128-bit vectors are valid; keep the natural width.
+			resultElemType := b.spmdSubVectorElemType(elemType, laneCount)
 
 			if unop, ok := expr.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
 				// Shadow vector bypass: when the alloca has a tracked shadow (kept
@@ -6512,15 +6528,10 @@ func (b *builder) spmdVectorIndexArray(expr *ssa.Index, collection, index llvm.V
 	// Per-lane: GEP, load, insert into result vector.
 	// On WASM, build the result in the mask element type (e.g., <4 x i32>) to avoid
 	// sub-128-bit vectors (e.g., <4 x i8> = 32 bits) which WASM cannot lower.
+	// On x86 (SSE/AVX2), sub-128-bit vectors are valid; keep the natural element width.
 	// Each loaded byte is zero-extended to the wider element type during insertion
 	// rather than after, so no intermediate sub-128-bit vector is ever created.
-	resultElemType := elemType
-	if b.spmdUsesSIMD() {
-		vecBits := uint64(b.targetData.TypeAllocSize(llvm.VectorType(elemType, laneCount))) * 8
-		if vecBits < 128 {
-			resultElemType = b.spmdMaskElemType(laneCount)
-		}
-	}
+	resultElemType := b.spmdSubVectorElemType(elemType, laneCount)
 	result := llvm.Undef(llvm.VectorType(resultElemType, laneCount))
 	zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
 	for lane := 0; lane < laneCount; lane++ {
