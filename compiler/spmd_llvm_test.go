@@ -8182,3 +8182,42 @@ func TestSPMDContiguousIndexChangeType(t *testing.T) {
 		t.Error("nested ChangeType not unwrapped")
 	}
 }
+
+// TestSPMDMaskedLoadNarrowWidthCap verifies the narrow contiguous load builds
+// its result vector at a capped element width: on AVX2 4-lane it must be i32
+// (not the i64 that spmdMaskElemType(4)=256/4 would give, which forces
+// vpcmpeqq for byte comparisons), while WASM behavior is unchanged.
+// Regression guard for the real Bug 2.b.
+func TestSPMDMaskedLoadNarrowWidthCap(t *testing.T) {
+	t.Run("AVX2 4-lane caps at i32 (was i64)", func(t *testing.T) {
+		c := newTestCompilerContextX86(t)
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+		c.SIMDRegisterBytes = 32 // AVX2 256-bit
+		laneCount := 4
+		// targetElemBits=8, laneCount=4 → scalarType=i32 (4 bytes packed).
+		scalarType := c.ctx.Int32Type()
+		ptr := b.CreateAlloca(scalarType, "test.narrow.ptr")
+		mask := llvm.ConstNull(llvm.VectorType(c.ctx.Int1Type(), laneCount))
+		res := b.spmdMaskedLoadNarrow(8, ptr, laneCount, mask)
+		if got := res.Type().ElementType(); got != c.ctx.Int32Type() {
+			t.Errorf("AVX2 narrow-load elem = %v, want i32 (capped, not i64)", got)
+		}
+	})
+	t.Run("WASM 4-lane stays i32", func(t *testing.T) {
+		c := newTestCompilerContext(t) // WASM 128-bit
+		defer c.dispose()
+		b := newTestBuilder(t, c)
+		defer b.Dispose()
+		laneCount := 4
+		// targetElemBits=8, laneCount=4 → scalarType=i32 (4 bytes packed).
+		scalarType := c.ctx.Int32Type()
+		ptr := b.CreateAlloca(scalarType, "test.narrow.ptr")
+		mask := llvm.ConstNull(llvm.VectorType(c.ctx.Int1Type(), laneCount))
+		res := b.spmdMaskedLoadNarrow(8, ptr, laneCount, mask)
+		if got := res.Type().ElementType(); got != c.ctx.Int32Type() {
+			t.Errorf("WASM narrow-load elem = %v, want i32 (unchanged)", got)
+		}
+	})
+}

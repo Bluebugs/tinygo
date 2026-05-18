@@ -4829,7 +4829,8 @@ func (b *builder) spmdNarrowLoadElemBits(ssaElemType types.Type, laneCount int) 
 }
 
 // spmdMaskedLoadNarrow loads N elements of targetElemBits bits each from ptr
-// and returns a <N x iWide> vector (where iWide = spmdMaskElemType = i32 on WASM)
+// and returns a <N x iWide> vector (where iWide = min(regBits/N, 32); the i32
+// cap avoids <4 x i64> on AVX2 4-lane, which would force vpcmpeqq downstream)
 // with each element zero-extended. This is the inverse of spmdMaskedStoreNarrow.
 //
 // For example, loading 4 booleans (1 byte each) from a [16]bool array:
@@ -4845,7 +4846,18 @@ func (b *builder) spmdMaskedLoadNarrow(targetElemBits uint64, ptr llvm.Value, la
 	// Load the packed bytes as a single scalar integer.
 	packed := b.CreateLoad(scalarType, ptr, "spmd.narrow.load")
 	// Unpack per lane: extract targetElemBits-wide slice and zero-extend to i32.
-	wideElemType := b.spmdMaskElemType(laneCount) // i32 on WASM
+	// Cap the result element width at i32. spmdMaskElemType(laneCount) is
+	// regBits/laneCount = i64 on AVX2 4-lane, which forces <4 x i64> and
+	// vpcmpeqq for the byte/half comparisons that consume this load. i32 is
+	// sufficient (this is the sub-128-bit narrow path; targetElemBits<=16).
+	// Use min() so WASM, where spmdMaskElemType is intentionally <=i32 (and
+	// <i32 for >4 lanes), is unchanged — a blanket i32 would create invalid
+	// sub-128-bit-element WASM vectors.
+	maskElemBits := b.spmdRegisterBytes() * 8 / laneCount
+	if maskElemBits > 32 {
+		maskElemBits = 32
+	}
+	wideElemType := b.ctx.IntType(maskElemBits)
 	result := llvm.ConstNull(llvm.VectorType(wideElemType, laneCount))
 	elemMask := llvm.ConstInt(scalarType, (1<<targetElemBits)-1, false)
 	for lane := 0; lane < laneCount; lane++ {
