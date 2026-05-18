@@ -3496,7 +3496,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			if onlyMemOps {
 				// Fast path: index is directly the loop iter phi (overridden to lane indices).
 				if _, isOverridden := b.spmdValueOverride[expr.Index]; isOverridden {
-					if loop, ok := b.spmdLoopState.activeLoops[expr.Index]; ok {
+					idxKey := spmdUnwrapChangeType(expr.Index)
+					if loop, ok := b.spmdLoopState.activeLoops[idxKey]; ok {
 						if result, err := b.spmdContiguousIndexAddr(expr, loop); err == nil {
 							return result, nil
 						}

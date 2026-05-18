@@ -8141,3 +8141,44 @@ func TestSPMDSubVectorElemType(t *testing.T) {
 		}
 	})
 }
+
+// TestSPMDContiguousIndexChangeType verifies that a ChangeType-wrapped loop
+// iterator (the SPMD range variable, e.g. field = ChangeType(incrBinOp)) is
+// recognized by spmdAnalyzeContiguousIndex, so ip[field] reaches the
+// contiguous-store fast path instead of a per-lane vpextrb scatter.
+// Regression guard for Bug 2.c.
+func TestSPMDContiguousIndexChangeType(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	iterPhi := &ssa.Phi{}
+	loop := &spmdActiveLoop{
+		bodyIterValue: iterPhi,
+		laneCount:     4,
+		scalarIterVal: llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+	}
+	b.spmdLoopState = &spmdLoopState{
+		activeLoops: map[ssa.Value]*spmdActiveLoop{iterPhi: loop},
+		bodyBlocks:  map[int]*spmdActiveLoop{},
+		loopBlocks:  map[int]*spmdActiveLoop{},
+	}
+
+	// field = ChangeType(iterPhi) — how go/ssa tags the SPMD range variable.
+	ct := &ssa.ChangeType{X: iterPhi}
+
+	gotLoop, _, ok := b.spmdAnalyzeContiguousIndex(ct)
+	if !ok {
+		t.Fatal("spmdAnalyzeContiguousIndex(ChangeType(iterPhi)) = false, want true")
+	}
+	if gotLoop != loop {
+		t.Errorf("returned loop = %p, want %p", gotLoop, loop)
+	}
+
+	// Sanity: nested ChangeType chains also unwrap.
+	ct2 := &ssa.ChangeType{X: &ssa.ChangeType{X: iterPhi}}
+	if _, _, ok := b.spmdAnalyzeContiguousIndex(ct2); !ok {
+		t.Error("nested ChangeType not unwrapped")
+	}
+}

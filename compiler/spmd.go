@@ -2143,6 +2143,21 @@ type spmdInterleavedStoreInfo struct {
 	remainder int
 }
 
+// spmdUnwrapChangeType peels *ssa.ChangeType wrappers. ChangeType is a pure
+// type annotation (e.g. tagging a value with an SPMD Varying[T] type) and
+// never changes the underlying SSA value, so unwrapping it is always safe for
+// identity and loop-membership checks.
+func spmdUnwrapChangeType(v ssa.Value) ssa.Value {
+	for {
+		if ct, ok := v.(*ssa.ChangeType); ok {
+			v = ct.X
+		} else {
+			break
+		}
+	}
+	return v
+}
+
 // spmdAnalyzeStrideIndex pattern-matches an SSA index expression to detect
 // stride-S interleaved access patterns of the form iter*S+R, where iter is
 // the SPMD loop body iterator, S is the stride (2, 3, or 4), and R is the
@@ -2161,16 +2176,7 @@ func (b *builder) spmdAnalyzeStrideIndex(index ssa.Value) *spmdStridePattern {
 	}
 
 	// Unwrap ChangeType chains on the top-level index value.
-	unwrapCT := func(v ssa.Value) ssa.Value {
-		for {
-			if ct, ok := v.(*ssa.ChangeType); ok {
-				v = ct.X
-			} else {
-				break
-			}
-		}
-		return v
-	}
+	unwrapCT := spmdUnwrapChangeType
 
 	// checkIsIter returns the active loop if v (after ChangeType unwrap) is the
 	// body iterator for some SPMD loop.
@@ -5243,6 +5249,7 @@ func (b *builder) spmdAnalyzeContiguousIndex(index ssa.Value) (*spmdActiveLoop, 
 	// Returns the stored value, or v unchanged if tracing is not possible.
 	var unwrapLoad func(v ssa.Value) ssa.Value
 	unwrapLoad = func(v ssa.Value) ssa.Value {
+		v = spmdUnwrapChangeType(v)
 		load, ok := v.(*ssa.SPMDLoad)
 		if !ok {
 			return v
@@ -9471,16 +9478,7 @@ func (b *builder) spmdMatchStride2Index(index ssa.Value) (int64, bool) {
 	}
 
 	// Unwrap ChangeType wrappers.
-	unwrapCT := func(v ssa.Value) ssa.Value {
-		for {
-			if ct, ok := v.(*ssa.ChangeType); ok {
-				v = ct.X
-			} else {
-				break
-			}
-		}
-		return v
-	}
+	unwrapCT := spmdUnwrapChangeType
 
 	// isIter returns true if v (after ChangeType peel) is in spmdValueOverride.
 	isIter := func(v ssa.Value) bool {
