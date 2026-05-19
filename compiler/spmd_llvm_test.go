@@ -8183,6 +8183,103 @@ func TestSPMDContiguousIndexChangeType(t *testing.T) {
 	}
 }
 
+// TestSPMDExtractPmaddSideChangeType verifies that spmdExtractPmaddSide
+// correctly sees through *ssa.ChangeType wrappers inserted by x-tools-spmd
+// commit f3afc3fb ("propagate Varying[T] through addressable IndexExpr load").
+//
+// After that commit, uniform-slice-indexed-by-varying-lane accesses like
+// sextets[g*2] emit ChangeType(SPMDLoad(IndexAddr)) instead of the bare
+// SPMDLoad(IndexAddr). The pmadd pattern:
+//
+//	int16(sextets[g*2])*64 + int16(sextets[g*2+1])
+//
+// becomes at SSA level:
+//
+//	BinOp{ADD,
+//	    BinOp{MUL, Convert{ChangeType{SPMDLoad{IndexAddr{g*2}}}}, Const(64)},
+//	    Convert{ChangeType{SPMDLoad{IndexAddr{g*2+1}}}}}
+//
+// Without the fix, cvt.X.(*ssa.SPMDLoad) fails and spmdExtractPmaddSide
+// returns nil → spmdTryEmitPmadd returns false → base64 decodeAndPack falls
+// back to scalar vpinsrb/vpextrb scatter (~0.8 GB/s vs ~17 GB/s).
+// Regression guard for the base64 ~20x performance regression.
+func TestSPMDExtractPmaddSideChangeType(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	// Set up the loop state: iterPhi is the range-over-slice body iterator.
+	iterPhi := &ssa.Phi{}
+	loop := &spmdActiveLoop{
+		bodyIterValue: iterPhi,
+		laneCount:     4,
+		scalarIterVal: llvm.ConstInt(c.ctx.Int32Type(), 0, false),
+	}
+	b.spmdLoopState = &spmdLoopState{
+		activeLoops: map[ssa.Value]*spmdActiveLoop{iterPhi: loop},
+		bodyBlocks:  map[int]*spmdActiveLoop{},
+		loopBlocks:  map[int]*spmdActiveLoop{},
+	}
+
+	// Build the SSA chain for the even side (sextets[g*2]):
+	//   g*2 = BinOp{MUL, iterPhi, Const(2)}
+	const2 := ssa.NewConst(constant.MakeInt64(2), types.Typ[types.Int])
+	indexMul := &ssa.BinOp{Op: token.MUL, X: iterPhi, Y: const2}
+
+	// IndexAddr for the even element: sextets[g*2]
+	dummySlice := &ssa.Alloc{} // placeholder; spmdExtractPmaddSide only checks indexAddr.X identity
+	indexAddr := &ssa.IndexAddr{X: dummySlice, Index: indexMul}
+
+	// SPMDLoad of the IndexAddr — bare (pre-f3afc3fb shape):
+	spmdLoad := &ssa.SPMDLoad{Addr: indexAddr}
+
+	// ChangeType wrapper — what f3afc3fb inserts to tag the value as Varying[byte]:
+	changeType := &ssa.ChangeType{X: spmdLoad}
+
+	// Convert to int16 (int16(sextets[g*2])):
+	cvt := &ssa.Convert{X: changeType}
+
+	// Multiply by 64 (int16(sextets[g*2])*64):
+	const64 := ssa.NewConst(constant.MakeInt64(64), types.Typ[types.Int])
+	binopMul := &ssa.BinOp{Op: token.MUL, X: cvt, Y: const64}
+
+	// Without the fix, spmdExtractPmaddSide(binopMul) returns nil because
+	// cvt.X.(*ssa.SPMDLoad) fails (cvt.X is *ssa.ChangeType, not *ssa.SPMDLoad).
+	side := b.spmdExtractPmaddSide(binopMul)
+	if side == nil {
+		t.Fatal("spmdExtractPmaddSide(BinOp{MUL,Convert{ChangeType{SPMDLoad{...}}},64}) = nil, want non-nil (pmadd side detected)")
+	}
+	if side.load != spmdLoad {
+		t.Errorf("side.load = %p, want %p (the underlying SPMDLoad)", side.load, spmdLoad)
+	}
+	if side.indexAddr != indexAddr {
+		t.Errorf("side.indexAddr = %p, want %p", side.indexAddr, indexAddr)
+	}
+	if side.constVal != 64 {
+		t.Errorf("side.constVal = %d, want 64", side.constVal)
+	}
+	if side.remainder != 0 {
+		t.Errorf("side.remainder = %d, want 0 (even index g*2)", side.remainder)
+	}
+
+	// Also test the bare Convert case: Convert{ChangeType{SPMDLoad{...}}} (constVal=1).
+	side2 := b.spmdExtractPmaddSide(cvt)
+	if side2 == nil {
+		t.Fatal("spmdExtractPmaddSide(Convert{ChangeType{SPMDLoad{...}}}) = nil, want non-nil")
+	}
+	if side2.constVal != 1 {
+		t.Errorf("side2.constVal = %d, want 1 (no MUL → implicit 1)", side2.constVal)
+	}
+
+	// Nested ChangeType chains must also unwrap.
+	doubleWrap := &ssa.ChangeType{X: &ssa.ChangeType{X: spmdLoad}}
+	cvt2 := &ssa.Convert{X: doubleWrap}
+	if side3 := b.spmdExtractPmaddSide(cvt2); side3 == nil {
+		t.Error("nested ChangeType not unwrapped in spmdExtractPmaddSide")
+	}
+}
+
 // TestSPMDMaskedLoadNarrowWidthCap verifies the narrow contiguous load builds
 // its result vector at a capped element width: on AVX2 4-lane it must be i32
 // (not the i64 that spmdMaskElemType(4)=256/4 would give, which forces

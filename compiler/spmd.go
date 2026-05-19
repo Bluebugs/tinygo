@@ -9462,8 +9462,11 @@ func (b *builder) spmdExtractPmaddSide(v ssa.Value) *spmdPmaddSide {
 		return nil
 	}
 
-	// The Convert must load from an SPMDLoad.
-	load, ok := cvt.X.(*ssa.SPMDLoad)
+	// The Convert must load from an SPMDLoad. Peel any *ssa.ChangeType wrapper
+	// that x-tools-spmd commit f3afc3fb inserts to tag slice-indexed-by-varying
+	// loads with Varying[elem] type (for mask-aware fmt.Printf). ChangeType is a
+	// pure type annotation; unwrapping it is safe for structural pattern matching.
+	load, ok := spmdUnwrapChangeType(cvt.X).(*ssa.SPMDLoad)
 	if !ok {
 		return nil
 	}
