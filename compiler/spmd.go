@@ -629,14 +629,17 @@ func (b *builder) vectorToArray(vec llvm.Value) llvm.Value {
 }
 
 // spmdBoxedVaryingGoType returns the Go struct type used to box a varying value
-// with its mask: struct{ Value [N]T; Mask [N]int32 }.
+// with its mask: struct{ Value [N]T; Mask [N]<intType> }.
+// The mask element Go type is derived from spmdMaskElemBits so it matches the
+// LLVM struct produced by spmdMaskElemType (single source of truth).
 func (c *compilerContext) spmdBoxedVaryingGoType(spmdType *types.SPMDType, laneCount int) *types.Struct {
 	arrayType := types.NewArray(spmdType.Elem(), int64(laneCount))
-	// Mask element type must match spmdMaskElemType: SIMD targets use regBits/laneCount
-	// bits per lane (2→int64, 4→int32, 8→int16, 16→int8), non-SIMD uses int8 (for i1).
+	// Mask element type must match spmdMaskElemType. Derive from spmdMaskElemBits
+	// so both the Go typecode string and the LLVM struct agree on the bit width.
+	// Non-SIMD targets use int8 (i1 becomes 1-byte in Go's type system).
 	var maskElemGoType types.Type
 	if c.spmdUsesSIMD() {
-		switch c.spmdRegisterBytes() * 8 / laneCount {
+		switch c.spmdMaskElemBits(laneCount) {
 		case 64:
 			maskElemGoType = types.Typ[types.Int64]
 		case 32:
@@ -2828,15 +2831,34 @@ func (b *builder) spmdSubVectorElemType(elemType llvm.Type, laneCount int) llvm.
 	return elemType
 }
 
+// spmdMaskElemBits returns the per-lane mask width in bits for SIMD targets,
+// capped at 32 on >128-bit registers (AVX2+). On ≤128-bit targets (WASM/SSE)
+// the natural regBits/laneCount is kept so 2-lane float64 stays i64. Single
+// source of truth shared by spmdMaskElemType and spmdBoxedVaryingGoType.
+func (c *compilerContext) spmdMaskElemBits(laneCount int) int {
+	regBits := c.spmdRegisterBytes() * 8
+	bits := regBits / laneCount
+	if regBits > 128 && bits > 32 {
+		bits = 32
+	}
+	return bits
+}
+
 // spmdMaskElemType returns the LLVM element type for SPMD mask vectors.
 // On SIMD targets, the mask element type is sized to fill the register:
 // regBits/laneCount bits per lane (e.g., 256-bit AVX2 with 8 lanes → i32,
 // 128-bit SIMD128 with 4 lanes → i32, 8 lanes → i16, 16 lanes → i8).
+// The per-lane width is capped at i32 when regBits > 128: on AVX2 (256-bit)
+// with 4 lanes, regBits/laneCount would be i64, which inflates mask vectors to
+// <4 x i64> and forces movmsk.pd.256 + sext <4 x i1> to <4 x i64> chains.
+// i32 carries an all-ones/all-zeros lane mask just as faithfully
+// (i64(-1) truncates to i32(-1)). Mirrors the same cap in spmdMaskedLoadNarrow.
+// WASM SIMD128 (128-bit) is unaffected: at laneCount≥4 already ≤i32; at
+// laneCount=2 (float64) stays i64 — the 128-bit cap only fires for wider regs.
 // On other targets this is always i1 (native LLVM boolean vector element).
 func (c *compilerContext) spmdMaskElemType(laneCount int) llvm.Type {
 	if c.spmdUsesSIMD() {
-		regBits := c.spmdRegisterBytes() * 8
-		return c.ctx.IntType(regBits / laneCount)
+		return c.ctx.IntType(c.spmdMaskElemBits(laneCount))
 	}
 	return c.ctx.Int1Type()
 }

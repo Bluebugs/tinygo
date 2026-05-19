@@ -8221,3 +8221,59 @@ func TestSPMDMaskedLoadNarrowWidthCap(t *testing.T) {
 		}
 	})
 }
+
+// TestSPMDMaskElemTypeCap verifies the mask element width is capped at i32:
+// AVX2 4-lane must be i32 (not i64, which would force <4 x i64> masks and
+// movmsk.pd.256); other lane counts/targets are unchanged. Mirrors the
+// spmdMaskedLoadNarrow i32 cap. Regression guard for the residual 2.b-sibling.
+func TestSPMDMaskElemTypeCap(t *testing.T) {
+	t.Run("AVX2 4-lane caps at i32 (was i64)", func(t *testing.T) {
+		c := newTestCompilerContextX86(t)
+		defer c.dispose()
+		c.SIMDRegisterBytes = 32 // AVX2 256-bit
+		if got := c.spmdMaskElemType(4); got != c.ctx.Int32Type() {
+			t.Errorf("AVX2 spmdMaskElemType(4) = %v, want i32 (capped, not i64)", got)
+		}
+	})
+	t.Run("AVX2 8-lane stays i32", func(t *testing.T) {
+		c := newTestCompilerContextX86(t)
+		defer c.dispose()
+		c.SIMDRegisterBytes = 32
+		if got := c.spmdMaskElemType(8); got != c.ctx.Int32Type() {
+			t.Errorf("AVX2 spmdMaskElemType(8) = %v, want i32 (unchanged)", got)
+		}
+	})
+	t.Run("WASM 4-lane stays i32", func(t *testing.T) {
+		c := newTestCompilerContext(t) // WASM 128-bit
+		defer c.dispose()
+		if got := c.spmdMaskElemType(4); got != c.ctx.Int32Type() {
+			t.Errorf("WASM spmdMaskElemType(4) = %v, want i32 (unchanged)", got)
+		}
+	})
+	t.Run("WASM 8-lane stays i16", func(t *testing.T) {
+		c := newTestCompilerContext(t)
+		defer c.dispose()
+		if got := c.spmdMaskElemType(8); got != c.ctx.Int16Type() {
+			t.Errorf("WASM spmdMaskElemType(8) = %v, want i16 (unchanged)", got)
+		}
+	})
+	// The two cases below justify the regBits > 128 guard: 2-lane float64 must
+	// stay i64 on ≤128-bit targets (WASM and SSE) because those registers are
+	// not wide enough for the cap to fire, and the 2-lane i64 mask is valid.
+	t.Run("WASM 2-lane stays i64 (float64 excluded from cap)", func(t *testing.T) {
+		c := newTestCompilerContext(t) // WASM 128-bit (SIMDRegisterBytes=16)
+		defer c.dispose()
+		if got := c.spmdMaskElemType(2); got != c.ctx.Int64Type() {
+			t.Errorf("WASM spmdMaskElemType(2) = %v, want i64 (cap must not fire on 128-bit registers)", got)
+		}
+	})
+	t.Run("SSE 2-lane stays i64", func(t *testing.T) {
+		c := newTestCompilerContextX86(t) // x86 SSE, SIMDRegisterBytes=16 (default for +ssse3,+sse4.2)
+		defer c.dispose()
+		// SSE is 128-bit (SIMDRegisterBytes=16); regBits=128, so regBits > 128
+		// is false and the cap does not fire — 2-lane stays i64.
+		if got := c.spmdMaskElemType(2); got != c.ctx.Int64Type() {
+			t.Errorf("SSE spmdMaskElemType(2) = %v, want i64 (cap must not fire on 128-bit registers)", got)
+		}
+	})
+}
