@@ -1595,7 +1595,17 @@ func (b *builder) createFunction() {
 				if loop.isPeeled && block.Index == loop.ssaLoopInfo.TailBodyBlock.Index {
 					// Peeled tail body: emit prologue immediately (TailIterPhi is in TailCheckBlock).
 					b.emitSPMDBodyPrologue(loop)
-					b.spmdValueOverride[loop.ssaLoopInfo.TailIterPhi] = loop.laneIndices
+					if !loop.isDecomposed {
+						// Decomposed path: do NOT set spmdValueOverride for the tail iter
+						// value. emitSPMDBodyPrologue already registered
+						// spmdDecomposed[ssaLoop.TailIterPhi] (see the isDecomposed branch
+						// above), and getValue's spmdDecomposed fallback materializes it
+						// correctly. loop.laneIndices is never populated on the decomposed
+						// path (see emitSPMDBodyPrologue's early return), so overriding with
+						// it here would poison every reference to TailIterPhi — including
+						// indirect ones through ChangeType — with a nil llvm.Value.
+						b.spmdValueOverride[loop.ssaLoopInfo.TailIterPhi] = loop.laneIndices
+					}
 				} else if loop.isRangeIndex && !loop.prologueEmitted {
 					// Emit prologue only once per rangeindex loop. spmdRegisterBodyBlocks
 					// walks all successors of the actual body block, which may include inner
