@@ -5724,11 +5724,18 @@ func (b *builder) spmdShiftedLoadSafeTail(info *spmdShiftedLoadInfo, mask llvm.V
 	// vector-load, whether or not the memcpy below filled all of it.
 	loadVecType := llvm.VectorType(elemType, info.uniqueCount)
 	buf, bufSize := b.createTemporaryAlloca(loadVecType, "shifted.safe.buf")
+	// bufSize from createTemporaryAlloca is always i64 (required by the
+	// llvm.lifetime.start intrinsic signature), but the memset/memcpy size
+	// operand must match the target's pointer width (b.uintptrType: i32 on
+	// wasm32, i64 on amd64) since getMemsetFunc/getMemcpyFunc select the
+	// intrinsic overload based on that width. Recompute the buffer size in
+	// uptrType rather than reusing the i64 lifetime-intrinsic value.
+	memsetSize := llvm.ConstInt(uptrType, b.targetData.TypeAllocSize(loadVecType), false)
 	memsetFn := b.getMemsetFunc()
 	b.CreateCall(memsetFn.GlobalValueType(), memsetFn, []llvm.Value{
 		buf,
 		llvm.ConstInt(b.ctx.Int8Type(), 0, false),
-		bufSize,
+		memsetSize,
 		llvm.ConstInt(b.ctx.Int1Type(), 0, false),
 	}, "")
 	memcpyFn := b.getMemcpyFunc()
