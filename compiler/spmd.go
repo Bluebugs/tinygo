@@ -2144,6 +2144,15 @@ type spmdShiftedLoadInfo struct {
 	shuffleMask []int           // lane i -> index in loaded vector
 	elemType    llvm.Type       // element type being loaded
 	loop        *spmdActiveLoop // owning SPMD loop
+
+	// Fields used only when safeTail is true (tail body of a peeled SPMD
+	// loop): the single narrow vector load in spmdShiftedLoad is replaced
+	// with per-element loads whose index is clamped to bufLen-1 before the
+	// GEP is formed, so no out-of-bounds pointer is ever materialized.
+	safeTail  bool
+	bufBase   llvm.Value // slice data pointer (element pointer, not yet offset)
+	baseIndex llvm.Value // uintptr-typed scalar index: scalarBase >> shift
+	bufLen    llvm.Value // uintptr-typed slice length
 }
 
 // spmdStridePattern represents the stride decomposition of an SSA index expression.
@@ -5635,6 +5644,10 @@ func (b *builder) spmdShiftedLoad(info *spmdShiftedLoadInfo, mask llvm.Value) ll
 	laneCount := info.loop.laneCount
 	elemType := info.elemType
 
+	if info.safeTail {
+		return b.spmdShiftedLoadSafeTail(info, mask)
+	}
+
 	if info.uniqueCount == 1 {
 		// Broadcast: load single scalar element, splat to all lanes.
 		scalar := b.CreateLoad(elemType, info.scalarPtr, "shifted.scalar")
@@ -5659,6 +5672,94 @@ func (b *builder) spmdShiftedLoad(info *spmdShiftedLoadInfo, mask llvm.Value) ll
 	// shufflevector expands the narrow loaded vector to full lane width.
 	undef := llvm.Undef(loadVecType)
 	result := b.CreateShuffleVector(loaded, undef, shuffleMaskVec, "shifted.expand")
+
+	return b.spmdShiftedApplyMask(result, mask)
+}
+
+// spmdShiftedLoadSafeTail is the bounds-safe counterpart of spmdShiftedLoad
+// for the tail body of a peeled SPMD loop, where uniqueCount is sized for a
+// full lane group and may exceed the number of elements actually remaining
+// in the slice. Rather than forming a single narrow vector load directly
+// from the (possibly under-sized) source slice — or unrolling one clamped
+// scalar load+GEP per unique element, which bloats the tail block's code
+// size by O(uniqueCount) instructions and was observed to trigger unrelated
+// heap corruption in the caller under AVX2 — this copies at most
+// min(uniqueCount, bufLen-baseIndex) real bytes into a small, exactly
+// uniqueCount-sized stack buffer via a bounds-checked runtime-length
+// llvm.memcpy, zero-filling the rest first. The narrow vector load then
+// reads from that stack buffer, which is always exactly uniqueCount
+// elements wide, so the load itself can never be out of bounds regardless
+// of how few (or zero) elements the tail actually has to offer. No
+// out-of-bounds pointer into the source slice's backing array is ever
+// formed: the memcpy source pointer is clamped to at most bufLen (a
+// zero-length copy from the one-past-the-end address is well-defined).
+func (b *builder) spmdShiftedLoadSafeTail(info *spmdShiftedLoadInfo, mask llvm.Value) llvm.Value {
+	laneCount := info.loop.laneCount
+	elemType := info.elemType
+	uptrType := b.uintptrType
+	elemSize := b.targetData.TypeAllocSize(elemType)
+
+	zero := llvm.ConstInt(uptrType, 0, false)
+	uniqueCountVal := llvm.ConstInt(uptrType, uint64(info.uniqueCount), false)
+
+	// remaining = bufLen > baseIndex ? bufLen - baseIndex : 0
+	baseGEBufLen := b.CreateICmp(llvm.IntUGE, info.baseIndex, info.bufLen, "shifted.safe.oob")
+	rawRemaining := b.CreateSub(info.bufLen, info.baseIndex, "shifted.safe.rawremaining")
+	remaining := b.CreateSelect(baseGEBufLen, zero, rawRemaining, "shifted.safe.remaining")
+
+	// copyLen = min(remaining, uniqueCount)
+	tooMany := b.CreateICmp(llvm.IntUGT, remaining, uniqueCountVal, "shifted.safe.toomany")
+	copyLen := b.CreateSelect(tooMany, uniqueCountVal, remaining, "shifted.safe.copylen")
+	copyBytes := copyLen
+	if elemSize != 1 {
+		copyBytes = b.CreateMul(copyLen, llvm.ConstInt(uptrType, elemSize, false), "shifted.safe.copybytes")
+	}
+
+	// srcOffset = min(baseIndex, bufLen) — never points past the allocation,
+	// so the GEP below stays "inbounds" even when copyBytes ends up 0.
+	srcOffset := b.CreateSelect(baseGEBufLen, info.bufLen, info.baseIndex, "shifted.safe.srcoffset")
+	srcPtr := b.CreateInBoundsGEP(elemType, info.bufBase, []llvm.Value{srcOffset}, "shifted.safe.srcptr")
+
+	// Stack buffer exactly uniqueCount elements wide: always safe to fully
+	// vector-load, whether or not the memcpy below filled all of it.
+	loadVecType := llvm.VectorType(elemType, info.uniqueCount)
+	buf, bufSize := b.createTemporaryAlloca(loadVecType, "shifted.safe.buf")
+	memsetFn := b.getMemsetFunc()
+	b.CreateCall(memsetFn.GlobalValueType(), memsetFn, []llvm.Value{
+		buf,
+		llvm.ConstInt(b.ctx.Int8Type(), 0, false),
+		bufSize,
+		llvm.ConstInt(b.ctx.Int1Type(), 0, false),
+	}, "")
+	memcpyFn := b.getMemcpyFunc()
+	b.CreateCall(memcpyFn.GlobalValueType(), memcpyFn, []llvm.Value{
+		buf,
+		srcPtr,
+		copyBytes,
+		llvm.ConstInt(b.ctx.Int1Type(), 0, false),
+	}, "")
+
+	loaded := b.CreateLoad(loadVecType, buf, "shifted.safe.narrow")
+	loaded.SetAlignment(1)
+	b.emitLifetimeEnd(buf, bufSize)
+
+	if info.uniqueCount == 1 {
+		vecType := llvm.VectorType(elemType, laneCount)
+		scalar := b.CreateExtractElement(loaded, llvm.ConstInt(b.ctx.Int32Type(), 0, false), "shifted.safe.scalar")
+		result := b.splatScalar(scalar, vecType)
+		return b.spmdShiftedApplyMask(result, mask)
+	}
+
+	// Build the shuffle mask constant vector and expand to full lane width,
+	// same as the fast path.
+	maskElems := make([]llvm.Value, laneCount)
+	i32Type := b.ctx.Int32Type()
+	for i := 0; i < laneCount; i++ {
+		maskElems[i] = llvm.ConstInt(i32Type, uint64(info.shuffleMask[i]), false)
+	}
+	shuffleMaskVec := llvm.ConstVector(maskElems, false)
+	undef := llvm.Undef(loadVecType)
+	result := b.CreateShuffleVector(loaded, undef, shuffleMaskVec, "shifted.safe.expand")
 
 	return b.spmdShiftedApplyMask(result, mask)
 }

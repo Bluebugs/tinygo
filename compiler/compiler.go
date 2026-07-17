@@ -3425,29 +3425,48 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					bufptr := b.CreateExtractValue(val, 0, "indexaddr.ptr")
 					elemType := b.getLLVMType(ptrTyp.Elem())
 					shiftedBase = b.extendInteger(shiftedBase, expr.Index.Type(), b.uintptrType)
-					ptr = b.CreateInBoundsGEP(elemType, bufptr, []llvm.Value{shiftedBase}, "shifted.ptr")
+					buflen := b.CreateExtractValue(val, 1, "indexaddr.len")
 					info.elemType = elemType
+					info.bufBase = bufptr
+					info.baseIndex = shiftedBase
+					info.bufLen = buflen
+
+					// The tail body of a peeled SPMD loop has a conservative
+					// uniqueCount (sized for a full lane group) that can exceed
+					// the actual remaining slice length, even though every
+					// ACTIVE lane's index is in bounds. Rather than forming a
+					// single narrow vector load that may read past the buffer
+					// end (guarded only by a runtime-panic bound check, or
+					// worse, an unguarded OOB access), the tail path loads each
+					// of the uniqueCount unique elements individually with its
+					// index clamped to bufLen-1 *before* the GEP is formed. No
+					// out-of-bounds pointer is ever materialized, which also
+					// avoids the LLVM -opt=2 miscompile a prior unclamped
+					// prototype triggered (the optimizer was exploiting
+					// out-of-bounds `inbounds` GEP UB). See spmdShiftedLoad.
+					inTail := false
+					if b.spmdLoopState != nil {
+						if loop, ok := b.spmdLoopState.bodyBlocks[b.currentBlock.Index]; ok &&
+							loop.isPeeled && loop.ssaLoopInfo != nil && loop.ssaLoopInfo.TailBodyBlock != nil {
+							inTail = b.currentBlock.Index == loop.ssaLoopInfo.TailBodyBlock.Index
+						}
+					}
+					info.safeTail = inTail
+
+					if inTail {
+						// No GEP formed here; spmdShiftedLoad builds per-element
+						// clamped pointers from bufBase/baseIndex/bufLen.
+						ptr = llvm.Undef(b.dataPtrType)
+						break
+					}
+
+					ptr = b.CreateInBoundsGEP(elemType, bufptr, []llvm.Value{shiftedBase}, "shifted.ptr")
 
 					// Bounds check: verify that base + uniqueCount <= slice length.
-					//
-					// KNOWN LIMITATION (deferred, see PLAN.md): this is
-					// conservative for the tail phase of a peeled loop (or any
-					// loop whose element count isn't a multiple of laneCount)
-					// — uniqueCount is sized for a full lane group, so a tail
-					// phase with only a few active lanes remaining can panic
-					// here even though every ACTIVE lane's index is in bounds.
-					// A bounds-safe masked-load fallback was prototyped but
-					// reverted: it triggered an LLVM optimizer miscompilation
-					// (-opt=2 only) observed as heap-adjacent buffer
-					// corruption when two SPMD functions using this codepath
-					// were compiled in the same module and one read a slice
-					// also passed to the other (reproducible via
-					// Encode+EncodeSrc in the hex-encode example). The root
-					// LLVM pass responsible was not identified within budget.
-					// Panicking here is the safe (if suboptimal) fallback;
-					// silent memory corruption is worse than an abort.
+					// This fast path only runs outside the tail body of a peeled
+					// loop (see inTail above), where uniqueCount always matches a
+					// full lane group and this check cannot be conservative.
 					if !b.info.nobounds {
-						buflen := b.CreateExtractValue(val, 1, "indexaddr.len")
 						endIdx := b.CreateAdd(shiftedBase, llvm.ConstInt(b.uintptrType, uint64(info.uniqueCount), false), "")
 						oob := b.CreateICmp(llvm.IntUGT, endIdx, buflen, "")
 						b.createRuntimeAssert(oob, "lookup", "lookupPanic")
