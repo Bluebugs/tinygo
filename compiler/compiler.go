@@ -3429,6 +3429,23 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 					info.elemType = elemType
 
 					// Bounds check: verify that base + uniqueCount <= slice length.
+					//
+					// KNOWN LIMITATION (deferred, see PLAN.md): this is
+					// conservative for the tail phase of a peeled loop (or any
+					// loop whose element count isn't a multiple of laneCount)
+					// — uniqueCount is sized for a full lane group, so a tail
+					// phase with only a few active lanes remaining can panic
+					// here even though every ACTIVE lane's index is in bounds.
+					// A bounds-safe masked-load fallback was prototyped but
+					// reverted: it triggered an LLVM optimizer miscompilation
+					// (-opt=2 only) observed as heap-adjacent buffer
+					// corruption when two SPMD functions using this codepath
+					// were compiled in the same module and one read a slice
+					// also passed to the other (reproducible via
+					// Encode+EncodeSrc in the hex-encode example). The root
+					// LLVM pass responsible was not identified within budget.
+					// Panicking here is the safe (if suboptimal) fallback;
+					// silent memory corruption is worse than an abort.
 					if !b.info.nobounds {
 						buflen := b.CreateExtractValue(val, 1, "indexaddr.len")
 						endIdx := b.CreateAdd(shiftedBase, llvm.ConstInt(b.uintptrType, uint64(info.uniqueCount), false), "")

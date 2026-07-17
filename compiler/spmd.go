@@ -1200,8 +1200,37 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 
 		// Map tail body: no iter phi in TailBodyBlock (TailIterPhi is in TailCheckBlock).
 		// The prologue is triggered by body block entry code (isPeeled check).
-		// Do NOT add TailIterPhi to activeLoops — TailCheckBlock is not a body block
-		// and the phi handler must not call emitSPMDBodyPrologue for it.
+		//
+		// Register TailIterPhi in activeLoops too (pointing at the SAME loop
+		// struct as mainIterPhi), so spmdAnalyzeContiguousIndex's direct-match
+		// fast path (compiler.go) can resolve contiguous IndexAddr accesses
+		// inside straight-line multi-block tail chains — e.g. a peeled varying
+		// if/else body (hex-encode's Encode, to-upper) clones the original
+		// body into several tail.body blocks; only the FIRST one gets its
+		// spmdValueOverride[TailIterPhi] entry populated by the isPeeled
+		// TailBodyBlock special case below, and that entry is wiped (reset to
+		// a fresh empty map) when subsequent chain blocks are visited. Without
+		// this registration, spmdAnalyzeContiguousIndex's generalized fallback
+		// (which does not depend on spmdValueOverride) has no way to recognize
+		// TailIterPhi-derived indices in those later chain blocks, and the
+		// IndexAddr compiler falls back to per-lane scatter/gather — which,
+		// combined with the existing OOB-lane index-clamp-to-zero safety
+		// trick, causes multiple inactive/OOB lanes to collide their writes on
+		// index 0 and clobber the real lane 0 result (only observable when
+		// the tail phase actually executes, i.e., unaligned lengths).
+		// This registration does NOT cause the generic Phi-instruction handler
+		// (compiler.go's "after compiling an SPMD loop's iter phi" hook) to
+		// misfire for TailIterPhi: that handler only fires while compiling the
+		// Phi instruction itself with b.spmdValueOverride != nil, and
+		// TailCheckBlock (where TailIterPhi is defined) is not a body block —
+		// spmdValueOverride is nil there (see the block-entry dispatch in
+		// compiler.go). spmdAnalyzeContiguousIndex only reads
+		// activeLoops[...].scalarIterVal, which by the time any tail body
+		// instruction is compiled has already been set to TailIterPhi's LLVM
+		// value by emitSPMDBodyPrologue's explicit isPeeled/TailBodyBlock case.
+		if ssaLoop.TailIterPhi != nil {
+			state.activeLoops[ssaLoop.TailIterPhi] = loop
+		}
 		if ssaLoop.TailBodyBlock != nil {
 			state.loopBlocks[ssaLoop.TailBodyBlock.Index] = loop
 			// Register all blocks reachable from tail body too.
@@ -2296,13 +2325,24 @@ func (b *builder) spmdAnalyzeInterleavedStores() {
 		return
 	}
 
-	// Key for grouping: (base-slice SSA value, stride, owning loop).
+	// Key for grouping: (base-slice SSA value, stride, owning loop, iter value).
 	// The loop pointer prevents cross-loop false grouping when two SPMD loops
-	// write stride-S patterns to the same base slice.
+	// write stride-S patterns to the same base slice. The iter value additionally
+	// prevents cross-PHASE false grouping for a peeled loop: main and tail
+	// phases share the same *spmdActiveLoop pointer (registered under both
+	// MainIterPhi and TailIterPhi in activeLoops so contiguous-index detection
+	// works in both phases — see the TailIterPhi registration comment), but
+	// their store instructions are physically distinct clones in separate
+	// blocks. Without iterValue in the key, main-phase and tail-phase stores to
+	// the same base/stride would collide into a single partialGroup, and the
+	// "duplicate remainder — skip" logic would silently discard one phase's
+	// stores when promoting the merged interleaved store, leaving that phase's
+	// writes never executed.
 	type groupKey struct {
-		base   ssa.Value
-		stride int64
-		loop   *spmdActiveLoop
+		base      ssa.Value
+		stride    int64
+		loop      *spmdActiveLoop
+		iterValue ssa.Value
 	}
 
 	// Partial group accumulator: maps groupKey → per-remainder slot.
@@ -2349,7 +2389,7 @@ func (b *builder) spmdAnalyzeInterleavedStores() {
 				continue // pattern iter belongs to a different loop
 			}
 
-			key := groupKey{base: indexAddr.X, stride: pat.stride, loop: loop}
+			key := groupKey{base: indexAddr.X, stride: pat.stride, loop: loop, iterValue: pat.iterValue}
 			pg := partials[key]
 			if pg == nil {
 				pg = &partialGroup{
