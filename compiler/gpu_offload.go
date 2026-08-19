@@ -529,7 +529,7 @@ func (b *builder) gpuEmitGuard(loop *spmdActiveLoop) {
 	// --- launch ------------------------------------------------------------
 	b.SetInsertPointAtEnd(launchBlock)
 	paramsPtr, paramsSize := b.gpuBuildParams(loop, bound, pos)
-	bufsPtr, bufCount := b.gpuBuildBuffers(loop, pos)
+	bufsPtr, bufCount := b.gpuBuildBuffers(loop, bound, pos)
 	i32 := b.ctx.Int32Type()
 	b.createRuntimeCall("spmdGPULaunch", []llvm.Value{
 		llvm.ConstInt(i32, uint64(k.ID), true),
@@ -605,8 +605,13 @@ func (b *builder) gpuBuildParams(loop *spmdActiveLoop, bound llvm.Value, pos tok
 // gpuBuildBuffers materialises the [k x gpuBufferDesc] array on the stack.
 // gpuBufferDesc is {u32 dataPtr, u32 byteLen, u32 mode} -- see
 // src/runtime/gpu_wasm.go, where the JS glue reads it as a flat Uint32Array
-// with stride 3.
-func (b *builder) gpuBuildBuffers(loop *spmdActiveLoop, pos token.Pos) (llvm.Value, int) {
+// with stride 3.  The stride-3 layout is load-bearing on both sides; the
+// write-only optimization below therefore encodes itself as a new *value*
+// of the existing mode field (2), never as an extra field.
+//
+// bound is the loop's dynamic trip count (n), needed for the runtime
+// `n == len(slice)` test that selects mode 2.
+func (b *builder) gpuBuildBuffers(loop *spmdActiveLoop, bound llvm.Value, pos token.Pos) (llvm.Value, int) {
 	k := loop.gpu.kernel
 	i32 := b.ctx.Int32Type()
 	// gpuBufferDesc is {u32 dataPtr, u32 byteLen, u32 mode}. The 32-bit field
@@ -634,9 +639,34 @@ func (b *builder) gpuBuildBuffers(loop *spmdActiveLoop, pos token.Pos) (llvm.Val
 		// Element size is asserted to be 4 in gpuResolveArgs.
 		byteLen := b.CreateShl(b.gpuToI32(b.CreateExtractValue(slice, 1, ""), false),
 			llvm.ConstInt(i32, 2, false), "")
-		mode := uint64(0)
-		if bufv.Kind == gpuSliceRW {
-			mode = 1
+		// mode 0 = read-only (upload, no readback)
+		// mode 1 = read-write (upload AND read back)
+		// mode 2 = write-only (do NOT upload, but read back)
+		//
+		// Mode 2 is only sound when EVERY element of the buffer is written
+		// by the kernel.  The eligibility analysis
+		// (gpu_eligible.go, writeOnlySliceObjs) proves the kernel writes
+		// exactly element `idx` for every idx in [0, n) and never reads the
+		// slice; what it cannot prove statically is that the slice's length
+		// is n rather than something longer.  If len(slice) > n the tail
+		// elements are never touched by the kernel, and skipping the upload
+		// would read device garbage back over the user's live data.
+		//
+		// So the mode is chosen at RUNTIME here: n == len(slice) picks 2,
+		// anything else falls back to the always-correct 1.  No attempt is
+		// made to prove the equality statically.
+		var mode llvm.Value
+		switch {
+		case bufv.Kind != gpuSliceRW:
+			mode = llvm.ConstInt(i32, 0, false)
+		case !bufv.WriteOnly:
+			mode = llvm.ConstInt(i32, 1, false)
+		default:
+			sliceLen := b.gpuToI32(b.CreateExtractValue(slice, 1, ""), false)
+			full := b.CreateICmp(llvm.IntEQ, b.gpuToI32(bound, false), sliceLen, "gpu.buf.full")
+			mode = b.CreateSelect(full,
+				llvm.ConstInt(i32, 2, false),
+				llvm.ConstInt(i32, 1, false), "gpu.buf.mode")
 		}
 		base := b.CreateInBoundsGEP(arrTy, alloca, []llvm.Value{
 			llvm.ConstInt(i32, 0, false),
@@ -644,7 +674,7 @@ func (b *builder) gpuBuildBuffers(loop *spmdActiveLoop, pos token.Pos) (llvm.Val
 		}, "")
 		b.CreateStore(dataPtr, b.CreateStructGEP(descTy, base, 0, ""))
 		b.CreateStore(byteLen, b.CreateStructGEP(descTy, base, 1, ""))
-		b.CreateStore(llvm.ConstInt(i32, mode, false), b.CreateStructGEP(descTy, base, 2, ""))
+		b.CreateStore(mode, b.CreateStructGEP(descTy, base, 2, ""))
 	}
 	return alloca, n
 }

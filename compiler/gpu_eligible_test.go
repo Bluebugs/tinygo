@@ -699,3 +699,270 @@ func kernel(n int, out []int, double func(lanes.Varying[int]) lanes.Varying[int]
 		t.Errorf("expected no inlined callee, got %d", len(plan.Inlined))
 	}
 }
+
+// --- write-only buffer classification (upload-skipping optimization) ------
+//
+// A gpuSliceRW free variable is additionally flagged WriteOnly when the
+// kernel provably writes every element of [0, n) and never reads the slice.
+// The flag only makes the buffer a CANDIDATE -- gpuBuildBuffers turns it
+// into a runtime `n == len(slice)` check that picks descriptor mode 2 (skip
+// the upload) or mode 1 (upload, as before). These tests pin the classifier
+// itself: every condition that makes the optimization unsound must clear
+// the flag.
+
+func gpuWriteOnlyFlag(t *testing.T, src, name string) (gpuFreeVar, *gpuLoopPlan) {
+	t.Helper()
+	plan := parseAndAnalyzeGPULoop(t, src, 1_000_000)
+	if plan.Reject != "" {
+		t.Fatalf("expected eligible loop, got Reject=%q", plan.Reject)
+	}
+	fv, ok := freeVarKind(t, plan, name)
+	if !ok {
+		t.Fatalf("expected free var %q, Free=%+v", name, plan.Free)
+	}
+	if fv.Kind != gpuSliceRW {
+		t.Fatalf("%s: expected gpuSliceRW, got %d", name, fv.Kind)
+	}
+	return fv, plan
+}
+
+// The canonical accepted shape: an unconditional `output[idx] = expr` at
+// loop-body top level, with the slice never read. This is exactly
+// mandelbrotFlat's and intOffloadFlat's store.
+func TestGPUEligibleWriteOnlyBareIndexStoreAccepted(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		output[idx] = idx*3 + 7
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if !out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=true for top-level output[idx] = expr")
+	}
+}
+
+// A slice that is READ as well as written must not be write-only: skipping
+// the upload would make the kernel observe undefined device memory.
+func TestGPUEligibleWriteOnlyRejectedWhenRead(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		output[idx] = output[idx] + 1
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=false, slice is read on the RHS")
+	}
+}
+
+// A read through a *different* index still counts as a read.
+func TestGPUEligibleWriteOnlyRejectedWhenReadAtOtherIndex(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		output[idx] = output[0] + 1
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=false, output[0] is a read")
+	}
+}
+
+// A conditional store writes only some elements of [0, n); the rest would
+// come back as device garbage.
+func TestGPUEligibleWriteOnlyRejectedWhenConditional(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		if idx > 3 {
+			output[idx] = idx
+		}
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=false, store is nested inside an if")
+	}
+}
+
+// A `continue` at loop-body depth is explicitly ELIGIBLE (checkStmt allows
+// it), and it makes every following statement conditional on control
+// reaching it -- including a store that is syntactically a direct child of
+// body.List. `output[idx] = idx` below runs only for idx <= 3, so [4, n) is
+// never written and mode 2 would read back undefined device memory over the
+// caller's live data. Fail closed.
+func TestGPUEligibleWriteOnlyRejectedAfterContinue(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		if idx > 3 {
+			continue
+		}
+		output[idx] = idx
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=false, a body-level continue makes the store conditional")
+	}
+}
+
+// A `continue` bound to a NESTED loop cannot skip the body-level store, so
+// it must not disqualify the candidate -- otherwise the guard would be
+// needlessly broad.
+func TestGPUEligibleWriteOnlyAllowedWithNestedLoopContinue(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		acc := 0
+		for k := 0; k < 8; k++ {
+			if k == 3 {
+				continue
+			}
+			acc += k
+		}
+		output[idx] = acc
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if !out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=true, the continue binds to the nested for")
+	}
+}
+
+// A store at a derived index need not cover [0, n).
+func TestGPUEligibleWriteOnlyRejectedWhenNonIdentityIndex(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		output[idx/2] = idx
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=false, index is idx/2 not idx")
+	}
+}
+
+// `output[idx]++` reads the old value, so it is not write-only (and it is
+// also not a plain `=` store).
+func TestGPUEligibleWriteOnlyRejectedForIncDec(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		output[idx]++
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=false for output[idx]++")
+	}
+}
+
+// A compound assignment reads the old value too.
+func TestGPUEligibleWriteOnlyRejectedForCompoundAssign(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		output[idx] += idx
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=false for output[idx] += idx")
+	}
+}
+
+// A second, differently-indexed store disqualifies: the recognised
+// top-level store is no longer the object's only write.
+func TestGPUEligibleWriteOnlyRejectedForSecondStore(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		output[idx] = idx
+		if idx == 0 {
+			output[1] = 9
+		}
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=false, output has two stores")
+	}
+}
+
+// A store nested inside an inner `for` is not top-level, so its coverage of
+// [0, n) is not established by this classifier.
+func TestGPUEligibleWriteOnlyRejectedInsideNestedLoop(t *testing.T) {
+	src := `package test
+
+func kernel(n int, output []int) {
+	go for idx := range n {
+		for k := 0; k < 4; k++ {
+			output[idx] = k
+		}
+	}
+}
+`
+	out, _ := gpuWriteOnlyFlag(t, src, "output")
+	if out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=false, store is inside a nested for")
+	}
+}
+
+// A read-only slice is never flagged: there is nothing to skip uploading,
+// and its contents are exactly what the kernel needs.
+func TestGPUEligibleWriteOnlyNotSetForReadOnlySlice(t *testing.T) {
+	src := `package test
+
+func kernel(n int, input []int, output []int) {
+	go for idx := range n {
+		output[idx] = input[idx] * 2
+	}
+}
+`
+	plan := parseAndAnalyzeGPULoop(t, src, 1_000_000)
+	if plan.Reject != "" {
+		t.Fatalf("expected eligible loop, got Reject=%q", plan.Reject)
+	}
+	in, ok := freeVarKind(t, plan, "input")
+	if !ok {
+		t.Fatalf("expected free var input, Free=%+v", plan.Free)
+	}
+	if in.Kind != gpuSliceRead {
+		t.Errorf("input: expected gpuSliceRead, got %d", in.Kind)
+	}
+	if in.WriteOnly {
+		t.Errorf("input: WriteOnly must never be set on a read-only slice")
+	}
+	out, ok := freeVarKind(t, plan, "output")
+	if !ok {
+		t.Fatalf("expected free var output, Free=%+v", plan.Free)
+	}
+	if !out.WriteOnly {
+		t.Errorf("output: expected WriteOnly=true (input is read, output is not)")
+	}
+}

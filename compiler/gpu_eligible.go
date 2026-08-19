@@ -24,6 +24,24 @@ type gpuFreeVar struct {
 	Obj    types.Object
 	Kind   int    // gpuScalar | gpuSliceRead | gpuSliceRW
 	WGSLTy string // "i32", "u32", "f32", "array<i32>", "array<f32>"
+
+	// WriteOnly is only meaningful for gpuSliceRW.  It records that the
+	// loop body (and every inlined callee) NEVER reads this slice and its
+	// ONLY write is an unconditional `s[idx] = expr` at loop-body top
+	// level, with idx the bare loop induction variable.  Under those
+	// conditions every element in [0, n) is provably written by the
+	// kernel, so if the slice's length is exactly n at launch time there
+	// is no need to upload its prior contents to the device.
+	//
+	// This is a CANDIDATE flag, not a decision: `len(s) == n` cannot be
+	// proven statically (the slice may be longer than the trip count, in
+	// which case the tail elements are never written by the kernel and
+	// their pre-launch contents must survive the round trip).  The
+	// descriptor emitter in gpu_offload.go therefore turns this into a
+	// RUNTIME `n == len(s)` check that selects buffer mode 2 (skip the
+	// upload, still read back) or falls back to mode 1 (upload + read
+	// back).  See gpuBuildBuffers.
+	WriteOnly bool
 }
 
 const (
@@ -692,6 +710,11 @@ func (a *gpuAnalyzer) freeVars(rangeStmt *ast.RangeStmt) ([]gpuFreeVar, string) 
 
 	writes := a.writtenSliceObjs(rangeStmt.Body)
 	scalarWrites := a.writtenScalarObjs(rangeStmt.Body)
+	// Write-only candidates for the upload-skipping optimization (see
+	// gpuFreeVar.WriteOnly).  iterIdent is rangeStmt.Key when it is a
+	// plain identifier; anything else yields no candidates at all.
+	iterIdent, _ := rangeStmt.Key.(*ast.Ident)
+	writeOnly := a.writeOnlySliceObjs(rangeStmt.Body, iterIdent)
 
 	// The loop's own iteration variable(s) (e.g. "idx" in
 	// "go for idx := range n") are not free: exclude the objects they
@@ -743,7 +766,14 @@ func (a *gpuAnalyzer) freeVars(rangeStmt *ast.RangeStmt) ([]gpuFreeVar, string) 
 				reject = err
 				return false
 			}
-			free = append(free, gpuFreeVar{Obj: v, Kind: kind, WGSLTy: wgslTy})
+			free = append(free, gpuFreeVar{
+				Obj:    v,
+				Kind:   kind,
+				WGSLTy: wgslTy,
+				// Only a read-write slice can be write-only: a
+				// gpuSliceRead buffer is never written at all.
+				WriteOnly: kind == gpuSliceRW && writeOnly[v],
+			})
 			return true
 		})
 	}
@@ -787,6 +817,240 @@ func (a *gpuAnalyzer) writtenSliceObjs(body *ast.BlockStmt) map[*types.Var]bool 
 		return true
 	})
 	return writes
+}
+
+// readSliceObjs returns the set of *types.Var slice objects that appear as
+// an *rvalue* index expression (`... = s[i]`, `f(s[i])`, `s[i] + 1`, ...)
+// anywhere in n.  It deliberately walks EVERY IndexExpr and then subtracts
+// the ones that are pure assignment targets, so any use it does not
+// recognise counts as a read -- the fail-closed direction for the
+// write-only-buffer optimization, whose soundness depends on the kernel
+// never observing the buffer's prior contents.
+//
+// Note `s[i] += x` and `s[i]++` ARE reads (the old value is consumed), and
+// this function reports them as such because record() below only removes
+// plain `=` assignment targets from the set.
+func (a *gpuAnalyzer) readSliceObjs(n ast.Node) map[*types.Var]bool {
+	reads := map[*types.Var]bool{}
+	// Assignment targets of a plain `=` are writes, not reads.  Collect
+	// their IndexExpr nodes by identity so the general walk below can skip
+	// exactly those nodes and nothing else.
+	pureWriteTargets := map[ast.Expr]bool{}
+	ast.Inspect(n, func(nd ast.Node) bool {
+		if as, ok := nd.(*ast.AssignStmt); ok && as.Tok == token.ASSIGN {
+			for _, lhs := range as.Lhs {
+				if _, ok := lhs.(*ast.IndexExpr); ok {
+					pureWriteTargets[lhs] = true
+				}
+			}
+		}
+		return true
+	})
+	ast.Inspect(n, func(nd ast.Node) bool {
+		idx, ok := nd.(*ast.IndexExpr)
+		if !ok {
+			return true
+		}
+		if pureWriteTargets[idx] {
+			// Still descend into the index expression itself: `a[b[i]] = x`
+			// reads b.
+			ast.Inspect(idx.Index, func(inner ast.Node) bool {
+				if ie, ok := inner.(*ast.IndexExpr); ok {
+					if ident, ok := ie.X.(*ast.Ident); ok {
+						if v, ok := a.info.Uses[ident].(*types.Var); ok {
+							reads[v] = true
+						}
+					}
+				}
+				return true
+			})
+			return true
+		}
+		if ident, ok := idx.X.(*ast.Ident); ok {
+			if v, ok := a.info.Uses[ident].(*types.Var); ok {
+				reads[v] = true
+			}
+		}
+		return true
+	})
+	return reads
+}
+
+// bodyHasTopLevelBranch reports whether body contains a `continue` or
+// `break` (labeled or not) that is NOT lexically enclosed by a nested
+// `for`/`range` statement inside body -- i.e. a branch that acts on the
+// `go for` loop itself.
+//
+// This exists purely for the write-only-buffer optimization. The
+// eligibility walk deliberately ALLOWS `continue` at loop-body depth
+// (checkStmt, *ast.BranchStmt), and a `continue` skips every statement
+// after it:
+//
+//	go for idx := range n {
+//	    if idx > 3 { continue }
+//	    output[idx] = idx      // a direct child of body.List, yet only
+//	}                          // executed for idx <= 3
+//
+// The store above is syntactically top-level, bare-indexed, unconditional
+// and unread, so every other condition in writeOnlySliceObjs holds -- but
+// [4, n) is never written, which is exactly what mode 2 must never assume.
+// Rather than model reachability, this fails closed: any body-level branch
+// disqualifies every write-only candidate in that body.
+//
+// (`break` at body level is already rejected by checkStmt, and a labeled
+// branch is rejected with labeled statements; both are matched here anyway
+// so this predicate does not silently depend on those rules holding.)
+func bodyHasTopLevelBranch(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found || n == nil {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.ForStmt:
+			// A branch inside a nested loop binds to THAT loop, not to the
+			// `go for` body, so it cannot skip the body-level store.
+			return false
+		case *ast.RangeStmt:
+			return false
+		case *ast.BranchStmt:
+			if x.Tok == token.CONTINUE || x.Tok == token.BREAK {
+				found = true
+			}
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// writeOnlySliceObjs returns the set of *types.Var slice objects that are
+// WRITE-ONLY CANDIDATES for the upload-skipping optimization: within body
+// (and every inlined callee), the object is never read, and its only write
+// is a single unconditional `s[iterIdent] = expr` statement at body TOP
+// LEVEL -- not nested inside an `if`, a `for`, or an inlined callee, and
+// indexed by the bare loop induction variable rather than any derived
+// expression.
+//
+// Every one of those conditions is load-bearing for soundness:
+//   - never read: the kernel must not observe the buffer's prior contents,
+//     since the optimization leaves them undefined on the device.
+//   - top level / unconditional: a store under an `if` writes only some
+//     elements; the rest would come back as device garbage.
+//   - bare loop index: `s[f(idx)]` need not be a bijection onto [0, n).
+//   - exactly one write: a second write elsewhere may be conditional or
+//     differently-indexed, so anything beyond the single recognised store
+//     disqualifies the object.
+//   - no body-level `continue`/`break`: those make a syntactically
+//     top-level store conditional on control reaching it. See
+//     bodyHasTopLevelBranch.
+//
+// Note this says nothing about len(s) vs. n -- that is checked at runtime
+// by the descriptor emitter, see gpuFreeVar.WriteOnly.
+func (a *gpuAnalyzer) writeOnlySliceObjs(body *ast.BlockStmt, iterIdent *ast.Ident) map[*types.Var]bool {
+	if iterIdent == nil {
+		return nil
+	}
+	iterObj := a.info.Defs[iterIdent]
+	if iterObj == nil {
+		return nil
+	}
+	// A body-level `continue` (which the eligibility walk allows) makes
+	// every statement after it conditional, including a store that is
+	// syntactically a direct child of body.List. Fail closed.
+	if bodyHasTopLevelBranch(body) {
+		return nil
+	}
+
+	// Candidates: objects with a top-level `s[iter] = expr` statement.
+	cand := map[*types.Var]bool{}
+	for _, stmt := range body.List {
+		as, ok := stmt.(*ast.AssignStmt)
+		if !ok || as.Tok != token.ASSIGN {
+			continue
+		}
+		for _, lhs := range as.Lhs {
+			idx, ok := lhs.(*ast.IndexExpr)
+			if !ok {
+				continue
+			}
+			xIdent, ok := idx.X.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			iIdent, ok := idx.Index.(*ast.Ident)
+			if !ok || a.info.Uses[iIdent] != iterObj {
+				continue
+			}
+			if v, ok := a.info.Uses[xIdent].(*types.Var); ok {
+				cand[v] = true
+			}
+		}
+	}
+	if len(cand) == 0 {
+		return nil
+	}
+
+	// Count every write to each candidate anywhere in the body: more than
+	// the single top-level store recognised above disqualifies it.
+	writeCount := map[*types.Var]int{}
+	countWrite := func(target ast.Expr) {
+		idx, ok := target.(*ast.IndexExpr)
+		if !ok {
+			return
+		}
+		ident, ok := idx.X.(*ast.Ident)
+		if !ok {
+			return
+		}
+		if v, ok := a.info.Uses[ident].(*types.Var); ok {
+			writeCount[v]++
+		}
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range x.Lhs {
+				countWrite(lhs)
+			}
+		case *ast.IncDecStmt:
+			countWrite(x.X)
+		}
+		return true
+	})
+
+	// Reads anywhere in the body OR in any inlined callee disqualify.
+	reads := a.readSliceObjs(body)
+	for _, decl := range a.inlined {
+		for v := range a.readSliceObjs(decl) {
+			reads[v] = true
+		}
+		// A write inside a callee is by definition not the single
+		// top-level store, so count it too.
+		ast.Inspect(decl, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range x.Lhs {
+					countWrite(lhs)
+				}
+			case *ast.IncDecStmt:
+				countWrite(x.X)
+			}
+			return true
+		})
+	}
+
+	out := map[*types.Var]bool{}
+	for v := range cand {
+		if reads[v] || writeCount[v] != 1 {
+			continue
+		}
+		out[v] = true
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // writtenScalarObjs returns the set of *types.Var objects assigned via a
