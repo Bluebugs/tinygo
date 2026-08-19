@@ -437,15 +437,34 @@ func (c *compilerContext) getLLVMRuntimeType(name string) llvm.Type {
 }
 
 // getLLVMType returns a LLVM type for a Go type in an SPMD function body context.
-// When spmdFuncMinLaneCount > 0, Varying[T] types are capped at the function's
-// minimum lane count so that all vector operations use a consistent width
-// (e.g., Varying[float32] → <4 x float> in a function where int gives 4 lanes).
+// When spmdFuncMinLaneCount > 0, every Varying[T] is laid out at the function's
+// single lane width so that all vector operations -- and the function's own
+// signature, which getFunction/getLLVMFunctionType build with spmdSigTypeFor
+// from the same spmdMinLaneCountForSig value -- use a consistent width.
+//
+// The width is applied in BOTH directions. Capping down handles mixed
+// signatures (Varying[float32] → <4 x float> in a function whose other varying
+// parameter gives 4 lanes). Widening up is required because spmdSigLaneCount
+// caps the element size at spmdLaneElemSizeCap: a Varying[float64] parameter is
+// <8 x double> under AVX2, and if body-local Varying[float64] values stayed at
+// their natural <4 x double> the mismatch would be "reconciled" by
+// spmdBroadcastMatch / phi narrowing, both of which silently drop the upper
+// lanes.
 func (b *builder) getLLVMType(goType types.Type) llvm.Type {
 	if b.spmdFuncMinLaneCount > 0 {
 		if spmdType, ok := goType.(*types.SPMDType); ok && spmdType.IsVarying() {
 			elemType := b.compilerContext.getLLVMType(spmdType.Elem())
 			naturalLC := b.spmdLaneCount(elemType)
-			if naturalLC > 1 && b.spmdFuncMinLaneCount < naturalLC {
+			// Only genuinely vectorizable element kinds may be re-laid-out here.
+			// LLVM has no vector-of-aggregate type, and compilerContext.getLLVMType
+			// has a dedicated Struct/Array branch (plus typ.Lanes()-driven sizing
+			// that the alloca path depends on) for those. Building
+			// <N x {ptr, ptr}> for Varying[interface{}], Varying[complex128],
+			// Varying[string] or Varying[[2]int64] is invalid IR. The former
+			// `minLC < naturalLC` guard excluded 8-16 byte aggregates only by
+			// accident; the two-directional `!=` guard must exclude them on purpose.
+			if spmdIsVectorizableElemKind(elemType) &&
+				naturalLC > 1 && b.spmdFuncMinLaneCount != naturalLC {
 				return llvm.VectorType(elemType, b.spmdFuncMinLaneCount)
 			}
 		}
@@ -2583,6 +2602,38 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 					} else if actualLanes > expectedLanes &&
 						arg.Type().ElementType() == expectedType.ElementType() {
 						params[i] = b.spmdNarrowVector(arg, expectedLanes)
+					} else if actualLanes == expectedLanes {
+						// Same width, different element type. This is the common case
+						// for a `go for i := range n` loop calling a Varying[int]
+						// helper: the loop materializes its index at i32 while the
+						// parameter is i64. A per-lane conversion is lossless -- the
+						// lane count is unchanged, so no active lane can be dropped.
+						converted, err := b.spmdConvertVectorElem(arg, expectedType,
+							spmdCallElemGoType(instr.Args[i].Type()),
+							spmdCallElemGoType(fn.Signature.Params().At(i).Type()),
+							getPos(instr))
+						if err != nil {
+							return llvm.Value{}, err
+						}
+						params[i] = converted
+					}
+				}
+				// Any residual mismatch cannot be legalised without dropping or
+				// inventing lanes. Report it as a compiler diagnostic naming the
+				// callee rather than letting the LLVM verifier dump raw IR.
+				for i := range params {
+					calleeIdx := calleeParamStart + i
+					if calleeIdx >= len(calleeParamTypes) || params[i].IsNil() {
+						continue
+					}
+					if params[i].Type() != calleeParamTypes[calleeIdx] {
+						return llvm.Value{}, b.makeError(getPos(instr),
+							"SPMD: cannot pass argument "+strconv.Itoa(i)+" to "+fn.RelString(nil)+
+								": caller holds "+spmdLLVMTypeString(params[i].Type())+
+								" but the function is compiled for "+spmdLLVMTypeString(calleeParamTypes[calleeIdx])+
+								". The calling `go for` loop and this function were assigned "+
+								"different SIMD widths; give the loop index and the function's "+
+								"varying parameters element types of the same width")
 					}
 				}
 			}
@@ -2726,15 +2777,23 @@ func (b *builder) getValue(expr ssa.Value, pos token.Pos) llvm.Value {
 						}
 					}
 				} else if b.spmdFuncIsBody && b.spmdFuncMinLaneCount > 0 {
-					// SPMD function body with mixed-width varying types (e.g., AVX2):
-					// createSPMDConst uses compilerContext.getLLVMType which doesn't
-					// see spmdFuncMinLaneCount, so Varying[float32] constants are
-					// created as <8 x float> instead of <4 x float>. Narrow here.
+					// SPMD function body: createSPMDConst uses
+					// compilerContext.getLLVMType, which does not see
+					// spmdFuncMinLaneCount, so the constant carries its element
+					// type's NATURAL width. Resize it to the function's width in
+					// both directions -- e.g. Varying[float32] <8 x float> → 4 lanes
+					// in a mixed signature, and Varying[float64] <4 x double> →
+					// 8 lanes under AVX2 where the signature is widened.
+					//
+					// Widening must SPLAT, not shuffle in undef lanes: these values
+					// are splat constants, so lane 0 is the correct content for
+					// every added lane. Padding with undef here produced NaN in the
+					// upper lanes of a loop-carried float64 accumulator.
 					if val.Type().TypeKind() == llvm.VectorTypeKind {
 						srcLanes := val.Type().VectorSize()
 						dstLanes := b.spmdFuncMinLaneCount
-						if srcLanes > dstLanes {
-							val = b.spmdNarrowVector(val, dstLanes)
+						if srcLanes != dstLanes {
+							val = b.spmdResizeVector(val, dstLanes, val.Type().ElementType())
 						}
 					}
 				}
@@ -2953,7 +3012,12 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		// narrowed to 4 lanes before use. The extra lanes contain garbage but
 		// are excluded by the caller's lane count.
 		if !result.IsNil() && result.Type().TypeKind() == llvm.VectorTypeKind {
-			expectedType := b.getLLVMType(expr.Type())
+			// Use the signature-level width (spmdSigLaneCount), not the element
+			// type's natural width: an SPMD function's Varying[T] result is
+			// compiled at the capped width, so `getLLVMType` alone would report
+			// <4 x i64> for a Varying[int] result that the callee returns as
+			// <8 x i64> -- and narrowing it here would silently discard lanes 4-7.
+			expectedType := b.spmdSigLLVMType(expr.Type())
 			if expectedType.TypeKind() == llvm.VectorTypeKind &&
 				result.Type().ElementType() == expectedType.ElementType() &&
 				result.Type().VectorSize() != expectedType.VectorSize() {
@@ -4912,6 +4976,13 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 				}
 				// Already in WASM mask format (<N x i8/i16/i32>); return as-is.
 				return value, nil
+			}
+			// If this is not a boolean/mask conversion, the value is DATA that the
+			// SPMD loop vectorized ahead of this Convert (e.g. Varying[int] index →
+			// Varying[float32]). It needs a real element-wise conversion; the mask
+			// path would emit invalid IR such as `sext <N x i1> to <N x float>`.
+			if !spmdIsBoolOrMaskType(spmdTo.Elem()) || !spmdIsBoolOrMaskType(typeFrom) {
+				return b.spmdConvertVectorElem(value, vecType, typeFrom, spmdTo.Elem(), pos)
 			}
 			// Mask format conversion (e.g., <4 x i32> to <4 x i32> with different mask format).
 			return b.spmdConvertMaskFormat(value, vecType), nil

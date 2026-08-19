@@ -303,6 +303,138 @@ func (c *compilerContext) spmdLaneCount(elemType llvm.Type) int {
 	return c.spmdRegisterBytes() / int(elemSize)
 }
 
+// spmdLaneElemSizeCap bounds the element size used when deriving a lane count
+// from a type that is not itself the data being processed.
+//
+// It is DERIVED from go/types.SPMDLoopIndexElemSizeCap
+// (go/src/go/types/check_ext_spmd.go) rather than duplicated, because the two
+// MUST agree: one fixes the width of a `go for` loop and the other fixes the
+// width of the SPMD functions that loop calls, and any disagreement turns every
+// SPMD call boundary into a hard compile error. Do not replace this with a
+// literal.
+const spmdLaneElemSizeCap = int(types.SPMDLoopIndexElemSizeCap)
+
+// spmdSigLaneCount is spmdLaneCount with the element size capped at
+// spmdLaneElemSizeCap, used to fix the vector width of an SPMD function's
+// signature.
+//
+// The type checker caps a `go for` loop index's contribution to the loop's lane
+// count at 4 bytes, so on linux/amd64 (Go `int` = 8 bytes) a
+// `go for i := range n` loop is 8 lanes wide under AVX2. Deriving an SPMD
+// function's width from its parameter types alone would make
+// `func helper(v lanes.Varying[int])` 32/8 = 4 lanes wide, and the call from
+// that loop could then not be typed at all. Applying the same cap on both sides
+// keeps caller and callee in agreement by construction, and does so WITHOUT
+// narrowing any vector at the call boundary -- which would silently discard
+// active lanes.
+//
+// Elements narrower than the cap (byte, int16, float32) are unaffected, so
+// byte-wide loops still run at their natural 16/32 lanes. On wasm, where `int`
+// is 4 bytes, the cap is a no-op.
+func (c *compilerContext) spmdSigLaneCount(elemType llvm.Type) int {
+	if !c.simdEnabled {
+		return 1
+	}
+	elemSize := int(c.targetData.TypeAllocSize(elemType))
+	if elemSize <= 0 {
+		return 1
+	}
+	if elemSize > spmdLaneElemSizeCap {
+		elemSize = spmdLaneElemSizeCap
+	}
+	return c.spmdRegisterBytes() / elemSize
+}
+
+// spmdSigTypeFor returns the LLVM type to use for goType when it appears in
+// signature sig. Every Varying[T] in an SPMD signature is laid out at the
+// signature's single lane width (spmdMinLaneCountForSig), so that a function is
+// compiled at one consistent width and matches the `go for` loops that call it.
+//
+// This is the single source of truth for SPMD signature layout and must be used
+// by BOTH getLLVMFunctionType (function-pointer types) and getFunction
+// (the actual declaration); using plain getLLVMType in either place produces a
+// declaration the call site cannot type.
+func (c *compilerContext) spmdSigTypeFor(sig *types.Signature, goType types.Type) llvm.Type {
+	minLC := c.spmdMinLaneCountForSig(sig)
+	if minLC <= 0 {
+		return c.getLLVMType(goType)
+	}
+	spmdType, ok := goType.(*types.SPMDType)
+	if !ok || !spmdType.IsVarying() {
+		return c.getLLVMType(goType)
+	}
+	elemType := c.getLLVMType(spmdType.Elem())
+	// Aggregates have no vector form; compilerContext.getLLVMType lays them out
+	// as [Lanes x T] instead. Same guard as builder.getLLVMType -- the two must
+	// agree or the call boundary sees <N x %struct> against [N x %struct].
+	if !spmdIsVectorizableElemKind(elemType) {
+		return c.getLLVMType(goType)
+	}
+	if c.spmdLaneCount(elemType) <= 1 {
+		return elemType // scalar fallback
+	}
+	return llvm.VectorType(elemType, minLC)
+}
+
+// spmdSigLLVMType is getLLVMType for a type appearing in an SPMD function
+// signature: a varying element type is laid out at spmdSigLaneCount lanes rather
+// than its natural width, matching getLLVMFunctionType.
+func (c *compilerContext) spmdSigLLVMType(goType types.Type) llvm.Type {
+	spmdType, ok := goType.(*types.SPMDType)
+	if !ok || !spmdType.IsVarying() {
+		return c.getLLVMType(goType)
+	}
+	elemLLVM := c.getLLVMType(spmdType.Elem())
+	lc := c.spmdSigLaneCount(elemLLVM)
+	if lc <= 1 {
+		return elemLLVM
+	}
+	return llvm.VectorType(elemLLVM, lc)
+}
+
+// spmdLLVMTypeString renders an LLVM type the way LLVM IR spells it (the Go
+// binding's Type.String() only reports the kind, e.g. "VectorType", which is
+// useless in a user-facing diagnostic).
+func spmdLLVMTypeString(t llvm.Type) string {
+	switch t.TypeKind() {
+	case llvm.VectorTypeKind:
+		return "<" + strconv.Itoa(t.VectorSize()) + " x " + spmdLLVMTypeString(t.ElementType()) + ">"
+	case llvm.IntegerTypeKind:
+		return "i" + strconv.Itoa(t.IntTypeWidth())
+	case llvm.FloatTypeKind:
+		return "float"
+	case llvm.DoubleTypeKind:
+		return "double"
+	case llvm.PointerTypeKind:
+		return "ptr"
+	}
+	return t.String()
+}
+
+// spmdIsVectorizableElemKind reports whether an LLVM type may be used as the
+// element type of an SPMD vector. Aggregates (struct, array) and vectors are
+// excluded: LLVM has no vector-of-aggregate and no nested-vector type, and
+// compilerContext.getLLVMType handles those Varying[T] shapes with a dedicated
+// array-of-T layout instead.
+func spmdIsVectorizableElemKind(elemType llvm.Type) bool {
+	switch elemType.TypeKind() {
+	case llvm.StructTypeKind, llvm.ArrayTypeKind, llvm.VectorTypeKind,
+		llvm.VoidTypeKind, llvm.LabelTypeKind, llvm.FunctionTypeKind:
+		return false
+	}
+	return true
+}
+
+// spmdCallElemGoType returns the element Go type of a possibly-varying type. It
+// is used to recover signedness when converting vector element types at an SPMD
+// call boundary.
+func spmdCallElemGoType(t types.Type) types.Type {
+	if spmdType, ok := t.(*types.SPMDType); ok {
+		return spmdType.Elem()
+	}
+	return t
+}
+
 // spmdEffectiveLaneCount returns the lane count for an SPMDType derived from
 // the SIMD register width for the element type.
 func (c *compilerContext) spmdEffectiveLaneCount(spmdType *types.SPMDType, elemLLVM llvm.Type) int {
@@ -326,7 +458,12 @@ func (c *compilerContext) spmdMinLaneCountForSig(sig *types.Signature) int {
 			return
 		}
 		elemType := c.getLLVMType(spmdType.Elem())
-		lc := c.spmdLaneCount(elemType)
+		if !spmdIsVectorizableElemKind(elemType) {
+			// Laid out as [Lanes x T], not as a vector; it neither has nor
+			// constrains a SIMD lane width.
+			return
+		}
+		lc := c.spmdSigLaneCount(elemType)
 		if lc <= 0 {
 			return
 		}
@@ -1148,8 +1285,23 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 				// above arrayLenCap, keep the heuristic value (already correct).
 			}
 		} else {
+			// rangeint (`go for i := range N`). The iterator's own LLVM type would
+			// give simdRegisterSize/sizeof(int) lanes -- 4 under AVX2 on linux/amd64,
+			// where Go `int` is 8 bytes. That lets the index dominate the lane count
+			// and makes the loop disagree with any Varying[float32]/Varying[int32]
+			// callee (whose lane count comes from its own parameter types), which
+			// silently defeats varying `break` lowering.
+			//
+			// The type checker caps the index's contribution (see
+			// go/types.spmdLoopIndexElemSize) and publishes the result as
+			// ssaLoop.LaneCount; x-tools' peeler uses that same value, so honoring it
+			// here is what keeps the two in agreement. The index keeps its declared
+			// width, so a wider lane count just means a wider iterator vector.
 			elemType := b.getLLVMType(mainIterPhi.Type())
 			laneCount = b.spmdLaneCount(elemType)
+			if ssaLoop.LaneCount > laneCount {
+				laneCount = ssaLoop.LaneCount
+			}
 		}
 
 		// Scalar fallback: override to 1 lane when SIMD is disabled.
@@ -3283,12 +3435,31 @@ func (b *builder) spmdConvertMaskFormat(mask llvm.Value, targetType llvm.Type) l
 		return mask // Not a vector-to-vector conversion; leave unchanged.
 	}
 
-	// For LLVM constants, just produce the correct constant without emitting instructions.
+	// For LLVM constants, just produce the correct constant without emitting
+	// instructions.
+	//
+	// A CONSTANT all-ones mask is deliberately re-materialized as all-ones at
+	// the target width rather than zero-padded. Such a constant is not a
+	// measurement of some narrower producer; it is the "all lanes active"
+	// literal, created at whatever width the local getLLVMType happened to
+	// return, and several loop-prologue paths rely on it covering the full
+	// width (zero-padding it truncates 16-lane byte loops to 4 active lanes --
+	// integ_to-upper, integ_store-coalescing, integ_bit-counting and
+	// integ_pmaddubsw-pattern all regress). The non-constant extend path below
+	// is the one that must not invent active lanes.
 	if mask.IsConstant() {
 		if mask.IsNull() {
 			return llvm.ConstNull(targetType)
 		}
-		return llvm.ConstAllOnes(targetType)
+		// Enforce the invariant the comment above asserts: only a genuinely
+		// all-ones constant is the "all lanes active" literal. A PARTIAL constant
+		// mask (e.g. a folded `lanes.Index() < 3`) is a measurement, and widening
+		// it to all-ones would activate lanes over undef -- exactly the hazard
+		// removed from the shuffle path below. Such a mask falls through and is
+		// zero-extended like any other.
+		if mask == llvm.ConstAllOnes(mask.Type()) {
+			return llvm.ConstAllOnes(targetType)
+		}
 	}
 
 	srcLanes := mask.Type().VectorSize()
@@ -3318,18 +3489,31 @@ func (b *builder) spmdConvertMaskFormat(mask llvm.Value, targetType llvm.Type) l
 			undef := llvm.Undef(llvm.VectorType(i1Type, srcLanes))
 			i1Vec = b.CreateShuffleVector(i1Vec, undef, shuffleMask, "spmd.mask.cvt.shuf")
 		} else {
-			// Extend: keep existing lanes, fill rest by repeating lane 0.
+			// Extend: keep existing lanes, fill the added lanes with FALSE.
+			//
+			// The added lanes have no data behind them -- they exist only because
+			// the consumer is wider than the producer -- so the only safe value is
+			// "inactive". Repeating an existing lane (this used to repeat lane 0)
+			// marks them ACTIVE whenever that lane is active, which makes the
+			// consumer execute over undef data. That is invisible for a purely
+			// elementwise callee whose result is narrowed back, but wrong as soon
+			// as the callee reduces or stores.
+			//
+			// Every caller of spmdConvertMaskFormat is a mask/boolean context
+			// (call-boundary mask, varying-bool phi, boolean operand matching), so
+			// none depends on the added lanes being active.
 			maskElems := make([]llvm.Value, targetLanes)
 			for i := range maskElems {
 				idx := i
 				if idx >= srcLanes {
-					idx = 0 // repeat lane 0 as a safe placeholder
+					// Index into the second shuffle operand, which is all-zero.
+					idx = srcLanes
 				}
 				maskElems[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(idx), false)
 			}
 			shuffleMask := llvm.ConstVector(maskElems, false)
-			undef := llvm.Undef(llvm.VectorType(i1Type, srcLanes))
-			i1Vec = b.CreateShuffleVector(i1Vec, undef, shuffleMask, "spmd.mask.cvt.ext")
+			zeros := llvm.ConstNull(llvm.VectorType(i1Type, srcLanes))
+			i1Vec = b.CreateShuffleVector(i1Vec, zeros, shuffleMask, "spmd.mask.cvt.ext")
 		}
 	}
 
@@ -3337,7 +3521,134 @@ func (b *builder) spmdConvertMaskFormat(mask llvm.Value, targetType llvm.Type) l
 	if targetElem == i1Type {
 		return i1Vec
 	}
+	if targetElem.TypeKind() != llvm.IntegerTypeKind {
+		// A mask can only be materialized as an integer vector: `sext <N x i1> to
+		// <N x float>` is invalid LLVM IR. Reaching here means a data vector was
+		// misclassified as a mask upstream; refuse rather than emit broken IR.
+		// (Callers that legitimately need a float-typed all-ones pattern must sext
+		// to the same-width integer vector and bitcast themselves.)
+		panic("spmdConvertMaskFormat: non-integer mask target type " + targetType.String() +
+			"; a data vector was routed through the mask conversion path")
+	}
 	return b.CreateSExt(i1Vec, targetType, "spmd.mask.cvt.sext")
+}
+
+// spmdIsBoolOrMaskType reports whether t is a boolean or SPMD mask type, i.e. a
+// type whose vector representation is a lane mask (all-ones = true) rather than
+// data. Used to decide between spmdConvertMaskFormat (mask reinterpretation) and
+// spmdConvertVectorElem (real element conversion).
+func spmdIsBoolOrMaskType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if spmdtypes.IsMask(t) {
+		return true
+	}
+	if spmdType, ok := t.(*types.SPMDType); ok {
+		return spmdIsBoolOrMaskType(spmdType.Elem())
+	}
+	if basic, ok := t.Underlying().(*types.Basic); ok {
+		return basic.Info()&types.IsBoolean != 0
+	}
+	return false
+}
+
+// spmdIsFloatKind reports whether an LLVM type is a floating point scalar type.
+func spmdIsFloatKind(t llvm.Type) bool {
+	switch t.TypeKind() {
+	case llvm.FloatTypeKind, llvm.DoubleTypeKind, llvm.FP128TypeKind, llvm.X86_FP80TypeKind, llvm.PPC_FP128TypeKind:
+		return true
+	}
+	return false
+}
+
+// spmdConvertVectorElem converts an already-vectorized value to targetVec by
+// converting its element type (and, if they differ, its lane count).
+//
+// This is the data counterpart of spmdConvertMaskFormat. An SPMD loop frequently
+// vectorizes a value before the go/ssa Convert instruction that changes its type
+// is reached -- e.g. `lanes.Varying[float32](i)` where `i` is a loop-derived
+// varying int. In that case createConvert sees a scalar Go source type but an
+// LLVM value that is already a vector. Routing such a conversion through the
+// mask path produced invalid IR (`sext <N x i1> to <N x float>`); it must be a
+// real element-wise conversion (sitofp/trunc/sext/...) instead.
+//
+// typeFrom/typeTo are the Go element types, used only for signedness.
+func (b *builder) spmdConvertVectorElem(value llvm.Value, targetVec llvm.Type, typeFrom, typeTo types.Type, pos token.Pos) (llvm.Value, error) {
+	if value.Type() == targetVec {
+		return value, nil
+	}
+	if value.Type().TypeKind() != llvm.VectorTypeKind || targetVec.TypeKind() != llvm.VectorTypeKind {
+		return llvm.Value{}, b.makeError(pos, "SPMD: element conversion requires vector types, got "+
+			value.Type().String()+" -> "+targetVec.String())
+	}
+
+	// Reconcile lane counts first, preserving the source element type.
+	//
+	// Only NARROWING is permitted here. spmdResizeVector's extend path is
+	// ExtractElement(vec, 0) + splat, which is correct for a splat constant but
+	// catastrophic on a data path: every lane would silently become lane 0.
+	// The createFunctionCall caller is guarded by actualLanes == expectedLanes,
+	// but the createConvert caller is not, so refuse loudly instead.
+	if value.Type().VectorSize() != targetVec.VectorSize() {
+		if value.Type().VectorSize() < targetVec.VectorSize() {
+			return llvm.Value{}, b.makeError(pos, "SPMD: cannot widen data vector "+
+				spmdLLVMTypeString(value.Type())+" to "+spmdLLVMTypeString(targetVec)+
+				": the added lanes have no defined value")
+		}
+		value = b.spmdResizeVector(value, targetVec.VectorSize(), value.Type().ElementType())
+	}
+
+	srcElem := value.Type().ElementType()
+	dstElem := targetVec.ElementType()
+	if srcElem == dstElem {
+		return value, nil
+	}
+
+	srcInt := srcElem.TypeKind() == llvm.IntegerTypeKind
+	dstInt := dstElem.TypeKind() == llvm.IntegerTypeKind
+	if (!srcInt && !spmdIsFloatKind(srcElem)) || (!dstInt && !spmdIsFloatKind(dstElem)) {
+		return llvm.Value{}, b.makeError(pos, "SPMD: unsupported vector element conversion "+
+			value.Type().String()+" -> "+targetVec.String())
+	}
+
+	srcUnsigned := false
+	if basic, ok := typeFrom.Underlying().(*types.Basic); ok {
+		srcUnsigned = basic.Info()&types.IsUnsigned != 0
+	}
+	dstUnsigned := false
+	if basic, ok := typeTo.Underlying().(*types.Basic); ok {
+		dstUnsigned = basic.Info()&types.IsUnsigned != 0
+	}
+
+	switch {
+	case srcInt && dstInt:
+		srcBits := srcElem.IntTypeWidth()
+		dstBits := dstElem.IntTypeWidth()
+		switch {
+		case srcBits > dstBits:
+			return b.CreateTrunc(value, targetVec, "spmd.conv.trunc"), nil
+		case srcUnsigned:
+			return b.CreateZExt(value, targetVec, "spmd.conv.zext"), nil
+		default:
+			return b.CreateSExt(value, targetVec, "spmd.conv.sext"), nil
+		}
+	case srcInt:
+		if srcUnsigned {
+			return b.CreateUIToFP(value, targetVec, "spmd.conv.uitofp"), nil
+		}
+		return b.CreateSIToFP(value, targetVec, "spmd.conv.sitofp"), nil
+	case dstInt:
+		if dstUnsigned {
+			return b.CreateFPToUI(value, targetVec, "spmd.conv.fptoui"), nil
+		}
+		return b.CreateFPToSI(value, targetVec, "spmd.conv.fptosi"), nil
+	default:
+		if b.targetData.TypeAllocSize(srcElem) > b.targetData.TypeAllocSize(dstElem) {
+			return b.CreateFPTrunc(value, targetVec, "spmd.conv.fptrunc"), nil
+		}
+		return b.CreateFPExt(value, targetVec, "spmd.conv.fpext"), nil
+	}
 }
 
 // spmdReshapeVector reshapes a vector from its current lane count to the lane
@@ -3432,6 +3743,15 @@ func spmdVectorTypeSuffix(vecType llvm.Type) string {
 // op is the operation name: "add", "mul", "and", "or", "xor", "smax", "smin", "umax", "umin".
 // Returns the scalar result.
 func (b *builder) spmdCallVectorReduce(op string, vec llvm.Value) llvm.Value {
+	// Float min/max reductions over a vector wider than one SIMD register are
+	// scalarized by LLVM into per-element llvm.minnum/maxnum calls, which lower
+	// to libcalls (fmin/fmax) that the wasi link step cannot resolve. Fold the
+	// vector down to register width first using ELEMENTWISE llvm.minnum/maxnum,
+	// which do lower to native instructions (f64x2.min etc.). The result is
+	// identical: min/max is associative and commutative over the lanes.
+	if op == "fmin" || op == "fmax" {
+		vec = b.spmdFoldFloatMinMaxToRegisterWidth(op, vec)
+	}
 	vecType := vec.Type()
 	elemType := vecType.ElementType()
 	intrinsicName := "llvm.vector.reduce." + op + "." + spmdVectorTypeSuffix(vecType)
@@ -3441,6 +3761,50 @@ func (b *builder) spmdCallVectorReduce(op string, vec llvm.Value) llvm.Value {
 		llvmFn = llvm.AddFunction(b.mod, intrinsicName, fnType)
 	}
 	return b.createCall(fnType, llvmFn, []llvm.Value{vec}, "")
+}
+
+// spmdFoldFloatMinMaxToRegisterWidth halves a float vector with elementwise
+// llvm.minnum/llvm.maxnum until it is no wider than one SIMD register, so the
+// subsequent reduction intrinsic operates on a natively-supported vector type.
+// op is "fmin" or "fmax".
+func (b *builder) spmdFoldFloatMinMaxToRegisterWidth(op string, vec llvm.Value) llvm.Value {
+	if vec.Type().TypeKind() != llvm.VectorTypeKind {
+		return vec
+	}
+	elemBytes := int(b.targetData.TypeAllocSize(vec.Type().ElementType()))
+	if elemBytes <= 0 {
+		return vec
+	}
+	maxLanes := b.spmdRegisterBytes() / elemBytes
+	if maxLanes < 1 {
+		return vec
+	}
+	intrinsicBase := "llvm.minnum."
+	if op == "fmax" {
+		intrinsicBase = "llvm.maxnum."
+	}
+	for vec.Type().VectorSize() > maxLanes && vec.Type().VectorSize()%2 == 0 {
+		n := vec.Type().VectorSize()
+		half := n / 2
+		loIdx := make([]llvm.Value, half)
+		hiIdx := make([]llvm.Value, half)
+		for i := 0; i < half; i++ {
+			loIdx[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(i), false)
+			hiIdx[i] = llvm.ConstInt(b.ctx.Int32Type(), uint64(half+i), false)
+		}
+		undef := llvm.Undef(vec.Type())
+		lo := b.CreateShuffleVector(vec, undef, llvm.ConstVector(loIdx, false), "spmd.reduce.lo")
+		hi := b.CreateShuffleVector(vec, undef, llvm.ConstVector(hiIdx, false), "spmd.reduce.hi")
+		halfType := lo.Type()
+		name := intrinsicBase + spmdVectorTypeSuffix(halfType)
+		llvmFn := b.mod.NamedFunction(name)
+		fnType := llvm.FunctionType(halfType, []llvm.Type{halfType, halfType}, false)
+		if llvmFn.IsNil() {
+			llvmFn = llvm.AddFunction(b.mod, name, fnType)
+		}
+		vec = b.createCall(fnType, llvmFn, []llvm.Value{lo, hi}, "spmd.reduce.fold")
+	}
+	return vec
 }
 
 // spmdCallVectorReduceFloat declares and calls an LLVM float vector reduction intrinsic.

@@ -48,30 +48,11 @@ func (c *compilerContext) getFuncType(typ *types.Signature) llvm.Type {
 
 // getLLVMFunctionType returns a LLVM function type for a given signature.
 func (c *compilerContext) getLLVMFunctionType(typ *types.Signature) llvm.Type {
-	// For SPMD signatures with mixed-width varying types (e.g., Varying[float32]
-	// and Varying[int] on AVX2 where float32→8 lanes and int→4 lanes), all
-	// Varying[T] parameters and results are capped to the minimum lane count so
-	// the function uses a single, consistent lane width throughout.
-	minLC := c.spmdMinLaneCountForSig(typ)
-
-	// getLLVMTypeForSig returns the LLVM type for a Go type, capping Varying[T]
-	// at minLC when minLC > 0.
+	// For SPMD signatures every Varying[T] parameter and result is laid out at
+	// the signature's single lane width; see spmdSigTypeFor, which getFunction
+	// uses for the actual declaration so the two always agree.
 	getLLVMTypeForSig := func(goType types.Type) llvm.Type {
-		if minLC <= 0 {
-			return c.getLLVMType(goType)
-		}
-		if spmdType, ok := goType.(*types.SPMDType); ok && spmdType.IsVarying() {
-			elemType := c.getLLVMType(spmdType.Elem())
-			naturalLC := c.spmdLaneCount(elemType)
-			if naturalLC <= 1 {
-				return elemType // scalar fallback
-			}
-			if minLC < naturalLC {
-				// Cap to minimum: e.g., Varying[float32] on AVX2 → <4 x float> not <8 x float>
-				return llvm.VectorType(elemType, minLC)
-			}
-		}
-		return c.getLLVMType(goType)
+		return c.spmdSigTypeFor(typ, goType)
 	}
 
 	// Get the return type.

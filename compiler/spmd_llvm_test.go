@@ -845,9 +845,14 @@ func TestSPMDMaskType(t *testing.T) {
 				)
 				return types.NewSignatureType(nil, nil, nil, params, nil, false)
 			},
-			wantMaskType:  true,
-			wantLaneCount: 2,       // 128 bits / 64 bits = 2 lanes
-			wantElemWidth: 128 / 2, // i64 for WASM mask at 2 lanes (128/2=64 bits)
+			wantMaskType: true,
+			// Elements wider than spmdLaneElemSizeCap (4 bytes) do not narrow an
+			// SPMD signature: the width is 128/4 = 4 lanes, matching the `go for`
+			// loops that call it. A Varying[float64] parameter is therefore
+			// <4 x double> (two v128 registers), not <2 x double>. Before this,
+			// a float64 helper called from a 4-lane loop could not be typed.
+			wantLaneCount: 4,
+			wantElemWidth: 128 / 4, // i32 for WASM mask at 4 lanes
 		},
 		{
 			name: "mixed_params_with_varying",

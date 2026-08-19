@@ -81,11 +81,11 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 	if fn.Signature.Results() == nil {
 		retType = c.ctx.VoidType()
 	} else if fn.Signature.Results().Len() == 1 {
-		retType = c.getLLVMType(fn.Signature.Results().At(0).Type())
+		retType = c.spmdSigTypeFor(fn.Signature, fn.Signature.Results().At(0).Type())
 	} else {
 		results := make([]llvm.Type, 0, fn.Signature.Results().Len())
 		for i := 0; i < fn.Signature.Results().Len(); i++ {
-			results = append(results, c.getLLVMType(fn.Signature.Results().At(i).Type()))
+			results = append(results, c.spmdSigTypeFor(fn.Signature, fn.Signature.Results().At(i).Type()))
 		}
 		retType = c.ctx.StructType(results, false)
 	}
@@ -100,7 +100,7 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 	}
 
 	for _, param := range getParams(fn.Signature) {
-		paramType := c.getLLVMType(param.Type())
+		paramType := c.spmdSigTypeFor(fn.Signature, param.Type())
 		paramFragmentInfos := c.expandFormalParamType(paramType, param.Name(), param.Type())
 		paramInfos = append(paramInfos, paramFragmentInfos...)
 	}
