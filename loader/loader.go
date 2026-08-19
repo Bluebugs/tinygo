@@ -93,6 +93,14 @@ type Package struct {
 	info         types.Info
 }
 
+// TypesInfo returns the types.Info produced while type-checking this
+// package, giving downstream consumers (e.g. the SPMD GPU-offload
+// eligibility analysis) access to type information without exposing the
+// unexported info field directly.
+func (p *Package) TypesInfo() *types.Info {
+	return &p.info
+}
+
 type EmbedFile struct {
 	Name      string
 	Size      uint64
