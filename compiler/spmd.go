@@ -923,6 +923,10 @@ type spmdActiveLoop struct {
 	// Peeling fields (only set when ssaLoopInfo.IsPeeled == true):
 	isPeeled bool // loop was peeled at SSA level; main body uses all-ones mask
 
+	// GPU offload (only set when -gpu=webgpu and the loop is offloadable):
+	gpu     *gpuLoopOffload
+	gpuArgs *gpuLaunchArgs
+
 	// Set during IR generation:
 	laneIndices     llvm.Value // <iter, iter+1, ..., iter+laneCount-1> (nil when isDecomposed)
 	tailMask        llvm.Value // per-lane bounds check

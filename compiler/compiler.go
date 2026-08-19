@@ -101,6 +101,11 @@ type compilerContext struct {
 	packageDir       string // directory for this package
 	runtimePkg       *types.Package
 	spmdInfo         *SPMDInfo // SPMD metadata extracted from AST (nil if no SPMD code)
+
+	// gpuKernelCounter numbers the WGSL kernels generated for this module.
+	// Each offloaded `go for` loop consumes one id; the id is also the key
+	// the JS host uses to look the compiled shader up.
+	gpuKernelCounter int32
 }
 
 // newCompilerContext returns a new compiler context ready for use, most
@@ -1522,6 +1527,9 @@ func (b *builder) createFunction() {
 	// SPMD: analyze loops before compiling blocks.
 	b.spmdLoopState = b.analyzeSPMDLoops()
 
+	// SPMD: decide which loops (if any) get a GPU offload path.
+	b.spmdGPUAnalyze()
+
 	// SPMD: if no go-for loops but this is an SPMD function with entry mask,
 	// mark the entire function body as an SPMD region so that varying if/else
 	// linearization infrastructure is active for all blocks.
@@ -1677,6 +1685,12 @@ func (b *builder) createFunction() {
 					fmt.Printf("\t%s\n", instr.String())
 				}
 			}
+			// SPMD: when this is the terminator of an offloaded `go for`
+			// loop's entry block, append the GPU runtime guard and the GPU
+			// path first; the terminator below is then emitted into the
+			// fresh "spmd.cpu" block, unchanged.
+			b.spmdGPUMaybeEmitGuard(block, instr)
+
 			b.createInstruction(instr)
 
 			// SPMD: after compiling an SPMD loop's iter phi, emit the body prologue.
@@ -1829,6 +1843,10 @@ func (b *builder) createFunction() {
 			phi.llvm.AddIncoming([]llvm.Value{inc.val}, []llvm.BasicBlock{inc.block})
 		}
 	}
+
+	// SPMD: the GPU-offload edge adds a predecessor to each offloaded loop's
+	// merge block; make sure no phi there was left with a missing incoming.
+	b.gpuRepairDonePhis()
 
 	if b.NeedsStackObjects {
 		// Track phi nodes.
