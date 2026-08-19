@@ -273,6 +273,32 @@ func (a *gpuAnalyzer) checkStmt(stmt ast.Stmt, depth int) string {
 		}
 		return a.checkEligible(x.Body, depth)
 
+	case *ast.RangeStmt:
+		// Narrowly allowlist "for i := range n" over an integer bound
+		// (Go 1.22+ range-over-int) as a nested loop inside an inlined
+		// SPMD callee (e.g. mandelSPMD's "for iter := range maxIter"
+		// divergence loop) -- NOT range over a slice/map/string/channel/
+		// func, and NOT a two-variable "for i, v := range ...", both of
+		// which have no meaning identical to a plain counted loop here.
+		// Everything else about x is rejected by falling through to the
+		// default case below via the explicit checks; the default switch
+		// case is NOT reopened.
+		if x.Value != nil || x.Tok != token.DEFINE {
+			return "range-over-value or non-defining range not eligible for GPU offload"
+		}
+		if _, ok := x.Key.(*ast.Ident); !ok {
+			return "unsupported range key not eligible for GPU offload"
+		}
+		xt := a.info.TypeOf(x.X)
+		basic, ok := xt.Underlying().(*types.Basic)
+		if !ok || basic.Info()&types.IsInteger == 0 {
+			return "range-over-non-integer not eligible for GPU offload"
+		}
+		if reject := a.checkExpr(x.X, depth); reject != "" {
+			return reject
+		}
+		return a.checkEligible(x.Body, depth)
+
 	case *ast.ReturnStmt:
 		// A return inside the loop body itself would exit the loop under a
 		// varying condition, which §D4 forbids. A return inside an inlined
@@ -479,6 +505,17 @@ func (a *gpuAnalyzer) checkPackageCall(sel *ast.SelectorExpr) (string, bool) {
 		if gpuCrossLaneOps[sel.Sel.Name] {
 			return fmt.Sprintf("cross-lane operation not eligible for GPU offload: lanes.%s", sel.Sel.Name), false
 		}
+		switch sel.Sel.Name {
+		case "Count", "Index":
+			// lanes.Count is the SIMD register width and lanes.Index is the
+			// lane index *within* a vector (0..Count-1); the loop index is
+			// already the GPU's gid.x. With one GPU invocation per lane
+			// neither has a sound meaning, and per-lane use of them is
+			// exactly the lane-count-dependent anti-pattern documented in
+			// CLAUDE.md as not dual-mode safe -- offloading them would
+			// silently change results depending on workgroup size.
+			return fmt.Sprintf("lane-count-dependent operation not eligible for GPU offload: lanes.%s", sel.Sel.Name), false
+		}
 		if gpuApprovedLanesFuncs[sel.Sel.Name] {
 			return "", true
 		}
@@ -502,8 +539,6 @@ func (a *gpuAnalyzer) checkPackageCall(sel *ast.SelectorExpr) (string, bool) {
 // gpuCrossLaneOps.
 var gpuApprovedLanesFuncs = map[string]bool{
 	"Varying": true,
-	"Count":   true,
-	"Index":   true,
 	"FMA":     true,
 }
 
@@ -757,6 +792,14 @@ func (a *gpuAnalyzer) stmtCost(stmt ast.Stmt) uint64 {
 		}
 		return innerCost * mult
 	}
+	if rangeStmt, ok := stmt.(*ast.RangeStmt); ok {
+		// "for i := range n" over an integer bound (allowlisted by
+		// checkStmt above): no compile-time-constant-bound fast path
+		// (unlike the classic for's literal-comparison form), so always
+		// use the dynamic-bound multiplier.
+		innerCost := a.bodyCost(rangeStmt.Body.List)
+		return innerCost * dynamicBoundMultiplier
+	}
 
 	var total uint64
 	ast.Inspect(stmt, func(n ast.Node) bool {
@@ -765,6 +808,9 @@ func (a *gpuAnalyzer) stmtCost(stmt ast.Stmt) uint64 {
 			// Nested for-loops are handled recursively by stmtCost (to get
 			// the correct multiplier and avoid double counting); stop
 			// descending into this subtree here.
+			total += a.stmtCost(x)
+			return false
+		case *ast.RangeStmt:
 			total += a.stmtCost(x)
 			return false
 		case *ast.BinaryExpr:
