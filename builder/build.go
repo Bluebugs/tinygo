@@ -663,6 +663,24 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 		}
 	}
 
+	// Check for wgpu-native only when actually linking (not for .o, .bc, .ll).
+	// This check must run here, not in compileopts/target.go, because target
+	// configuration has no knowledge of the output kind.
+	if config.Options.GPU == "webgpu" && config.Options.GOARCH != "wasm" {
+		wgpu := os.Getenv("WGPU_NATIVE_PATH")
+		if wgpu == "" {
+			wgpu = filepath.Join(os.Getenv("HOME"), ".local/share/wgpu-native")
+		}
+		// Fail here with something actionable. Without this check a missing
+		// wgpu-native surfaces much later as either
+		// "webgpu/webgpu.h: No such file or directory" from the C compile or
+		// "cannot find -lwgpu_native" from the link, neither of which says
+		// what to install or which variable to set.
+		if _, err := os.Stat(filepath.Join(wgpu, "include", "webgpu", "webgpu.h")); err != nil {
+			return result, fmt.Errorf("-gpu=webgpu on a native target requires wgpu-native at %s (set WGPU_NATIVE_PATH to override): %w", wgpu, err)
+		}
+	}
+
 	// Act as a compiler driver, as we need to produce a complete executable.
 	// First add all jobs necessary to build this object file, then afterwards
 	// run all jobs in parallel as far as possible.

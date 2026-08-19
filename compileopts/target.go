@@ -533,14 +533,9 @@ func defaultTarget(options *Options) (*TargetSpec, error) {
 		if wgpu == "" {
 			wgpu = filepath.Join(os.Getenv("HOME"), ".local/share/wgpu-native")
 		}
-		// Fail here with something actionable. Without this check a missing
-		// wgpu-native surfaces much later as either
-		// "webgpu/webgpu.h: No such file or directory" from the C compile or
-		// "cannot find -lwgpu_native" from the link, neither of which says
-		// what to install or which variable to set.
-		if _, err := os.Stat(filepath.Join(wgpu, "include", "webgpu", "webgpu.h")); err != nil {
-			return nil, fmt.Errorf("-gpu=webgpu on a native target requires wgpu-native at %s (set WGPU_NATIVE_PATH to override): %w", wgpu, err)
-		}
+		// The wgpu-native presence check is deferred to builder/build.go,
+		// where it can run only when the build will actually link. Object files
+		// (.o, .bc, .ll) do not link and should not fail on missing wgpu-native.
 		ldflags = append(ldflags,
 			// TinyGo's code generator emits non-PIC code (R_X86_64_32
 			// against .rodata), so the executable must not be a PIE.
