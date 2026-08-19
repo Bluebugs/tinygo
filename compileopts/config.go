@@ -238,7 +238,8 @@ func (c *Config) BuildTags() []string {
 		"osusergo",                                   // to get os/user to work
 		"math_big_pure_go",                           // to get math/big to work
 		"gc." + c.GC(), "scheduler." + c.Scheduler(), // used inside the runtime package
-		"serial." + c.Serial()}...) // used inside the machine package
+		"serial." + c.Serial(),    // used inside the machine package
+		"spmd.gpu." + c.GPU()}...) // gates src/runtime/gpu_wasm.go (I6)
 	switch c.Scheduler() {
 	case "threads", "cores":
 	default:

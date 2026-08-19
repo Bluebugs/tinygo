@@ -1,4 +1,4 @@
-//go:build tinygo.wasm && js
+//go:build tinygo.wasm && js && spmd.gpu.webgpu
 
 // SPMD GPU offload runtime ABI (browser/JS target only).
 //
@@ -7,7 +7,14 @@
 // that compiler-generated IR (Task 6) calls to register and launch GPU
 // kernels for "go for" loops offloaded to WebGPU.
 //
-// This is intentionally restricted to tinygo.wasm && js (i.e. -target=wasm)
+// The spmd.gpu.webgpu build tag (from Config.BuildTags, set only when
+// -gpu=webgpu is passed) is load-bearing: without it this file compiled into
+// EVERY tinygo.wasm && js build, so //go:wasmexport spmd_gpu_done added an
+// export to every plain `-target=wasm` binary -- measurably contradicting the
+// "nothing changes without -gpu" claim (I6). With the tag, a default build is
+// byte-identical to one from before this feature existed.
+//
+// This is additionally restricted to tinygo.wasm && js (i.e. -target=wasm)
 // rather than all tinygo.wasm targets: wasip1 also carries the tinygo.wasm
 // build tag, but wasmtime/wasi hosts have no WebGPU and refuse to
 // instantiate a module with unresolved imports from unknown modules. Only
@@ -75,6 +82,10 @@ func stringToPtr(s string) (unsafe.Pointer, uint32) {
 var (
 	spmdGPUSeq     uint32
 	spmdGPUPending = make(map[uint32]chan struct{})
+	// spmdGPUStatus records the completion status the JS host reported for
+	// a launch (see spmdGPUDone's ok argument). Read and deleted by the
+	// launching goroutine once it wakes up.
+	spmdGPUStatus = make(map[uint32]uint32)
 )
 
 // spmdGPULaunch dispatches a GPU kernel launch and blocks the calling
@@ -89,18 +100,39 @@ func spmdGPULaunch(kernelID int32, n uint32, params unsafe.Pointer, paramsLen ui
 	gpuLaunch(kernelID, n, params, paramsLen, bufsPtr, bufsLen, seq)
 
 	<-ch
+
+	// I2: the launch is only "done" if the host says it SUCCEEDED. A shader
+	// that failed to compile (createShaderModule does not throw -- the
+	// failure surfaces later from createComputePipeline), a dispatch refused
+	// by the workgroup-count ceiling, or any exception caught by the JS glue
+	// all used to unblock this goroutine with the output buffers NEVER
+	// WRITTEN, and execution simply continued over stale/garbage data. The
+	// compile-time path fails closed; the runtime must too. There is no
+	// CPU-path re-entry available from here (the compiler already branched
+	// away from it), so a failed launch is a hard, clearly-labelled panic
+	// rather than a silent wrong answer.
+	status, haveStatus := spmdGPUStatus[seq]
+	delete(spmdGPUStatus, seq)
+	if !haveStatus || status == 0 {
+		runtimePanic("spmd_gpu: GPU kernel launch failed (see host console for the underlying WebGPU error); output buffers were not written")
+	}
 }
 
 // spmdGPUDone is called by the JS host (via a wasm export call) when an
-// asynchronous GPU launch identified by seq has completed. It unblocks the
-// goroutine parked in spmdGPULaunch.
+// asynchronous GPU launch identified by seq has completed. status is 1 when
+// the dispatch AND the readback of every read_write buffer completed
+// successfully, and 0 when anything went wrong (no device, unknown kernel,
+// shader compile/pipeline failure, refused dispatch, mapAsync rejection,
+// ...). It unblocks the goroutine parked in spmdGPULaunch, which panics on
+// a 0 status rather than proceeding over unwritten output buffers.
 //
 //go:wasmexport spmd_gpu_done
-func spmdGPUDone(seq uint32) {
+func spmdGPUDone(seq uint32, status uint32) {
 	ch, ok := spmdGPUPending[seq]
 	if !ok {
 		return
 	}
+	spmdGPUStatus[seq] = status
 	delete(spmdGPUPending, seq)
 	close(ch)
 }

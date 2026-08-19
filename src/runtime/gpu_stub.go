@@ -1,7 +1,10 @@
-//go:build !(tinygo.wasm && js)
+//go:build !(tinygo.wasm && js && spmd.gpu.webgpu)
 
-// SPMD GPU offload runtime ABI stub for all targets other than wasm/js
-// (native, wasip1, other tinygo.wasm variants, etc). WebGPU is only
+// SPMD GPU offload runtime ABI stub for every build that is not a
+// wasm/js (-target=wasm) build with -gpu=webgpu -- i.e. all other targets
+// (native, wasip1, other tinygo.wasm variants) AND ordinary wasm/js builds
+// without -gpu=webgpu, which must stay byte-identical to a pre-feature
+// build (I6). WebGPU is only
 // reachable from a browser host, so these targets never have a GPU backend
 // available. This file exists so that compiler-generated IR (Task 6) can
 // unconditionally reference spmdGPU* by name on every target; the
@@ -38,6 +41,6 @@ func spmdGPULaunch(kernelID int32, n uint32, params unsafe.Pointer, paramsLen ui
 // a compiler error otherwise, see compiler/symbol.go). It is kept as a
 // plain Go function so any target-independent caller can still reference it
 // by name, though it is never invoked from a host on non-wasm targets.
-func spmdGPUDone(seq uint32) {
+func spmdGPUDone(seq uint32, status uint32) {
 	runtimePanic("spmd_gpu: GPU offload is not available on this target")
 }
