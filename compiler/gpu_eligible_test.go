@@ -496,3 +496,206 @@ func kernel(maxIter, n int, output []int) {
 		t.Errorf("Reject = %q, want it to mention %q", plan.Reject, "free scalar variable written")
 	}
 }
+
+// --- Final-review fix wave: fail-closed eligibility regressions ----------
+
+// C1: a bitwise/shift compound assignment must be REJECTED. compoundAssignOp
+// maps only += -= *= /= %=; before this fix `acc |= mask` was declared
+// eligible and emitted as a plain `acc = mask;` -- valid WGSL, wrong answer,
+// no diagnostic anywhere.
+func TestGPUEligibleBitwiseCompoundAssignRejected(t *testing.T) {
+	for _, tc := range []struct{ name, op string }{
+		{"or", "|="},
+		{"and", "&="},
+		{"xor", "^="},
+		{"shl", "<<="},
+		{"shr", ">>="},
+		{"andnot", "&^="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `package test
+
+func kernel(n int, out []int) {
+	go for idx := range n {
+		acc := idx
+		acc ` + tc.op + ` 7
+		out[idx] = acc
+	}
+}
+`
+			plan := parseAndAnalyzeGPULoop(t, src, 1)
+			if plan.Reject == "" {
+				t.Fatalf("expected %s to be rejected, got eligible", tc.op)
+			}
+			if !strings.Contains(plan.Reject, "assignment operator") {
+				t.Errorf("Reject = %q, want it to mention the assignment operator", plan.Reject)
+			}
+		})
+	}
+}
+
+// The arithmetic compound assignments compoundAssignOp DOES map stay
+// eligible -- the C1 fix must not over-reject.
+func TestGPUEligibleArithmeticCompoundAssignAccepted(t *testing.T) {
+	for _, op := range []string{"+=", "-=", "*=", "/=", "%="} {
+		src := `package test
+
+func kernel(n int, out []int) {
+	go for idx := range n {
+		acc := idx
+		acc ` + op + ` 7
+		out[idx] = acc
+	}
+}
+`
+		plan := parseAndAnalyzeGPULoop(t, src, 1)
+		if plan.Reject != "" {
+			t.Errorf("%s: expected eligible, got Reject=%q", op, plan.Reject)
+		}
+	}
+}
+
+// C3: a return that is not the final statement of an inlined callee body has
+// no early exit in the emitter (it lowers to `retTarget = v;` and falls
+// through), so both assignments would run and the LAST one would always win.
+func TestGPUEligibleNonTailReturnRejected(t *testing.T) {
+	src := `package test
+
+import "lanes"
+
+func pick(a lanes.Varying[int]) lanes.Varying[int] {
+	if a > 3 {
+		return a
+	}
+	return 0
+}
+
+func kernel(n int, out []int) {
+	go for idx := range n {
+		v := pick(idx)
+		out[idx] = v
+	}
+}
+`
+	plan := parseAndAnalyzeGPULoop(t, src, 1)
+	if plan.Reject == "" {
+		t.Fatalf("expected non-tail return to be rejected, got eligible")
+	}
+	if !strings.Contains(plan.Reject, "non-tail return") {
+		t.Errorf("Reject = %q, want it to mention a non-tail return", plan.Reject)
+	}
+}
+
+// A callee whose ONLY return is its final statement stays eligible.
+func TestGPUEligibleTailReturnAccepted(t *testing.T) {
+	src := `package test
+
+import "lanes"
+
+func twice(a lanes.Varying[int]) lanes.Varying[int] {
+	b := a * 2
+	return b
+}
+
+func kernel(n int, out []int) {
+	go for idx := range n {
+		v := twice(idx)
+		out[idx] = v
+	}
+}
+`
+	plan := parseAndAnalyzeGPULoop(t, src, 1)
+	if plan.Reject != "" {
+		t.Fatalf("expected eligible, got Reject=%q", plan.Reject)
+	}
+}
+
+// I1: body-local variables were never type-checked against WGSL (classify
+// only ever saw FREE vars), so a local `var c int64` / `float64` reached
+// wgslTypeOfIdent, whose error was swallowed into a hardcoded "i32" --
+// a silent truncation on the GPU path only.
+func TestGPUEligibleBodyLocalWideTypeRejected(t *testing.T) {
+	for _, tc := range []struct{ name, decl string }{
+		{"int64", "var c int64 = int64(idx)"},
+		{"float64", "var c float64 = float64(idx)"},
+		{"int64-shortdecl", "c := int64(idx)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `package test
+
+func kernel(n int, out []int) {
+	go for idx := range n {
+		` + tc.decl + `
+		out[idx] = int(c)
+	}
+}
+`
+			plan := parseAndAnalyzeGPULoop(t, src, 1)
+			if plan.Reject == "" {
+				t.Fatalf("expected %s local to be rejected, got eligible", tc.name)
+			}
+			if !strings.Contains(plan.Reject, "not representable in WGSL") {
+				t.Errorf("Reject = %q, want it to mention WGSL representability", plan.Reject)
+			}
+		})
+	}
+}
+
+// I1 (inlined callee): a wide local inside an inlined callee body must be
+// rejected too.
+func TestGPUEligibleInlinedCalleeWideLocalRejected(t *testing.T) {
+	src := `package test
+
+import "lanes"
+
+func widen(a lanes.Varying[int]) lanes.Varying[int] {
+	var c lanes.Varying[float64] = lanes.Varying[float64](a)
+	return lanes.Varying[int](c)
+}
+
+func kernel(n int, out []int) {
+	go for idx := range n {
+		v := widen(idx)
+		out[idx] = v
+	}
+}
+`
+	plan := parseAndAnalyzeGPULoop(t, src, 1)
+	if plan.Reject == "" {
+		t.Fatalf("expected eligible=false, got eligible")
+	}
+	if !strings.Contains(plan.Reject, "not representable in WGSL") {
+		t.Errorf("Reject = %q, want it to mention WGSL representability", plan.Reject)
+	}
+}
+
+// I4: lookupLocalFunc used to match by NAME, so a local (here: a parameter)
+// shadowing a package-level function inlined the WRONG body. Resolution now
+// goes through the type-checker object, so the shadowed call is simply not a
+// recognized target and the loop falls back to the CPU.
+func TestGPUEligibleShadowedFuncNameNotInlined(t *testing.T) {
+	src := `package test
+
+import "lanes"
+
+func double(x lanes.Varying[int]) lanes.Varying[int] {
+	return x * 2
+}
+
+func kernel(n int, out []int, double func(lanes.Varying[int]) lanes.Varying[int]) {
+	go for idx := range n {
+		out[idx] = double(idx)
+	}
+}
+`
+	plan := parseAndAnalyzeGPULoop(t, src, 1)
+	if plan.Reject == "" {
+		t.Fatalf("expected the shadowed call to be rejected, got eligible")
+	}
+	if !strings.Contains(plan.Reject, "unrecognized function") {
+		t.Errorf("Reject = %q, want it to mention an unrecognized function", plan.Reject)
+	}
+	if len(plan.Inlined) != 0 {
+		t.Errorf("expected no inlined callee, got %d", len(plan.Inlined))
+	}
+}

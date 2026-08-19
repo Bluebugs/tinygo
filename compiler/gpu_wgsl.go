@@ -91,8 +91,22 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 	sort.Slice(scalars, func(i, j int) bool { return scalars[i].Obj.Name() < scalars[j].Obj.Name() })
 	params = append(params, scalars...)
 
+	// I5: buffer identifiers are emitted verbatim into the WGSL module, so
+	// a Go slice named `params`, `select`, `loop`, `fn`, `let`, ... would
+	// either collide with the mandatory uniform binding or hit a WGSL
+	// reserved word. Either one is a shader COMPILE failure, which (before
+	// I2) surfaced as a silent wrong answer. Sanitize and uniquify here the
+	// same way the Params fields are handled below.
+	bufNames := make(map[types.Object]string, len(buffers))
+	usedBufNames := map[string]bool{"params": true}
 	for i, b := range buffers {
-		e.freeSubst[b.Obj] = b.Obj.Name()
+		name := wgslSafeIdent(b.Obj.Name())
+		for j := 1; usedBufNames[name]; j++ {
+			name = fmt.Sprintf("%s_%d", wgslSafeIdent(b.Obj.Name()), j)
+		}
+		usedBufNames[name] = true
+		bufNames[b.Obj] = name
+		e.freeSubst[b.Obj] = name
 		buffers[i].Obj = b.Obj // no-op, keeps order explicit
 	}
 
@@ -111,9 +125,9 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 	fieldName := make(map[types.Object]string, len(params))
 	used := map[string]bool{}
 	for _, p := range params {
-		name := p.Obj.Name()
+		name := wgslSafeIdent(p.Obj.Name())
 		for i := 1; used[name]; i++ {
-			name = fmt.Sprintf("%s_%d", p.Obj.Name(), i)
+			name = fmt.Sprintf("%s_%d", wgslSafeIdent(p.Obj.Name()), i)
 		}
 		used[name] = true
 		fieldName[p.Obj] = name
@@ -135,7 +149,7 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		if b.Kind == gpuSliceRW {
 			access = "read_write"
 		}
-		fmt.Fprintf(&sb, "@group(0) @binding(%d) var<storage, %s> %s: %s;\n", i+1, access, b.Obj.Name(), b.WGSLTy)
+		fmt.Fprintf(&sb, "@group(0) @binding(%d) var<storage, %s> %s: %s;\n", i+1, access, bufNames[b.Obj], b.WGSLTy)
 	}
 	fmt.Fprintf(&sb, "@compute @workgroup_size(%d)\n", wgslWorkgroupSize)
 	fmt.Fprintf(&sb, "fn %s(@builtin(global_invocation_id) gid: vec3<u32>) {\n", entry)
@@ -203,10 +217,23 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 		return fmt.Errorf("transpileWGSL: unsupported bare expression statement")
 
 	case *ast.DeclStmt:
-		gen := x.Decl.(*ast.GenDecl)
+		// Checked assertions: gpu_eligible.go rejects any declaration that
+		// is not a GenDecl of ValueSpecs, so a mismatch here is an internal
+		// inconsistency -- report it as a transpile error, never panic.
+		gen, ok := x.Decl.(*ast.GenDecl)
+		if !ok {
+			return fmt.Errorf("transpileWGSL: unsupported declaration %T", x.Decl)
+		}
 		for _, spec := range gen.Specs {
-			vs := spec.(*ast.ValueSpec)
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				return fmt.Errorf("transpileWGSL: unsupported declaration specifier %T", spec)
+			}
 			for i, name := range vs.Names {
+				ty, err := e.wgslTypeOfIdent(name)
+				if err != nil {
+					return err
+				}
 				var rhs string
 				if i < len(vs.Values) {
 					s, err := e.emitExpr(vs.Values[i])
@@ -215,11 +242,11 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 					}
 					rhs = s
 				} else {
-					rhs = wgslZeroValue(e.wgslTypeOfIdent(name))
+					rhs = wgslZeroValue(ty)
 				}
 				wgslName := e.declareLocal(name)
 				e.writeIndent()
-				fmt.Fprintf(e.sb, "var %s: %s = %s;\n", wgslName, e.wgslTypeOfIdent(name), rhs)
+				fmt.Fprintf(e.sb, "var %s: %s = %s;\n", wgslName, ty, rhs)
 			}
 		}
 		return nil
@@ -374,8 +401,12 @@ func (e *wgslEmitter) forInitText(init *ast.AssignStmt) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	ty, err := e.wgslTypeOfIdent(ident)
+	if err != nil {
+		return "", err
+	}
 	name := e.declareLocal(ident)
-	return fmt.Sprintf("var %s: %s = %s", name, e.wgslTypeOfIdent(ident), rhs), nil
+	return fmt.Sprintf("var %s: %s = %s", name, ty, rhs), nil
 }
 
 // emitAssign lowers `:=`/`=`/compound-assign statements, including the
@@ -398,10 +429,17 @@ func (e *wgslEmitter) emitAssign(x *ast.AssignStmt, retTarget string) error {
 	}
 
 	if x.Tok == token.DEFINE {
-		ident := x.Lhs[0].(*ast.Ident)
+		ident, ok := x.Lhs[0].(*ast.Ident)
+		if !ok {
+			return fmt.Errorf("transpileWGSL: unsupported := target %T", x.Lhs[0])
+		}
+		ty, err := e.wgslTypeOfIdent(ident)
+		if err != nil {
+			return err
+		}
 		name := e.declareLocal(ident)
 		e.writeIndent()
-		fmt.Fprintf(e.sb, "var %s: %s = %s;\n", name, e.wgslTypeOfIdent(ident), rhs)
+		fmt.Fprintf(e.sb, "var %s: %s = %s;\n", name, ty, rhs)
 		return nil
 	}
 
@@ -409,13 +447,22 @@ func (e *wgslEmitter) emitAssign(x *ast.AssignStmt, retTarget string) error {
 	if err != nil {
 		return err
 	}
-	op := compoundAssignOp(x.Tok)
-	e.writeIndent()
-	if op == "" {
+	if x.Tok == token.ASSIGN {
+		e.writeIndent()
 		fmt.Fprintf(e.sb, "%s = %s;\n", lv, rhs)
-	} else {
-		fmt.Fprintf(e.sb, "%s = (%s %s %s);\n", lv, lv, op, rhs)
+		return nil
 	}
+	// C1: an operator that reaches here without an explicit mapping is an
+	// INTERNAL ERROR (gpu_eligible.go's gpuEligibleAssignToks allowlist and
+	// compoundAssignOp have drifted apart), not something to silently lower
+	// as a plain `=` -- that would emit valid WGSL computing the wrong
+	// value with no diagnostic anywhere.
+	op, ok := compoundAssignOp(x.Tok)
+	if !ok {
+		return fmt.Errorf("transpileWGSL: internal error: unmapped assignment operator %s (eligibility allowlist and compoundAssignOp disagree)", x.Tok)
+	}
+	e.writeIndent()
+	fmt.Fprintf(e.sb, "%s = (%s %s %s);\n", lv, lv, op, rhs)
 	return nil
 }
 
@@ -430,9 +477,16 @@ func (e *wgslEmitter) emitInlinedCall(assign *ast.AssignStmt, call *ast.CallExpr
 	var lhsName string
 	var lhsWGSLTy string
 	if assign.Tok == token.DEFINE {
-		ident := assign.Lhs[0].(*ast.Ident)
+		ident, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok {
+			return fmt.Errorf("transpileWGSL: unsupported := target %T", assign.Lhs[0])
+		}
+		ty, err := e.wgslTypeOfIdent(ident)
+		if err != nil {
+			return err
+		}
 		lhsName = e.declareLocal(ident)
-		lhsWGSLTy = e.wgslTypeOfIdent(ident)
+		lhsWGSLTy = ty
 		e.writeIndent()
 		fmt.Fprintf(e.sb, "var %s: %s;\n", lhsName, lhsWGSLTy)
 	} else {
@@ -443,7 +497,17 @@ func (e *wgslEmitter) emitInlinedCall(assign *ast.AssignStmt, call *ast.CallExpr
 		lhsName = lv
 	}
 
-	// Bind callee parameters to the (outer-substituted) argument text.
+	// C2: bind each callee parameter to a FRESH WGSL variable initialised
+	// from the argument text, NOT to the argument text itself. Go parameters
+	// are by-value: a callee that assigns to its own parameter must not
+	// mutate the caller's local. Binding to the argument text emitted
+	// `x = (x * 2);` straight into the CALLER's scope -- correct on the CPU
+	// path, silently wrong on the GPU path.
+	//
+	// The fresh names carry this call site's inline suffix, so two inlined
+	// calls in the same scope cannot collide either. Argument expressions
+	// are emitted BEFORE e.locals is swapped, so they resolve in the
+	// caller's scope.
 	sig := decl.Type.Params.List
 	argIdx := 0
 	savedLocals := e.locals
@@ -451,22 +515,33 @@ func (e *wgslEmitter) emitInlinedCall(assign *ast.AssignStmt, call *ast.CallExpr
 	for k, v := range savedLocals {
 		newLocals[k] = v
 	}
+	e.inlineCounter++
+	savedSuffix := e.inlineSuffix
+	suffix := fmt.Sprintf("_i%d", e.inlineCounter)
 	for _, field := range sig {
 		for _, nameIdent := range field.Names {
 			obj := e.info.Defs[nameIdent]
+			if argIdx >= len(call.Args) {
+				return fmt.Errorf("transpileWGSL: inlined call to %s has fewer arguments than parameters", decl.Name.Name)
+			}
 			argTxt, err := e.emitExpr(call.Args[argIdx])
 			if err != nil {
 				return err
 			}
-			newLocals[obj] = argTxt
+			paramTy, err := e.wgslTypeOfIdent(nameIdent)
+			if err != nil {
+				return err
+			}
+			paramName := nameIdent.Name + suffix
+			e.writeIndent()
+			fmt.Fprintf(e.sb, "var %s: %s = %s;\n", paramName, paramTy, argTxt)
+			newLocals[obj] = paramName
 			argIdx++
 		}
 	}
 
 	e.locals = newLocals
-	e.inlineCounter++
-	savedSuffix := e.inlineSuffix
-	e.inlineSuffix = fmt.Sprintf("_i%d", e.inlineCounter)
+	e.inlineSuffix = suffix
 	err := e.emitStmts(decl.Body.List, lhsName)
 	e.inlineSuffix = savedSuffix
 	e.locals = savedLocals
@@ -510,7 +585,11 @@ func (e *wgslEmitter) emitExpr(expr ast.Expr) (string, error) {
 			return s, nil
 		}
 		if c, ok := obj.(*types.Const); ok {
-			return constLiteral(c.Val(), e.wgslTypeOfIdent(x)), nil
+			ty, err := e.wgslTypeOfIdent(x)
+			if err != nil {
+				return "", err
+			}
+			return constLiteral(c.Val(), ty), nil
 		}
 		return x.Name, nil
 
@@ -660,21 +739,89 @@ func (e *wgslEmitter) emitConversion(name string, args []ast.Expr) (string, erro
 	return fmt.Sprintf("%s(%s)", wgslName, strings.Join(parts, ", ")), nil
 }
 
+// wgslReservedWords are WGSL keywords/reserved words (and the predeclared
+// scalar type names) that must never be emitted as a user identifier. The
+// list is not exhaustive of the full WGSL reserved-word set, but covers
+// every keyword and builtin type name a Go identifier could plausibly be,
+// and anything missed is only a missed optimization now that a shader
+// compile failure is reported back to Go (I2) instead of silently ignored.
+var wgslReservedWords = map[string]bool{
+	"alias": true, "break": true, "case": true, "const": true, "const_assert": true,
+	"continue": true, "continuing": true, "default": true, "diagnostic": true,
+	"discard": true, "else": true, "enable": true, "false": true, "fn": true,
+	"for": true, "if": true, "let": true, "loop": true, "override": true,
+	"requires": true, "return": true, "struct": true, "switch": true, "true": true,
+	"var": true, "while": true, "select": true,
+	"bool": true, "f16": true, "f32": true, "i32": true, "u32": true,
+	"vec2": true, "vec3": true, "vec4": true, "mat2x2": true, "array": true,
+	"atomic": true, "ptr": true, "sampler": true, "texture_1d": true,
+}
+
+// wgslSafeIdent maps a Go identifier onto a legal, non-reserved WGSL
+// identifier: non-alphanumeric characters become '_', a leading digit or
+// a leading double underscore (reserved by the WGSL spec) is prefixed, and
+// reserved words are suffixed. Uniqueness against other emitted names is
+// the caller's job.
+func wgslSafeIdent(name string) string {
+	if name == "" {
+		return "v_"
+	}
+	var sb strings.Builder
+	for i, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+			sb.WriteRune(r)
+		case r >= '0' && r <= '9' && i > 0:
+			sb.WriteRune(r)
+		default:
+			sb.WriteByte('_')
+		}
+	}
+	out := sb.String()
+	if out[0] >= '0' && out[0] <= '9' {
+		out = "v_" + out
+	}
+	if strings.HasPrefix(out, "__") {
+		out = "v" + out
+	}
+	if wgslReservedWords[out] {
+		out += "_"
+	}
+	return out
+}
+
 // wgslTypeOfIdent resolves ident's declared Go type to its WGSL scalar
 // spelling.
-func (e *wgslEmitter) wgslTypeOfIdent(ident *ast.Ident) string {
+// I1: the error is PROPAGATED, never swallowed into a hardcoded "i32" --
+// silently truncating an int64/float64 local to i32 on the GPU path only is
+// exactly the class of invisible wrong answer this pipeline must not have.
+// gpu_eligible.go's checkLocalTypes rejects such loops up front, so an error
+// here means the two allowlists disagree: a transpile failure, which
+// gpuAnalyzeLoop turns into a clean CPU-only fallback.
+func (e *wgslEmitter) wgslTypeOfIdent(ident *ast.Ident) (string, error) {
 	obj := e.info.Defs[ident]
 	if obj == nil {
 		obj = e.info.Uses[ident]
 	}
 	if obj == nil {
-		return "i32"
+		return "", fmt.Errorf("transpileWGSL: cannot resolve identifier %s to an object", ident.Name)
 	}
-	ty, err := wgslTypeOf(obj.Type())
+	t := obj.Type()
+	// An untyped package-level constant (e.g. `const X0 = -2.5`) has no
+	// WGSL spelling of its own; the type checker records the type it was
+	// CONVERTED TO at this use site, which is the one to emit. If that is
+	// still untyped (the constant is used in an untyped context), fall
+	// through to wgslTypeOf, which rejects it -- fail closed.
+	if basic, ok := t.Underlying().(*types.Basic); ok && basic.Info()&types.IsUntyped != 0 {
+		if tv, ok := e.info.Types[ident]; ok && tv.Type != nil {
+			t = tv.Type
+		}
+	}
+	ty, err := wgslTypeOf(t)
 	if err != nil {
-		return "i32"
+		return "", fmt.Errorf("transpileWGSL: identifier %s: %w", ident.Name, err)
 	}
-	return ty
+	return ty, nil
 }
 
 // wgslTypeOf maps a Go type (basic, or lanes.Varying[T] via *types.SPMDType)
@@ -698,6 +845,17 @@ func wgslTypeOf(t types.Type) (string, error) {
 	case types.Float32:
 		return "f32", nil
 	case types.Bool:
+		return "bool", nil
+	case types.UntypedInt, types.UntypedRune:
+		// An untyped constant used inside a kernel. WGSL's abstract-numeric
+		// literals convert implicitly, and every float64 variable is already
+		// rejected by the eligibility gate, so an untyped int can only ever
+		// be consumed as an i32 (or widened to f32 by WGSL itself) and an
+		// untyped float only as an f32.
+		return "i32", nil
+	case types.UntypedFloat:
+		return "f32", nil
+	case types.UntypedBool:
 		return "bool", nil
 	default:
 		return "", fmt.Errorf("transpileWGSL: unsupported basic type %s", basic.String())
@@ -763,22 +921,24 @@ func wgslBinOp(op token.Token) (string, error) {
 }
 
 // compoundAssignOp maps a compound-assignment token (+=, -=, ...) to the
-// WGSL binary operator to expand it into `lhs = (lhs op rhs)`, or "" for a
-// plain `=`.
-func compoundAssignOp(tok token.Token) string {
+// WGSL binary operator to expand it into `lhs = (lhs op rhs)`. ok is false
+// for any token it does not explicitly handle -- callers MUST treat that as
+// an error rather than falling back to a plain `=` (C1). This set and
+// gpu_eligible.go's gpuEligibleAssignToks must stay in sync.
+func compoundAssignOp(tok token.Token) (string, bool) {
 	switch tok {
 	case token.ADD_ASSIGN:
-		return "+"
+		return "+", true
 	case token.SUB_ASSIGN:
-		return "-"
+		return "-", true
 	case token.MUL_ASSIGN:
-		return "*"
+		return "*", true
 	case token.QUO_ASSIGN:
-		return "/"
+		return "/", true
 	case token.REM_ASSIGN:
-		return "%"
+		return "%", true
 	default:
-		return ""
+		return "", false
 	}
 }
 

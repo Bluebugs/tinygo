@@ -102,10 +102,12 @@ type compilerContext struct {
 	runtimePkg       *types.Package
 	spmdInfo         *SPMDInfo // SPMD metadata extracted from AST (nil if no SPMD code)
 
-	// gpuKernelCounter numbers the WGSL kernels generated for this module.
-	// Each offloaded `go for` loop consumes one id; the id is also the key
-	// the JS host uses to look the compiled shader up.
-	gpuKernelCounter int32
+	// NOTE (I3): kernel ids are NOT numbered per compilerContext any more.
+	// compilerContext is per-PACKAGE, but the JS host's kernel map is keyed
+	// globally, so two offloadable loops in two packages both got id 0 and
+	// the second `register` overwrote the first. Ids are now derived from a
+	// hash of the kernel's own WGSL by gpuAllocKernelID (gpu_offload.go),
+	// which is unique across the whole build and stable across rebuilds.
 }
 
 // newCompilerContext returns a new compiler context ready for use, most

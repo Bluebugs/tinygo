@@ -39,9 +39,11 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
+	"hash/fnv"
 	"math"
 	"os"
 	"sort"
+	"sync"
 
 	"golang.org/x/tools/go/ssa"
 	"tinygo.org/x/go-llvm"
@@ -152,7 +154,17 @@ func (b *builder) gpuAnalyzeLoop(loop *spmdActiveLoop) {
 		b.gpuReport(loop, "skipped: %s", reason)
 		return
 	}
-	id := b.gpuKernelCounter
+	// I3: the id must be unique across the WHOLE BUILD (the JS host keys its
+	// kernel map globally), so it is derived from the kernel's own WGSL
+	// rather than from a per-package counter. Transpile once with a
+	// placeholder id to obtain the body, hash it, then transpile again with
+	// the final id so the entry-point name embedded in the module matches.
+	probe, err := transpileWGSL(plan, 0)
+	if err != nil {
+		b.gpuReport(loop, "skipped: WGSL transpilation failed: %v", err)
+		return
+	}
+	id := gpuAllocKernelID(probe.WGSL)
 	kernel, err := transpileWGSL(plan, id)
 	if err != nil {
 		b.gpuReport(loop, "skipped: WGSL transpilation failed: %v", err)
@@ -166,7 +178,6 @@ func (b *builder) gpuAnalyzeLoop(loop *spmdActiveLoop) {
 		b.gpuReport(loop, "skipped: %s", reason)
 		return
 	}
-	b.gpuKernelCounter++
 	loop.gpu = &gpuLoopOffload{plan: plan, kernel: kernel}
 	loop.gpuArgs = args
 	b.gpuReport(loop, "offload (kernel=%s, cost=%d, minTrip=%d, maxSafeTrip=%d, params=%d, buffers=%d)",
@@ -766,4 +777,46 @@ func (b *builder) gpuRepairPhi(loop *spmdActiveLoop, phi llvm.Value) {
 		return
 	}
 	phi.AddIncoming([]llvm.Value{common}, []llvm.BasicBlock{gpuExit})
+}
+
+// gpuKernelIDs records, for the whole build, which kernel id has been handed
+// out for which WGSL body. Compilation of different packages can run
+// concurrently, so it is mutex-guarded.
+var (
+	gpuKernelIDMu sync.Mutex
+	gpuKernelIDs  = map[int32]string{}
+)
+
+// gpuAllocKernelID returns a build-unique, rebuild-stable id for a kernel
+// whose (placeholder-id) WGSL body is wgsl.
+//
+// I3: a per-compilerContext counter numbered kernels per PACKAGE while the
+// JS host (test/webgpu/spmd_gpu.js) keys its kernel map GLOBALLY, so two
+// offloadable loops in two packages both got id 0 and the second
+// `spmd_gpu.register` silently overwrote the first -- reachable today in a
+// single build. Hashing the WGSL instead makes the id a property of the
+// kernel itself: unique across packages, identical across rebuilds (unlike
+// a global counter, whose value would depend on package compilation order).
+// Identical bodies deliberately share an id: they are the same shader.
+func gpuAllocKernelID(wgsl string) int32 {
+	h := fnv.New32a()
+	h.Write([]byte(wgsl))
+	// Keep it non-negative: the id is passed through an LLVM i32 and printed
+	// into symbol names.
+	id := int32(h.Sum32() & 0x7fffffff)
+
+	gpuKernelIDMu.Lock()
+	defer gpuKernelIDMu.Unlock()
+	for {
+		prev, taken := gpuKernelIDs[id]
+		if !taken {
+			gpuKernelIDs[id] = wgsl
+			return id
+		}
+		if prev == wgsl {
+			return id // same shader, same id
+		}
+		// Genuine hash collision between two different kernels: probe.
+		id = (id + 1) & 0x7fffffff
+	}
 }

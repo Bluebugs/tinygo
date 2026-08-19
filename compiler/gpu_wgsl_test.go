@@ -5,6 +5,7 @@
 package compiler
 
 import (
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,17 +66,10 @@ func mandelbrotFlat(width, height, maxIter int, output []int) {
 }
 `
 
-func TestGPUWGSLMandelbrotFlatDump(t *testing.T) {
-	plan := parseAndAnalyzeGPULoop(t, mandelbrotFlatGPUSrc, 1)
-	if plan.Reject != "" {
-		t.Fatalf("plan rejected: %s", plan.Reject)
-	}
-	k, err := transpileWGSL(plan, 0)
-	if err != nil {
-		t.Fatalf("transpileWGSL: %v", err)
-	}
-	t.Logf("ParamsSize=%d Params=%v Buffers=%v\n%s", k.ParamsSize, paramNames(k.Params), paramNames(k.Buffers), k.WGSL)
-}
+// (The former TestGPUWGSLMandelbrotFlatDump was a t.Logf-only "test" that
+// asserted nothing; it was dead weight beside TestGPUWGSLMandelbrotFlatGolden
+// below, which transpiles the same source and compares it byte-for-byte.
+// Deleted rather than kept as unassertive noise.)
 
 func paramNames(fv []gpuFreeVar) []string {
 	var s []string
@@ -136,10 +130,13 @@ fn spmd_kernel_0(@builtin(global_invocation_id) gid: vec3<u32>) {
   var x: f32 = (-2.5 + (f32(i) * params.dx));
   var y: f32 = (-1.25 + (f32(j) * params.dy));
   var iterations: i32;
-  var zRe_i1: f32 = x;
-  var zIm_i1: f32 = y;
-  var iterations_i1: i32 = params.maxIter;
-  for (var iter_i1: i32 = 0; iter_i1 < params.maxIter; iter_i1 = (iter_i1 + 1)) {
+  var cRe_i1: f32 = x;
+  var cIm_i1: f32 = y;
+  var maxIter_i1: i32 = params.maxIter;
+  var zRe_i1: f32 = cRe_i1;
+  var zIm_i1: f32 = cIm_i1;
+  var iterations_i1: i32 = maxIter_i1;
+  for (var iter_i1: i32 = 0; iter_i1 < maxIter_i1; iter_i1 = (iter_i1 + 1)) {
     var magSquared_i1: f32 = ((zRe_i1 * zRe_i1) + (zIm_i1 * zIm_i1));
     var diverged_i1: bool = (magSquared_i1 > 4.0);
     if (diverged_i1) {
@@ -148,8 +145,8 @@ fn spmd_kernel_0(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var newRe_i1: f32 = ((zRe_i1 * zRe_i1) - (zIm_i1 * zIm_i1));
     var newIm_i1: f32 = ((2.0 * zRe_i1) * zIm_i1);
-    zRe_i1 = (x + newRe_i1);
-    zIm_i1 = (y + newIm_i1);
+    zRe_i1 = (cRe_i1 + newRe_i1);
+    zIm_i1 = (cIm_i1 + newIm_i1);
   }
   iterations = iterations_i1;
   output[idx] = iterations;
@@ -345,4 +342,119 @@ func TestGPUWGSLLanesFMA(t *testing.T) {
 		t.Fatalf("expected fma(...) in output, got:\n%s", k.WGSL)
 	}
 	runNaga(t, k.WGSL)
+}
+
+// --- Final-review fix wave: emission regressions ------------------------
+
+// C2: a callee that assigns to its OWN parameter must not mutate the
+// caller's local. emitInlinedCall used to bind each parameter to the
+// ARGUMENT TEXT, so `x = x * 2` in the callee emitted `x = (x * 2);` into
+// the CALLER's scope -- correct on the CPU path (Go parameters are by
+// value), silently wrong on the GPU path.
+const inlinedParamWriteGPUSrc = `
+package p
+
+import "lanes"
+
+func twice(x lanes.Varying[int]) lanes.Varying[int] {
+	x = x * 2
+	return x
+}
+
+func run(n int, out []int) {
+	go for idx := range n {
+		x := idx + 1
+		y := twice(x)
+		out[idx] = y + x
+	}
+}
+`
+
+func TestGPUWGSLInlinedParamIsByValue(t *testing.T) {
+	plan := parseAndAnalyzeGPULoop(t, inlinedParamWriteGPUSrc, 1)
+	if plan.Reject != "" {
+		t.Fatalf("plan rejected: %s", plan.Reject)
+	}
+	k, err := transpileWGSL(plan, 0)
+	if err != nil {
+		t.Fatalf("transpileWGSL: %v", err)
+	}
+	// A fresh, suffixed copy of the parameter must be declared and written.
+	if !strings.Contains(k.WGSL, "var x_i1: i32 = x;") {
+		t.Errorf("missing by-value parameter copy `var x_i1: i32 = x;`\n%s", k.WGSL)
+	}
+	if !strings.Contains(k.WGSL, "x_i1 = (x_i1 * 2);") {
+		t.Errorf("callee write should target the parameter copy\n%s", k.WGSL)
+	}
+	// And the caller's own `x` must NEVER be assigned by the callee body.
+	if strings.Contains(k.WGSL, "\n  x = (x * 2);") || strings.Contains(k.WGSL, "  x = (x * 2);\n") {
+		t.Errorf("callee mutated the caller's local x (by-value semantics broken)\n%s", k.WGSL)
+	}
+	runNaga(t, k.WGSL)
+}
+
+// I5: buffer identifiers are emitted verbatim into the module, so a Go slice
+// named `params` collided with the mandatory uniform binding and one named
+// after a WGSL keyword produced an invalid shader -- which, before I2, was
+// an entirely silent wrong answer.
+func TestGPUWGSLBufferNameHygiene(t *testing.T) {
+	src := `package p
+
+func run(n int, params []int, loop []int) {
+	go for idx := range n {
+		params[idx] = loop[idx] + idx
+	}
+}
+`
+	plan := parseAndAnalyzeGPULoop(t, src, 1)
+	if plan.Reject != "" {
+		t.Fatalf("plan rejected: %s", plan.Reject)
+	}
+	k, err := transpileWGSL(plan, 0)
+	if err != nil {
+		t.Fatalf("transpileWGSL: %v", err)
+	}
+	// The uniform binding keeps the name `params`; the slice is renamed.
+	if !strings.Contains(k.WGSL, "var<uniform> params: Params;") {
+		t.Errorf("uniform binding lost its name\n%s", k.WGSL)
+	}
+	if strings.Contains(k.WGSL, "> params: array<i32>") {
+		t.Errorf("slice named `params` collided with the uniform binding\n%s", k.WGSL)
+	}
+	if !strings.Contains(k.WGSL, "params_1: array<i32>") || !strings.Contains(k.WGSL, "params_1[idx]") {
+		t.Errorf("slice named `params` was not uniquified\n%s", k.WGSL)
+	}
+	// `loop` is a WGSL reserved word.
+	if strings.Contains(k.WGSL, "> loop: array<i32>") {
+		t.Errorf("slice named after the WGSL reserved word `loop` emitted verbatim\n%s", k.WGSL)
+	}
+	if !strings.Contains(k.WGSL, "loop_: array<i32>") || !strings.Contains(k.WGSL, "loop_[idx]") {
+		t.Errorf("reserved-word slice name was not escaped\n%s", k.WGSL)
+	}
+	runNaga(t, k.WGSL)
+}
+
+// C1 (emitter half): every operator gpu_eligible.go declares eligible must
+// have an explicit mapping, and every other operator must be reported as an
+// internal error rather than silently lowered to a plain `=`.
+func TestGPUWGSLAssignOperatorAllowlistsAgree(t *testing.T) {
+	for tok := range gpuEligibleAssignToks {
+		if tok == token.DEFINE || tok == token.ASSIGN {
+			continue
+		}
+		if _, ok := compoundAssignOp(tok); !ok {
+			t.Errorf("%s is eligible but has no compoundAssignOp mapping", tok)
+		}
+	}
+	for _, tok := range []token.Token{
+		token.OR_ASSIGN, token.AND_ASSIGN, token.XOR_ASSIGN,
+		token.SHL_ASSIGN, token.SHR_ASSIGN, token.AND_NOT_ASSIGN,
+	} {
+		if _, ok := compoundAssignOp(tok); ok {
+			t.Errorf("%s must not be mapped without also being tested end to end", tok)
+		}
+		if gpuEligibleAssignToks[tok] {
+			t.Errorf("%s must not be eligible while unmapped", tok)
+		}
+	}
 }

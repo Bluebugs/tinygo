@@ -97,6 +97,19 @@ func analyzeGPULoop(info *SPMDLoopInfo, thresholdOps uint64) *gpuLoopPlan {
 		return plan
 	}
 
+	// I1: body-local (and inlined-callee-local) declared types must also be
+	// representable in WGSL.
+	if reject := a.checkLocalTypes(rangeStmt.Body); reject != "" {
+		plan.Reject = reject
+		return plan
+	}
+	for _, decl := range plan.Inlined {
+		if reject := a.checkLocalTypes(decl); reject != "" {
+			plan.Reject = reject
+			return plan
+		}
+	}
+
 	// Free-variable discovery + classification.
 	free, reject := a.freeVars(rangeStmt)
 	if reject != "" {
@@ -126,6 +139,26 @@ type gpuAnalyzer struct {
 	files     []*ast.File
 	rangeStmt *ast.RangeStmt
 	inlined   map[*ast.CallExpr]*ast.FuncDecl
+
+	// tailReturn is the single *ast.ReturnStmt that terminates the callee
+	// body currently being walked (nil outside an inlined callee). Any other
+	// return statement is rejected -- see checkStmt's *ast.ReturnStmt case.
+	tailReturn *ast.ReturnStmt
+}
+
+// gpuEligibleAssignToks is the set of assignment operators the WGSL emitter
+// explicitly handles (see compoundAssignOp in gpu_wgsl.go). It is
+// deliberately a closed allowlist: an operator present here but missing from
+// compoundAssignOp is an internal error, and an operator missing from here
+// simply falls back to the CPU path.
+var gpuEligibleAssignToks = map[token.Token]bool{
+	token.DEFINE:     true,
+	token.ASSIGN:     true,
+	token.ADD_ASSIGN: true,
+	token.SUB_ASSIGN: true,
+	token.MUL_ASSIGN: true,
+	token.QUO_ASSIGN: true,
+	token.REM_ASSIGN: true,
 }
 
 // pkgNameOf resolves a *ast.Ident used as the package qualifier of a
@@ -180,6 +213,16 @@ func (a *gpuAnalyzer) checkStmt(stmt ast.Stmt, depth int) string {
 		return a.checkExpr(x.X, depth)
 
 	case *ast.AssignStmt:
+		// C1 (fail-closed): only the assignment operators the WGSL emitter
+		// explicitly maps are eligible. Anything else -- notably the
+		// bitwise/shift compound forms |=, &=, ^=, <<=, >>=, &^= -- must be
+		// rejected here rather than silently reaching emitAssign, which
+		// would otherwise emit a plain `lhs = rhs` and produce a WRONG
+		// answer with no diagnostic. Adding an operator to
+		// gpuEligibleAssignToks REQUIRES adding it to compoundAssignOp too.
+		if !gpuEligibleAssignToks[x.Tok] {
+			return fmt.Sprintf("assignment operator %s not eligible for GPU offload", x.Tok)
+		}
 		for _, rhs := range x.Rhs {
 			if reject := a.checkExpr(rhs, depth); reject != "" {
 				return reject
@@ -228,7 +271,10 @@ func (a *gpuAnalyzer) checkStmt(stmt ast.Stmt, depth int) string {
 		for _, spec := range gen.Specs {
 			vs, ok := spec.(*ast.ValueSpec)
 			if !ok {
-				continue
+				// The emitter asserts *ast.ValueSpec unconditionally;
+				// tolerating anything else here would turn into a compiler
+				// panic later. Reject cleanly instead.
+				return fmt.Sprintf("unsupported declaration specifier not eligible for GPU offload: %T", spec)
 			}
 			for _, v := range vs.Values {
 				if reject := a.checkExpr(v, depth); reject != "" {
@@ -301,10 +347,19 @@ func (a *gpuAnalyzer) checkStmt(stmt ast.Stmt, depth int) string {
 
 	case *ast.ReturnStmt:
 		// A return inside the loop body itself would exit the loop under a
-		// varying condition, which §D4 forbids. A return inside an inlined
-		// callee's body is just an ordinary function return and is fine.
+		// varying condition, which §D4 forbids.
 		if depth == 0 {
 			return "return not eligible for GPU offload"
+		}
+		// C3 (fail-closed): inside an inlined callee, the emitter lowers
+		// `return v` to `retTarget = v;` and then FALLS THROUGH -- there is
+		// no early exit. That is only correct for a return which is the
+		// final statement of the callee body. A non-tail return (e.g.
+		// `if cond { return a }; return b`) would emit both assignments
+		// unconditionally and let the last one win, silently producing a
+		// wrong answer. Reject anything but the tail return.
+		if x != a.tailReturn {
+			return "non-tail return in inlined function not eligible for GPU offload"
 		}
 		for _, r := range x.Results {
 			if reject := a.checkExpr(r, depth); reject != "" {
@@ -428,12 +483,16 @@ func (a *gpuAnalyzer) checkCall(call *ast.CallExpr, depth int) string {
 				break
 			}
 		}
-		if decl := a.lookupLocalFunc(fun.Name); decl != nil {
+		if decl := a.lookupLocalFunc(fun); decl != nil {
 			if depth >= 1 {
 				return "nested SPMD call depth"
 			}
 			a.inlined[call] = decl
-			if reject := a.checkEligible(decl.Body, depth+1); reject != "" {
+			savedTail := a.tailReturn
+			a.tailReturn = tailReturnOf(decl.Body)
+			reject := a.checkEligible(decl.Body, depth+1)
+			a.tailReturn = savedTail
+			if reject != "" {
 				return reject
 			}
 			approved = true
@@ -548,22 +607,80 @@ var gpuApprovedMathFuncs = map[string]bool{
 	"Sqrt": true,
 }
 
-// lookupLocalFunc returns the package-level, unexported FuncDecl named name,
-// or nil. Only such functions are candidates for one-level SPMD inlining.
-func (a *gpuAnalyzer) lookupLocalFunc(name string) *ast.FuncDecl {
-	if ast.IsExported(name) {
+// lookupLocalFunc returns the package-level, unexported FuncDecl that ident
+// RESOLVES TO, or nil. Only such functions are candidates for one-level SPMD
+// inlining.
+//
+// I4: resolution goes through the type checker (info.Uses -> *types.Func ->
+// that object's own declaring *ast.Ident), never by name. A local variable
+// (or a local func literal bound to a name) that shadows a package-level
+// function must NOT cause that package function's body to be inlined -- a
+// name-only match silently transpiles the wrong code.
+func (a *gpuAnalyzer) lookupLocalFunc(ident *ast.Ident) *ast.FuncDecl {
+	fn, ok := a.info.Uses[ident].(*types.Func)
+	if !ok {
+		return nil // not a function at all (e.g. a shadowing local variable)
+	}
+	if fn.Pkg() == nil || fn.Parent() != fn.Pkg().Scope() {
+		return nil // not declared at package level
+	}
+	if sig, ok := fn.Type().(*types.Signature); !ok || sig.Recv() != nil {
+		return nil // methods are not inlined
+	}
+	if ast.IsExported(fn.Name()) {
 		return nil
 	}
 	for _, file := range a.files {
 		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Recv != nil || fn.Name.Name != name {
+			d, ok := decl.(*ast.FuncDecl)
+			if !ok || d.Recv != nil {
 				continue
 			}
-			return fn
+			// Identity match on the declaring object, not on the name.
+			if a.info.Defs[d.Name] == fn {
+				return d
+			}
 		}
 	}
 	return nil
+}
+
+// tailReturnOf returns body's final statement when it is a *ast.ReturnStmt,
+// else nil. See checkStmt's *ast.ReturnStmt case (C3).
+func tailReturnOf(body *ast.BlockStmt) *ast.ReturnStmt {
+	if body == nil || len(body.List) == 0 {
+		return nil
+	}
+	ret, _ := body.List[len(body.List)-1].(*ast.ReturnStmt)
+	return ret
+}
+
+// checkLocalTypes rejects the loop (I1) when any variable DECLARED inside
+// node has a type the WGSL emitter cannot spell. classify/basicWGSLType only
+// ever see FREE variables, so without this a body-local `var c int64` or
+// `float64` would reach wgslTypeOfIdent, whose error used to be swallowed
+// into a hardcoded "i32" -- a silent truncation on the GPU path only.
+func (a *gpuAnalyzer) checkLocalTypes(node ast.Node) string {
+	reject := ""
+	ast.Inspect(node, func(n ast.Node) bool {
+		if reject != "" {
+			return false
+		}
+		ident, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		obj, ok := a.info.Defs[ident].(*types.Var)
+		if !ok || obj == nil {
+			return true
+		}
+		if _, err := wgslTypeOf(obj.Type()); err != nil {
+			reject = fmt.Sprintf("local variable %s has a type not representable in WGSL: %s", ident.Name, obj.Type().String())
+			return false
+		}
+		return true
+	})
+	return reject
 }
 
 // freeVars discovers the loop body's free variables (objects declared
