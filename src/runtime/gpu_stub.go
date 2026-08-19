@@ -1,4 +1,4 @@
-//go:build !(tinygo.wasm && js && spmd.gpu.webgpu) && !(!tinygo.wasm && linux && amd64 && spmd.gpu.webgpu)
+//go:build !(tinygo.wasm && (js || spmd.gpu.host.browser) && spmd.gpu.webgpu) && !(!tinygo.wasm && linux && amd64 && spmd.gpu.webgpu)
 
 // SPMD GPU offload runtime ABI stub for every build that is not a
 // wasm/js (-target=wasm) build with -gpu=webgpu and is not a native

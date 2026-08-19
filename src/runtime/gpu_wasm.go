@@ -1,4 +1,4 @@
-//go:build tinygo.wasm && js && spmd.gpu.webgpu
+//go:build tinygo.wasm && (js || spmd.gpu.host.browser) && spmd.gpu.webgpu
 
 // SPMD GPU offload runtime ABI (browser/JS target only).
 //

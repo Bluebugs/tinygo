@@ -57,6 +57,7 @@ type Options struct {
 	LLVMFeatures    string
 	SIMD            string // -simd flag: "true" (default), "false" for scalar fallback
 	GPU             string // -gpu flag: "none" (default), "webgpu"
+	GPUHost         string // -gpu-host flag: "" (default) or "browser"
 	GPUThresholdOps uint64 // -gpu-threshold flag: minimum estimated op count to offload a `go for` loop
 	GPUVerbose      bool   // -gpu-verbose flag: print GPU offload decisions
 	Monitor         bool
@@ -133,6 +134,10 @@ func (o *Options) Verify() error {
 		if !isInArray(validGPUOptions, o.GPU) {
 			return fmt.Errorf("invalid -gpu=%s: valid values are %s", o.GPU, strings.Join(validGPUOptions, ", "))
 		}
+	}
+
+	if o.GPUHost != "" && o.GPUHost != "browser" {
+		return fmt.Errorf("invalid -gpu-host=%s: valid values are browser", o.GPUHost)
 	}
 
 	return nil

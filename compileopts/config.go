@@ -146,6 +146,9 @@ func (c *Config) GPU() string {
 	return c.Options.GPU
 }
 
+// GPUHost returns the declared GPU host environment ("" or "browser").
+func (c *Config) GPUHost() string { return c.Options.GPUHost }
+
 // GPUThresholdOps returns the minimum estimated op count for a `go for` loop
 // to be considered for GPU offload. Defaults to 50_000_000 when unset (0),
 // which also covers Options constructed without going through the
@@ -240,6 +243,9 @@ func (c *Config) BuildTags() []string {
 		"gc." + c.GC(), "scheduler." + c.Scheduler(), // used inside the runtime package
 		"serial." + c.Serial(),    // used inside the machine package
 		"spmd.gpu." + c.GPU()}...) // gates src/runtime/gpu_wasm.go (I6)
+	if c.GPUHost() == "browser" {
+		tags = append(tags, "spmd.gpu.host.browser") // gates src/runtime/gpu_wasm.go (I6)
+	}
 	switch c.Scheduler() {
 	case "threads", "cores":
 	default:

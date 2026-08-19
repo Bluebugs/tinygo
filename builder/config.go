@@ -28,6 +28,15 @@ func NewConfig(options *compileopts.Options) (*compileopts.Config, error) {
 		}
 	}
 
+	if options.GPUHost == "browser" {
+		if options.GPU != "webgpu" {
+			return nil, fmt.Errorf("-gpu-host=browser requires -gpu=webgpu")
+		}
+		if spec.GOARCH != "wasm" {
+			return nil, fmt.Errorf("-gpu-host=browser currently requires a wasm target")
+		}
+	}
+
 	if options.OpenOCDCommands != nil {
 		// Override the OpenOCDCommands from the target spec if specified on
 		// the command-line

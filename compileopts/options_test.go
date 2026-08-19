@@ -137,6 +137,15 @@ func TestVerifyOptions(t *testing.T) {
 				GPU: "webgpu",
 			},
 		},
+		{
+			name:          "InvalidGPUHostOption",
+			opts:          compileopts.Options{GPUHost: "vulkan"},
+			expectedError: errors.New("invalid -gpu-host=vulkan: valid values are browser"),
+		},
+		{
+			name: "GPUHostBrowser",
+			opts: compileopts.Options{GPUHost: "browser"},
+		},
 	}
 
 	for _, tc := range testCases {
