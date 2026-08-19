@@ -55,6 +55,9 @@ type Config struct {
 	// Various compiler options that determine how code is generated.
 	SIMDEnabled        bool   // false for scalar fallback mode (-simd=false)
 	SIMDRegisterBytes  int    // SIMD register width in bytes: 16 (SSE/WASM), 32 (AVX2), 64 (AVX-512)
+	GPU                string // "none" (default) or "webgpu" (-gpu flag)
+	GPUThresholdOps    uint64 // minimum estimated op count for GPU offload (-gpu-threshold flag)
+	GPUVerbose         bool   // print GPU offload decisions (-gpu-verbose flag)
 	Scheduler          string
 	AutomaticStackSize bool
 	DefaultStackSize   uint64
@@ -70,7 +73,8 @@ type Config struct {
 // must not contain function-dependent data such as an IR builder.
 type compilerContext struct {
 	*Config
-	simdEnabled      bool // mirrors Config.SIMDEnabled; false for scalar fallback mode
+	simdEnabled      bool   // mirrors Config.SIMDEnabled; false for scalar fallback mode
+	gpu              string // mirrors Config.GPU; "none" (default) or "webgpu"
 	DumpSSA          bool
 	mod              llvm.Module
 	ctx              llvm.Context
@@ -105,6 +109,7 @@ func newCompilerContext(moduleName string, machine llvm.TargetMachine, config *C
 	c := &compilerContext{
 		Config:        config,
 		simdEnabled:   config.SIMDEnabled,
+		gpu:           config.GPU,
 		DumpSSA:       dumpSSA,
 		difiles:       make(map[string]llvm.Metadata),
 		ditypes:       make(map[types.Type]llvm.Metadata),

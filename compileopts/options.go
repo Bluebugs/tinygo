@@ -15,6 +15,7 @@ var (
 	validPrintSizeOptions     = []string{"none", "short", "full", "html"}
 	validPanicStrategyOptions = []string{"print", "trap"}
 	validOptOptions           = []string{"none", "0", "1", "2", "s", "z"}
+	validGPUOptions           = []string{"none", "webgpu"}
 )
 
 // Options contains extra options to give to the compiler. These options are
@@ -55,6 +56,9 @@ type Options struct {
 	OpenOCDCommands []string
 	LLVMFeatures    string
 	SIMD            string // -simd flag: "true" (default), "false" for scalar fallback
+	GPU             string // -gpu flag: "none" (default), "webgpu"
+	GPUThresholdOps uint64 // -gpu-threshold flag: minimum estimated op count to offload a `go for` loop
+	GPUVerbose      bool   // -gpu-verbose flag: print GPU offload decisions
 	Monitor         bool
 	BaudRate        int
 	Timeout         time.Duration
@@ -122,6 +126,12 @@ func (o *Options) Verify() error {
 	if o.Opt != "" {
 		if !isInArray(validOptOptions, o.Opt) {
 			return fmt.Errorf("invalid -opt=%s: valid values are %s", o.Opt, strings.Join(validOptOptions, ", "))
+		}
+	}
+
+	if o.GPU != "" {
+		if !isInArray(validGPUOptions, o.GPU) {
+			return fmt.Errorf("invalid -gpu=%s: valid values are %s", o.GPU, strings.Join(validGPUOptions, ", "))
 		}
 	}
 

@@ -13,6 +13,7 @@ func TestVerifyOptions(t *testing.T) {
 	expectedSchedulerError := errors.New(`invalid scheduler option 'incorrect': valid values are none, tasks, asyncify, threads, cores`)
 	expectedPrintSizeError := errors.New(`invalid size option 'incorrect': valid values are none, short, full, html`)
 	expectedPanicStrategyError := errors.New(`invalid panic option 'incorrect': valid values are print, trap`)
+	expectedGPUError := errors.New(`invalid -gpu=metal: valid values are none, webgpu`)
 
 	testCases := []struct {
 		name          string
@@ -115,6 +116,25 @@ func TestVerifyOptions(t *testing.T) {
 			name: "PanicOptionTrap",
 			opts: compileopts.Options{
 				PanicStrategy: "trap",
+			},
+		},
+		{
+			name: "InvalidGPUOption",
+			opts: compileopts.Options{
+				GPU: "metal",
+			},
+			expectedError: expectedGPUError,
+		},
+		{
+			name: "GPUOptionNone",
+			opts: compileopts.Options{
+				GPU: "none",
+			},
+		},
+		{
+			name: "GPUOptionWebgpu",
+			opts: compileopts.Options{
+				GPU: "webgpu",
 			},
 		},
 	}

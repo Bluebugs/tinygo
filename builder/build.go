@@ -210,6 +210,9 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 
 		SIMDEnabled:        config.SIMDEnabled(),
 		SIMDRegisterBytes:  int(config.SIMDRegisterSize()),
+		GPU:                config.GPU(),
+		GPUThresholdOps:    config.GPUThresholdOps(),
+		GPUVerbose:         config.GPUVerbose(),
 		Scheduler:          config.Scheduler(),
 		AutomaticStackSize: config.AutomaticStackSize(),
 		DefaultStackSize:   config.StackSize(),

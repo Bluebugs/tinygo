@@ -1633,6 +1633,9 @@ func main() {
 	ldflags := flag.String("ldflags", "", "Go link tool compatible ldflags")
 	llvmFeatures := flag.String("llvm-features", "", "comma separated LLVM features to enable")
 	simd := flag.String("simd", "", "SIMD mode: true (default for SPMD+WASM), false (scalar fallback)")
+	gpu := flag.String("gpu", "", "GPU offload mode: none (default), webgpu")
+	gpuThreshold := flag.Uint64("gpu-threshold", 1_000_000, "minimum estimated op count for a `go for` loop to be offloaded to the GPU")
+	gpuVerbose := flag.Bool("gpu-verbose", false, "print GPU offload decisions")
 	cpuprofile := flag.String("cpuprofile", "", "cpuprofile output")
 	monitor := flag.Bool("monitor", false, "enable serial monitor")
 	baudrate := flag.Int("baudrate", 115200, "baudrate of serial monitor")
@@ -1757,6 +1760,9 @@ func main() {
 		OpenOCDCommands: ocdCommands,
 		LLVMFeatures:    *llvmFeatures,
 		SIMD:            *simd,
+		GPU:             *gpu,
+		GPUThresholdOps: *gpuThreshold,
+		GPUVerbose:      *gpuVerbose,
 		Monitor:         *monitor,
 		BaudRate:        *baudrate,
 		Timeout:         *timeout,

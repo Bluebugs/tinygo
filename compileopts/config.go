@@ -138,6 +138,30 @@ func (c *Config) SIMDRegisterSize() int64 {
 	return 16 // SSE2/SSE4 baseline
 }
 
+// GPU returns the GPU offload mode: "none" (default) or "webgpu".
+func (c *Config) GPU() string {
+	if c.Options.GPU == "" {
+		return "none"
+	}
+	return c.Options.GPU
+}
+
+// GPUThresholdOps returns the minimum estimated op count for a `go for` loop
+// to be considered for GPU offload. Defaults to 1_000_000 when unset (0),
+// which also covers Options constructed without going through the -gpu-threshold
+// CLI flag (whose default is likewise 1_000_000).
+func (c *Config) GPUThresholdOps() uint64 {
+	if c.Options.GPUThresholdOps == 0 {
+		return 1_000_000
+	}
+	return c.Options.GPUThresholdOps
+}
+
+// GPUVerbose returns whether GPU offload decisions should be printed.
+func (c *Config) GPUVerbose() bool {
+	return c.Options.GPUVerbose
+}
+
 // ABI returns the -mabi= flag for this target (like -mabi=lp64). A zero-length
 // string is returned if the target doesn't specify an ABI.
 func (c *Config) ABI() string {

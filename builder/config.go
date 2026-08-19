@@ -18,6 +18,10 @@ func NewConfig(options *compileopts.Options) (*compileopts.Config, error) {
 		return nil, err
 	}
 
+	if options.GPU == "webgpu" && spec.GOARCH != "wasm" {
+		return nil, fmt.Errorf("-gpu=webgpu currently requires a wasm target")
+	}
+
 	if options.OpenOCDCommands != nil {
 		// Override the OpenOCDCommands from the target spec if specified on
 		// the command-line
