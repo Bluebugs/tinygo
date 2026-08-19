@@ -494,6 +494,77 @@ func defaultTarget(options *Options) (*TargetSpec, error) {
 		}
 	}
 
+	// GPU offload on a native target links against wgpu-native, which is a
+	// glibc shared library.  TinyGo's default Linux configuration produces a
+	// statically-linked musl binary with no dynamic loader, so a glibc .so
+	// simply cannot be loaded into it (the resulting binary segfaults before
+	// main).  When -gpu=webgpu is requested on a native target we therefore
+	// switch the whole link over to the system C toolchain and glibc:
+	// Libc="" (no bundled libc, system headers via clang's defaults),
+	// Linker="cc" (the system compiler driver, which knows where crt1.o,
+	// the dynamic loader and libgcc live), and a -gnu triple.  Nothing here
+	// runs unless -gpu=webgpu is passed, so ordinary native builds are
+	// untouched.
+	if options.GPU == "webgpu" && options.GOARCH != "wasm" {
+		spec.Libc = ""
+		spec.RTLib = ""
+		spec.Linker = "cc"
+		spec.Triple = strings.TrimSuffix(spec.Triple, "-musleabihf")
+		spec.Triple = strings.TrimSuffix(spec.Triple, "-musleabi")
+		spec.Triple += "-gnu"
+		// LDFlags are now passed to `cc`, not to ld.lld directly, so the
+		// linker-only flags collected above have to be re-spelled.
+		//
+		// M4: this re-spelling covers only the flags THIS FILE collected.
+		// User-supplied -ldflags are appended later by Config.LDFlags() from
+		// Options.ExtLDFlags and are NOT re-spelled, so on this one target a
+		// user passing a bare LLD flag such as --gc-sections will have it
+		// reach `cc` unmodified and be rejected. Such users must write
+		// -Wl,--gc-sections themselves for native -gpu=webgpu builds.
+		var ldflags []string
+		for _, f := range spec.LDFlags {
+			if strings.HasPrefix(f, "--") {
+				ldflags = append(ldflags, "-Wl,"+f)
+				continue
+			}
+			ldflags = append(ldflags, f)
+		}
+		wgpu := os.Getenv("WGPU_NATIVE_PATH")
+		if wgpu == "" {
+			wgpu = filepath.Join(os.Getenv("HOME"), ".local/share/wgpu-native")
+		}
+		// Fail here with something actionable. Without this check a missing
+		// wgpu-native surfaces much later as either
+		// "webgpu/webgpu.h: No such file or directory" from the C compile or
+		// "cannot find -lwgpu_native" from the link, neither of which says
+		// what to install or which variable to set.
+		if _, err := os.Stat(filepath.Join(wgpu, "include", "webgpu", "webgpu.h")); err != nil {
+			return nil, fmt.Errorf("-gpu=webgpu on a native target requires wgpu-native at %s (set WGPU_NATIVE_PATH to override): %w", wgpu, err)
+		}
+		ldflags = append(ldflags,
+			// TinyGo's code generator emits non-PIC code (R_X86_64_32
+			// against .rodata), so the executable must not be a PIE.
+			"-no-pie",
+			"-L"+filepath.Join(wgpu, "lib"),
+			"-lwgpu_native", "-lm", "-lpthread", "-ldl",
+			"-Wl,-rpath,"+filepath.Join(wgpu, "lib"),
+		)
+		spec.LDFlags = ldflags
+		// See builder/cc.go: -fno-lto makes the C files compile to real ELF
+		// objects rather than ThinLTO bitcode, which `cc` cannot link.
+		//
+		// M3: this disables LTO for the WHOLE build, not just the GPU shim.
+		// Native -gpu=webgpu binaries are therefore not
+		// cross-module-optimized the way an ordinary TinyGo native build is,
+		// and CPU-path code in such a binary may be measurably slower than
+		// the same code built without -gpu. Benchmarks that compare the GPU
+		// path against the CPU path must be built as two separate binaries
+		// (as test/e2e and the Task 10 measurements do) rather than assuming
+		// the CPU half of a -gpu build is representative.
+		spec.CFlags = append(spec.CFlags, "-fno-lto", "-I"+filepath.Join(wgpu, "include"))
+		spec.ExtraFiles = append(spec.ExtraFiles, "src/runtime/gpu_native.c")
+	}
+
 	// Add extra assembly files (needed for the scheduler etc).
 	if options.GOARCH != "wasm" {
 		suffix := ""

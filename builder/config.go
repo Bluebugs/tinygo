@@ -18,8 +18,14 @@ func NewConfig(options *compileopts.Options) (*compileopts.Config, error) {
 		return nil, err
 	}
 
+	// -gpu=webgpu has two host backends: the browser/JS WebGPU glue (wasm)
+	// and wgpu-native + Vulkan (native linux/amd64, Task 10).  Every other
+	// target has neither, so it is still rejected up front rather than
+	// silently producing a binary whose spmdGPUAvailable() is always false.
 	if options.GPU == "webgpu" && spec.GOARCH != "wasm" {
-		return nil, fmt.Errorf("-gpu=webgpu currently requires a wasm target")
+		if !(spec.GOOS == "linux" && spec.GOARCH == "amd64") {
+			return nil, fmt.Errorf("-gpu=webgpu requires a wasm target or native linux/amd64, got %s/%s", spec.GOOS, spec.GOARCH)
+		}
 	}
 
 	if options.OpenOCDCommands != nil {

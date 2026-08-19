@@ -122,8 +122,26 @@ func compileAndCacheCFile(abspath, tmpdir string, cflags []string, printCommands
 		return "", err
 	}
 	depTmpFile.Close()
-	flags := append([]string{}, cflags...)                                                 // copy cflags
-	flags = append(flags, "-MD", "-MV", "-MTdeps", "-MF", depTmpFile.Name(), "-flto=thin") // autogenerate dependencies
+	flags := append([]string{}, cflags...)                                   // copy cflags
+	flags = append(flags, "-MD", "-MV", "-MTdeps", "-MF", depTmpFile.Name()) // autogenerate dependencies
+	// C files are normally compiled to ThinLTO bitcode, because LLD does the
+	// final link and can consume it. The native GPU-offload configuration
+	// links with the system `cc` instead (it has to, see
+	// compileopts/target.go), and gcc cannot read LLVM bitcode -- it fails
+	// with "file format not recognized". That configuration puts -fno-lto in
+	// its CFlags, which is honoured here by emitting a real object file.
+	// -flto=thin cannot simply be overridden by a later -fno-lto because it
+	// is appended AFTER the caller's cflags.
+	lto := true
+	for _, f := range cflags {
+		if f == "-fno-lto" {
+			lto = false
+			break
+		}
+	}
+	if lto {
+		flags = append(flags, "-flto=thin")
+	}
 	flags = append(flags, "-c", "-o", objTmpFile.Name(), abspath)
 	if strings.ToLower(filepath.Ext(abspath)) == ".s" {
 		// If this is an assembly file (.s or .S, lowercase or uppercase), then

@@ -57,7 +57,25 @@ func runCCompiler(flags ...string) error {
 
 // link invokes a linker with the given name and flags.
 func link(linker string, flags ...string) error {
-	// We only support LLD.
+	// "cc" means the SYSTEM C compiler driver, used only by the native
+	// GPU-offload configuration (compileopts/target.go, -gpu=webgpu on a
+	// native target). That configuration deliberately links against the
+	// system glibc, because wgpu-native is a glibc shared library and cannot
+	// be loaded into TinyGo's usual statically-linked musl binary. Only `cc`
+	// knows where this system's crt1.o, dynamic loader and libgcc live, so
+	// LLD is not usable there. Every other target still goes through LLD.
+	if linker == "cc" {
+		name, err := LookupCommand("cc")
+		if err != nil {
+			return err
+		}
+		cmd := exec.Command(name, flags...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+
+	// Otherwise we only support LLD.
 	if linker != "ld.lld" && linker != "wasm-ld" {
 		return fmt.Errorf("unexpected: linker %s should be ld.lld or wasm-ld", linker)
 	}

@@ -674,6 +674,20 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 		dependencies: []*compileJob{programJob},
 		result:       objfile,
 		run: func(*compileJob) error {
+			if config.Target.Linker == "cc" {
+				// The system compiler driver is used as the linker only by
+				// the native GPU-offload configuration, and it cannot
+				// consume LLVM ThinLTO bitcode (gcc rejects it outright with
+				// "file format not recognized"). Emit a real ELF object
+				// there instead and skip LTO; the LTO-only flags are
+				// likewise suppressed at the link step below.
+				llvmBuf, err := machine.EmitToMemoryBuffer(mod, llvm.ObjectFile)
+				if err != nil {
+					return err
+				}
+				defer llvmBuf.Dispose()
+				return os.WriteFile(objfile, llvmBuf.Bytes(), 0666)
+			}
 			llvmBuf := llvm.WriteThinLTOBitcodeToMemoryBuffer(mod)
 			defer llvmBuf.Dispose()
 			return os.WriteFile(objfile, llvmBuf.Bytes(), 0666)
@@ -786,7 +800,11 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 
 	// Strip debug information with -no-debug.
 	if hasDebug && !config.Debug() {
-		if config.Target.Linker == "wasm-ld" {
+		if config.Target.Linker == "cc" {
+			// The system compiler driver (native GPU-offload config): the
+			// linker-only flag has to be tunnelled through it.
+			ldflags = append(ldflags, "-Wl,--strip-debug")
+		} else if config.Target.Linker == "wasm-ld" {
 			// Don't just strip debug information, also compress relocations
 			// while we're at it. Relocations can only be compressed when debug
 			// information is stripped.
@@ -812,35 +830,70 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 				}
 				ldflags = append(ldflags, dependency.result)
 			}
-			ldflags = append(ldflags, "-mllvm", "-mcpu="+config.CPU())
-			ldflags = append(ldflags, "-mllvm", "-mattr="+config.Features()) // needed for MIPS softfloat
-			if config.GOOS() == "windows" {
-				// Options for the MinGW wrapper for the lld COFF linker.
-				ldflags = append(ldflags,
-					"-Xlink=/opt:lldlto="+strconv.Itoa(speedLevel),
-					"--thinlto-cache-dir="+filepath.Join(cacheDir, "thinlto"))
-			} else if config.GOOS() == "darwin" {
-				// Options for the ld64-compatible lld linker.
-				ldflags = append(ldflags,
-					"--lto-O"+strconv.Itoa(speedLevel),
-					"-cache_path_lto", filepath.Join(cacheDir, "thinlto"))
-			} else {
-				// Options for the ELF linker.
-				ldflags = append(ldflags,
-					"--lto-O"+strconv.Itoa(speedLevel),
-					"--thinlto-cache-dir="+filepath.Join(cacheDir, "thinlto"),
-				)
+			// `cc` (the native GPU-offload config) is a compiler driver,
+			// not LLD: it understands none of the -mllvm / --lto-* / -Xlink
+			// options below, and does not need them either -- LTO is not
+			// used on that path and the CPU/feature selection was already
+			// baked into the object files by the compile step. It gets only
+			// the object files, the library flags from LDFlags, and the
+			// -Wl,--strip-debug added above.
+			if config.Target.Linker != "cc" {
+				ldflags = append(ldflags, "-mllvm", "-mcpu="+config.CPU())
+				ldflags = append(ldflags, "-mllvm", "-mattr="+config.Features()) // needed for MIPS softfloat
+				if config.GOOS() == "windows" {
+					// Options for the MinGW wrapper for the lld COFF linker.
+					ldflags = append(ldflags,
+						"-Xlink=/opt:lldlto="+strconv.Itoa(speedLevel),
+						"--thinlto-cache-dir="+filepath.Join(cacheDir, "thinlto"))
+				} else if config.GOOS() == "darwin" {
+					// Options for the ld64-compatible lld linker.
+					ldflags = append(ldflags,
+						"--lto-O"+strconv.Itoa(speedLevel),
+						"-cache_path_lto", filepath.Join(cacheDir, "thinlto"))
+				} else {
+					// Options for the ELF linker.
+					ldflags = append(ldflags,
+						"--lto-O"+strconv.Itoa(speedLevel),
+						"--thinlto-cache-dir="+filepath.Join(cacheDir, "thinlto"),
+					)
+				}
+				if config.CodeModel() != "default" {
+					ldflags = append(ldflags,
+						"-mllvm", "-code-model="+config.CodeModel())
+				}
+				if sizeLevel >= 2 {
+					// Workaround with roughly the same effect as
+					// https://reviews.llvm.org/D119342.
+					// Can hopefully be removed in LLVM 19.
+					ldflags = append(ldflags,
+						"-mllvm", "--rotation-max-header-size=0")
+				}
 			}
-			if config.CodeModel() != "default" {
-				ldflags = append(ldflags,
-					"-mllvm", "-code-model="+config.CodeModel())
-			}
-			if sizeLevel >= 2 {
-				// Workaround with roughly the same effect as
-				// https://reviews.llvm.org/D119342.
-				// Can hopefully be removed in LLVM 19.
-				ldflags = append(ldflags,
-					"-mllvm", "--rotation-max-header-size=0")
+			if config.Target.Linker == "cc" {
+				// GNU ld resolves symbols strictly left to right, so a
+				// -l library must come AFTER the object files that
+				// reference it. TinyGo builds ldflags as
+				// [LDFlags..., -o out, objects...], which puts
+				// -lwgpu_native first and produces "undefined reference"
+				// for every wgpu* call. Move the library-search flags to
+				// the end.
+				var head, tail []string
+				for i := 0; i < len(ldflags); i++ {
+					f := ldflags[i]
+					// LDFlags() emits a detached `-L <dir>` pair, so the
+					// bare form has to take its argument with it.
+					if f == "-L" && i+1 < len(ldflags) {
+						tail = append(tail, f, ldflags[i+1])
+						i++
+						continue
+					}
+					if strings.HasPrefix(f, "-l") || strings.HasPrefix(f, "-L") {
+						tail = append(tail, f)
+						continue
+					}
+					head = append(head, f)
+				}
+				ldflags = append(head, tail...)
 			}
 			if config.Options.PrintCommands != nil {
 				config.Options.PrintCommands(config.Target.Linker, ldflags...)

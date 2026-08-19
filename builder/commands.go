@@ -22,6 +22,10 @@ func init() {
 	commands["ld.lld"] = []string{"ld.lld-" + llvmMajor, "ld.lld"}
 	commands["wasm-ld"] = []string{"wasm-ld-" + llvmMajor, "wasm-ld"}
 	commands["lldb"] = []string{"lldb-" + llvmMajor, "lldb"}
+	// The system C compiler driver. Used as the LINKER only by the native
+	// GPU-offload configuration (-gpu=webgpu on a native target), which
+	// links against the system glibc rather than TinyGo's bundled musl.
+	commands["cc"] = []string{"cc", "gcc", "clang"}
 	// Add the path to a Homebrew-installed LLVM for ease of use (no need to
 	// manually set $PATH).
 	if runtime.GOOS == "darwin" {
