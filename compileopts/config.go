@@ -147,12 +147,31 @@ func (c *Config) GPU() string {
 }
 
 // GPUThresholdOps returns the minimum estimated op count for a `go for` loop
-// to be considered for GPU offload. Defaults to 1_000_000 when unset (0),
-// which also covers Options constructed without going through the -gpu-threshold
-// CLI flag (whose default is likewise 1_000_000).
+// to be considered for GPU offload. Defaults to 50_000_000 when unset (0),
+// which also covers Options constructed without going through the
+// -gpu-threshold CLI flag (whose default is likewise 50_000_000).
+//
+// This was originally 1_000_000, chosen arbitrarily by the Task 2 plan
+// before any measurement existed. Task 9 measured the WebGPU path against
+// CPU SIMD on an integrated GPU (Ryzen 7 6800U / Radeon 680M, wgpu via
+// Deno) across every size that stays within the runtime's current
+// dispatchWorkgroups(ceil(n/64)) limit (workgroup size 64, WebGPU's default
+// maxComputeWorkgroupsPerDimension of 65535 -> ~4,194,240 elements before
+// results silently corrupt, see PLAN.md deferred item "GPU dispatch
+// workgroup-count overflow"). GPU lost at every measured size up to that
+// ceiling, including the largest safely-dispatchable mandelbrot grid
+// (1024x1024 = 1,048,576 elements, cost=20/element -> ~20.97M ops: GPU
+// 33.1ms vs CPU SIMD 29.7ms). No crossover was found; see
+// docs/gpu-offload-webgpu.md "Measured results". 50_000_000 is set above
+// every measured GPU-losing op count specifically so the default keeps
+// `go for` loops on the (faster, correct) CPU SIMD path until either the
+// dispatch-limit bug is fixed and offload can be tested past it, or the
+// cost model gains a transfer-size term (see PLAN.md deferred items) that
+// might reveal a real win at some size. -gpu-threshold remains available to
+// force offload for testing/measurement below this default.
 func (c *Config) GPUThresholdOps() uint64 {
 	if c.Options.GPUThresholdOps == 0 {
-		return 1_000_000
+		return 50_000_000
 	}
 	return c.Options.GPUThresholdOps
 }

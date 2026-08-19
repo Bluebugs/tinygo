@@ -100,6 +100,27 @@ func (b *builder) spmdGPUAnalyze() {
 	}
 }
 
+// gpuMaxSafeTrip is the largest `go for` trip count that is safe to
+// dispatch to the GPU in a single launch. The JS glue (test/webgpu/spmd_gpu.js)
+// dispatches ceil(n / wgslWorkgroupSize) workgroups in a single dispatch
+// dimension; the WebGPU spec guarantees maxComputeWorkgroupsPerDimension is
+// AT LEAST 65535 on every conformant device (some report more, none
+// report less), so 65535*wgslWorkgroupSize is the largest trip count that
+// is portably safe -- not just safe on this machine. Above it, the launch
+// can silently truncate or fail into an uncaptured WebGPU error scope,
+// producing wrong output with no signal to the caller (see PLAN.md "GPU
+// dispatch workgroup-count ceiling"); gpuEmitGuard's upper bound and
+// gpuAnalyzeLoop's compile-time reject below both exist so that path is
+// simply never taken -- a loop whose trip count could exceed this always
+// falls back to the ordinary CPU path instead.
+const gpuMaxSafeTrip = 65535 * wgslWorkgroupSize
+
+// gpuMaxSafeTripConst returns gpuMaxSafeTrip as an LLVM constant of the
+// same integer width as the trip-count value being compared against.
+func gpuMaxSafeTripConst(ty llvm.Type) llvm.Value {
+	return llvm.ConstInt(ty, uint64(gpuMaxSafeTrip), false)
+}
+
 // gpuReport prints a -gpu-verbose line for one loop.
 func (b *builder) gpuReport(loop *spmdActiveLoop, format string, args ...interface{}) {
 	if !b.GPUVerbose {
@@ -117,6 +138,14 @@ func (b *builder) gpuAnalyzeLoop(loop *spmdActiveLoop) {
 	}
 	if plan.MinTrip > math.MaxInt32 {
 		b.gpuReport(loop, "skipped: minTrip %d does not fit in an int32 trip-count comparison", plan.MinTrip)
+		return
+	}
+	if plan.MinTrip > gpuMaxSafeTrip {
+		// The runtime guard requires minTrip <= n <= gpuMaxSafeTrip; if
+		// minTrip alone already exceeds the safe ceiling, that range is
+		// empty and the GPU path could never fire at any trip count --
+		// skip emitting it at all rather than emit permanently-dead IR.
+		b.gpuReport(loop, "skipped: minTrip %d exceeds gpuMaxSafeTrip %d (dispatch-workgroup-count ceiling; loop's per-element cost is too low to ever safely reach the GPU-worthwhile threshold within the dispatchable range)", plan.MinTrip, gpuMaxSafeTrip)
 		return
 	}
 	if reason := b.gpuCFGReject(loop); reason != "" {
@@ -140,8 +169,8 @@ func (b *builder) gpuAnalyzeLoop(loop *spmdActiveLoop) {
 	b.gpuKernelCounter++
 	loop.gpu = &gpuLoopOffload{plan: plan, kernel: kernel}
 	loop.gpuArgs = args
-	b.gpuReport(loop, "offload (kernel=%s, cost=%d, minTrip=%d, params=%d, buffers=%d)",
-		kernel.Entry, plan.BodyCost, plan.MinTrip, len(kernel.Params), len(kernel.Buffers))
+	b.gpuReport(loop, "offload (kernel=%s, cost=%d, minTrip=%d, maxSafeTrip=%d, params=%d, buffers=%d)",
+		kernel.Entry, plan.BodyCost, plan.MinTrip, gpuMaxSafeTrip, len(kernel.Params), len(kernel.Buffers))
 }
 
 // gpuLoopShapeReject holds the parts of the eligibility proof that depend only
@@ -452,7 +481,20 @@ func (b *builder) gpuEmitGuard(loop *spmdActiveLoop) {
 	bound := b.getValue(loop.gpuArgs.bound, pos)
 	minTrip := llvm.ConstInt(bound.Type(), off.plan.MinTrip, false)
 	big := b.CreateICmp(llvm.IntSGE, bound, minTrip, "gpu.big")
-	cond := b.CreateAnd(avail, big, "gpu.offload")
+	// gpuMaxSafeTrip caps the trip count from ABOVE, not just below: the JS
+	// glue dispatches ceil(n / wgslWorkgroupSize) workgroups in a single
+	// dimension, and the WebGPU spec only GUARANTEES
+	// maxComputeWorkgroupsPerDimension >= 65535 (some devices report more,
+	// none report less) -- so 65535*wgslWorkgroupSize is the largest trip
+	// count that is safe to dispatch on every conformant WebGPU device, not
+	// just this one. Above it, dispatchWorkgroups can silently truncate or
+	// error into an uncaptured error scope, producing wrong output with no
+	// signal (see PLAN.md "GPU dispatch workgroup-count ceiling"). A loop
+	// whose trip count exceeds this always falls back to the CPU path,
+	// which is unconditionally safe.
+	small := b.CreateICmp(llvm.IntSLE, bound, gpuMaxSafeTripConst(bound.Type()), "gpu.small")
+	cond := b.CreateAnd(avail, big, "gpu.offload.lo")
+	cond = b.CreateAnd(cond, small, "gpu.offload")
 	b.CreateCondBr(cond, gpuBlock, cpuBlock)
 
 	// --- register-once -----------------------------------------------------

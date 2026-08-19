@@ -1634,7 +1634,7 @@ func main() {
 	llvmFeatures := flag.String("llvm-features", "", "comma separated LLVM features to enable")
 	simd := flag.String("simd", "", "SIMD mode: true (default for SPMD+WASM), false (scalar fallback)")
 	gpu := flag.String("gpu", "", "GPU offload mode: none (default), webgpu")
-	gpuThreshold := flag.Uint64("gpu-threshold", 1_000_000, "minimum estimated op count for a `go for` loop to be offloaded to the GPU")
+	gpuThreshold := flag.Uint64("gpu-threshold", 50_000_000, "minimum estimated op count for a `go for` loop to be offloaded to the GPU")
 	gpuVerbose := flag.Bool("gpu-verbose", false, "print GPU offload decisions")
 	cpuprofile := flag.String("cpuprofile", "", "cpuprofile output")
 	monitor := flag.Bool("monitor", false, "enable serial monitor")
