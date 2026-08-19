@@ -34,6 +34,14 @@ type SPMDLoopInfo struct {
 	BodyStart token.Pos // start of loop body (opening brace)
 	BodyEnd   token.Pos // end of loop body (closing brace)
 	LaneCount int64     // SIMD lane count (from type checker)
+
+	// RangeStmt, TypesInfo and Files are stashed here so that later passes
+	// (e.g. the GPU-offload eligibility analysis in gpu_eligible.go) can
+	// consume the typed AST without needing access to the *loader.Package,
+	// which may not be reachable at their call sites.
+	RangeStmt *ast.RangeStmt // the go-for range statement itself
+	TypesInfo *types.Info    // type info for the package containing this loop
+	Files     []*ast.File    // all files of the package containing this loop
 }
 
 // SPMDParamInfo holds info about a single varying parameter.
@@ -87,6 +95,9 @@ func extractSPMDLoops(pkg *loader.Package) map[token.Pos]*SPMDLoopInfo {
 				BodyStart: rangeStmt.Body.Lbrace,
 				BodyEnd:   rangeStmt.Body.Rbrace,
 				LaneCount: rangeStmt.LaneCount, // set by type checker
+				RangeStmt: rangeStmt,
+				TypesInfo: pkg.TypesInfo(),
+				Files:     pkg.Files,
 			}
 
 			loops[rangeStmt.For] = info
