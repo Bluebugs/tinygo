@@ -37,10 +37,21 @@ func gpuLaunch(kernelID int32, n uint32, paramsPtr unsafe.Pointer, paramsLen uin
 //
 // Field order and size are load-bearing: the JS glue reads an array of
 // these as a flat Uint32Array with stride 3 (dataPtr, byteLen, mode).
+// mode selects the host-side data movement for this buffer:
+//
+//	0  read-only:  upload before dispatch, no readback.
+//	1  read_write: upload before dispatch, read back after.
+//	2  write-only: do NOT upload, read back after. Emitted only when the
+//	   compiler proved the kernel writes every element and never reads the
+//	   buffer (gpu_eligible.go writeOnlySliceObjs) AND a runtime
+//	   n == len(slice) check passed (gpu_offload.go gpuBuildBuffers), so
+//	   the same kernel can launch with 2 or 1 on different calls.
+//
+// Any mode other than 0 is read back.
 type gpuBufferDesc struct {
 	dataPtr uint32
 	byteLen uint32
-	mode    uint32 // 0 = read, 1 = read_write
+	mode    uint32
 }
 
 // spmdGPUAvailable reports whether a WebGPU device was successfully
