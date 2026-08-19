@@ -248,12 +248,30 @@ func (b *builder) gpuCFGReject(loop *spmdActiveLoop) string {
 	if entry.Parent() != b.fn || done.Parent() != b.fn {
 		return "loop entry/done block belongs to another function"
 	}
-	if b.targetData.PointerSize() != 4 {
-		// gpuBufferDesc is a 32-bit ABI shared with the JS glue; see
-		// gpuBuildBuffers.  This is also why -gpu=webgpu is meaningless on a
-		// 64-bit (i.e. non-wasm32) target.
-		return fmt.Sprintf("GPU offload requires a 32-bit pointer target, this one has %d-byte pointers",
-			b.targetData.PointerSize())
+	// gpuBufferDesc has exactly two spellings (see gpuBuildBuffers): the
+	// wasm32 {u32,u32,u32} form the JS glue reads as a stride-3
+	// Uint32Array, and the native {u64,u32,u32} form gpu_native.go/.c
+	// reads.  Which one gpuBuildBuffers emits is decided by POINTER WIDTH,
+	// but which one is actually read at runtime is decided by the BUILD
+	// TAGS that select gpu_wasm.go vs gpu_native.go -- and those are
+	// GOOS/GOARCH predicates, not width predicates.  Those two selectors
+	// must be checked together: a hypothetical 64-bit target that still
+	// picked up gpu_wasm.go's 12-byte descriptor would be handed a 16-byte
+	// one, and the TypeAllocSize assertion in gpuBuildBuffers could not
+	// catch it, because that assertion only checks the emitted struct
+	// against the pointer width it was derived from.  So the supported
+	// (GOOS, GOARCH, pointer width) triples are enumerated explicitly here,
+	// matching builder/config.go's front-door allowlist and the build tags
+	// on the three src/runtime/gpu_*.go files.
+	ps := b.targetData.PointerSize()
+	switch {
+	case b.GOARCH == "wasm" && ps == 4:
+		// gpu_wasm.go (tinygo.wasm && js), 12-byte descriptor.
+	case b.GOOS == "linux" && b.GOARCH == "amd64" && ps == 8:
+		// gpu_native.go (!tinygo.wasm && linux && amd64), 16-byte descriptor.
+	default:
+		return fmt.Sprintf("GPU offload has no descriptor layout for %s/%s with %d-byte pointers (supported: wasm/wasm32, linux/amd64)",
+			b.GOOS, b.GOARCH, ps)
 	}
 
 	for _, instr := range done.Instrs {
@@ -603,9 +621,10 @@ func (b *builder) gpuBuildParams(loop *spmdActiveLoop, bound llvm.Value, pos tok
 }
 
 // gpuBuildBuffers materialises the [k x gpuBufferDesc] array on the stack.
-// gpuBufferDesc is {u32 dataPtr, u32 byteLen, u32 mode} -- see
-// src/runtime/gpu_wasm.go, where the JS glue reads it as a flat Uint32Array
-// with stride 3.  The stride-3 layout is load-bearing on both sides; the
+// gpuBufferDesc is {uptr dataPtr, u32 byteLen, u32 mode} -- see
+// src/runtime/gpu_wasm.go (wasm32, where the JS glue reads it as a flat
+// stride-3 Uint32Array) and src/runtime/gpu_native.go (native, 8-byte
+// dataPtr).  The layout is load-bearing on both sides; the
 // write-only optimization below therefore encodes itself as a new *value*
 // of the existing mode field (2), never as an extra field.
 //
@@ -614,13 +633,31 @@ func (b *builder) gpuBuildParams(loop *spmdActiveLoop, bound llvm.Value, pos tok
 func (b *builder) gpuBuildBuffers(loop *spmdActiveLoop, bound llvm.Value, pos token.Pos) (llvm.Value, int) {
 	k := loop.gpu.kernel
 	i32 := b.ctx.Int32Type()
-	// gpuBufferDesc is {u32 dataPtr, u32 byteLen, u32 mode}. The 32-bit field
-	// width is a wasm ABI requirement shared with the JS glue (Task 7), which
-	// reads the descriptor array as a flat stride-3 Uint32Array -- do NOT
-	// "fix" dataPtr by widening it to b.uintptrType, that would desynchronise
-	// the reader on any 64-bit target. gpuCFGReject instead refuses GPU
-	// offload unless pointers are 4 bytes wide.
-	descTy := b.ctx.StructType([]llvm.Type{i32, i32, i32}, false)
+	// gpuBufferDesc is pointer-width dependent, and BOTH spellings are a
+	// hard ABI contract with a host-side reader:
+	//
+	//   wasm32 (PointerSize 4): {u32 dataPtr, u32 byteLen, u32 mode}, 12
+	//     bytes.  The JS glue (Task 7) reads the descriptor array as a flat
+	//     stride-3 Uint32Array.  This layout MUST NOT change -- do not "fix"
+	//     dataPtr by widening it to b.uintptrType.
+	//
+	//   native (PointerSize 8): {u64 dataPtr, u32 byteLen, u32 mode}, 16
+	//     bytes, no padding.  Read by src/runtime/gpu_native.go's
+	//     gpuBufferDesc and by spmd_gpu_launch in gpu_native.c.
+	//
+	// The size is asserted below against the layout this compiler believes
+	// it emitted, the same way gpuBuildParams asserts ParamsSize: a silent
+	// mismatch here is memory corruption, not a wrong answer.
+	ptrInt := b.uintptrType
+	wantDescSize := uint64(12)
+	if b.targetData.PointerSize() == 8 {
+		wantDescSize = 16
+	}
+	descTy := b.ctx.StructType([]llvm.Type{ptrInt, i32, i32}, false)
+	if got := b.targetData.TypeAllocSize(descTy); got != wantDescSize {
+		panic(fmt.Sprintf("gpu: gpuBufferDesc is %d bytes, expected %d for %d-byte pointers",
+			got, wantDescSize, b.targetData.PointerSize()))
+	}
 	n := len(k.Buffers)
 	if n == 0 {
 		return llvm.ConstNull(b.dataPtrType), 0
@@ -634,8 +671,10 @@ func (b *builder) gpuBuildBuffers(loop *spmdActiveLoop, bound llvm.Value, pos to
 		// compiler), then narrow to the descriptor's 32-bit field explicitly.
 		// gpuCFGReject guarantees uintptrType is already i32 here, so the
 		// trunc is a no-op; it is written out so the narrowing is visible.
-		dataPtr := b.CreatePtrToInt(b.CreateExtractValue(slice, 0, ""), b.uintptrType, "")
-		dataPtr = b.gpuToI32(dataPtr, true)
+		// dataPtr occupies a full pointer-width field in the descriptor, so
+		// no narrowing happens on either target: i32 on wasm32, i64 on
+		// native, both exactly uintptrType.
+		dataPtr := b.CreatePtrToInt(b.CreateExtractValue(slice, 0, ""), ptrInt, "")
 		// Element size is asserted to be 4 in gpuResolveArgs.
 		byteLen := b.CreateShl(b.gpuToI32(b.CreateExtractValue(slice, 1, ""), false),
 			llvm.ConstInt(i32, 2, false), "")
