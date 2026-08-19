@@ -174,8 +174,24 @@ func scheduler(returnAtDeadlock bool) {
 				if returnAtDeadlock {
 					return
 				}
-				if asyncScheduler {
-					// JavaScript is treated specially, see below.
+				if asyncScheduler || (hostResumesScheduler && spmdGPULaunchesInFlight()) {
+					// JavaScript is treated specially, see below. Browser-hosted
+					// wasi (hostResumesScheduler) needs the same early return, but
+					// ONLY while a goroutine is genuinely parked waiting on an
+					// outstanding async host launch (spmd_gpu.launch's <-ch,
+					// unblocked later by spmd_gpu_done): spmdGPULaunchesInFlight()
+					// is the one source of truth for that, since this scheduler has
+					// no other way to distinguish "waiting on a real future host
+					// callback" from "an ordinary goroutine deadlocked on a channel
+					// nothing will ever signal". Returning early unconditionally
+					// whenever hostResumesScheduler is set would silently turn any
+					// unrelated deadlock in a -gpu-host=browser build into what
+					// looks, from the host's side, like a clean program exit --
+					// see worker/runner.js's run(): it has no other signal to tell
+					// a deadlock apart from a real finish once _start() returns.
+					// Falling through to waitForEvents() below in the "nothing
+					// outstanding" case restores the plain-wasi behavior: panic
+					// loudly instead of returning silently.
 					return
 				}
 				waitForEvents()

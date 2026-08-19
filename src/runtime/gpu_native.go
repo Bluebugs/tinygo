@@ -118,3 +118,20 @@ func spmdGPULaunch(kernelID int32, n uint32, params unsafe.Pointer, paramsLen ui
 func spmdGPUDone(seq uint32, status uint32) {
 	runtimePanic("spmd_gpu: spmdGPUDone is not used by the native GPU backend")
 }
+
+// spmdGPULaunchesInFlight always reports false. Unlike gpu_wasm.go's
+// version, this is not merely the "no GPU backend" stub value (that's
+// gpu_stub.go's job) -- it is correct FOR THIS BACKEND SPECIFICALLY:
+// spmdGPULaunch above is synchronous (it blocks the calling thread in
+// wgpuDevicePoll via the C shim) and never parks a goroutine on a channel,
+// so there is never a launch "in flight" from scheduler_cooperative.go's
+// point of view. Needed because this file, gpu_wasm.go, and gpu_stub.go
+// must each define every spmdGPU* name the compiler/runtime can reference
+// (see the build-tag partition note above) -- omitting this one is a
+// working default build (native defaults to scheduler.threads, which does
+// not compile scheduler_cooperative.go at all) but a compile error the
+// moment someone passes -scheduler=tasks. Do not "fix" this into a real
+// counter -- there is nothing to count here.
+func spmdGPULaunchesInFlight() bool {
+	return false
+}

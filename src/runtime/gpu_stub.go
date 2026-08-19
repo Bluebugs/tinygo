@@ -56,3 +56,10 @@ func spmdGPULaunch(kernelID int32, n uint32, params unsafe.Pointer, paramsLen ui
 func spmdGPUDone(seq uint32, status uint32) {
 	runtimePanic("spmd_gpu: GPU offload is not available on this target")
 }
+
+// spmdGPULaunchesInFlight always reports false: no launches are ever
+// in flight on a target with no GPU backend. See gpu_wasm.go's version
+// (and the scheduler_cooperative.go caller) for why this exists.
+func spmdGPULaunchesInFlight() bool {
+	return false
+}

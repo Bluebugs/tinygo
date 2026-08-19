@@ -97,7 +97,24 @@ var (
 	// a launch (see spmdGPUDone's ok argument). Read and deleted by the
 	// launching goroutine once it wakes up.
 	spmdGPUStatus = make(map[uint32]uint32)
+	// spmdGPUInFlightCount tracks the number of GPU launches currently
+	// blocked waiting on a host response. scheduler_cooperative.go reads
+	// this (via spmdGPULaunchesInFlight, below) to distinguish "the run
+	// queue is empty because we're genuinely waiting on an outstanding
+	// async host launch" (safe to return early and let the host resume us
+	// later) from "the run queue is empty because a goroutine deadlocked
+	// on an ordinary channel with nothing outstanding" (must still panic,
+	// exactly as a plain, non-GPU wasi build would) -- see
+	// hostResumesScheduler in scheduler_hostresume_browser.go. No mutex:
+	// same single-goroutine-at-a-time reasoning as the maps above.
+	spmdGPUInFlightCount uint32
 )
+
+// spmdGPULaunchesInFlight reports whether any goroutine is currently
+// blocked waiting on a GPU launch to complete. See spmdGPUInFlightCount.
+func spmdGPULaunchesInFlight() bool {
+	return spmdGPUInFlightCount > 0
+}
 
 // spmdGPULaunch dispatches a GPU kernel launch and blocks the calling
 // goroutine until the JS host reports completion via spmdGPUDone.
@@ -110,6 +127,17 @@ func spmdGPULaunch(kernelID int32, n uint32, params unsafe.Pointer, paramsLen ui
 
 	gpuLaunch(kernelID, n, params, paramsLen, bufsPtr, bufsLen, seq)
 
+	// The increment/decrement pair below is currently correct as a simple
+	// bracket (nothing between them can return early, and every return in
+	// spmdGPULaunch happens after the decrement). But the failure mode of
+	// getting this wrong is a MASKED panic that depends on execution
+	// history -- a future edit that adds an early return inside this window
+	// would silently turn a later genuine deadlock into what looks like a
+	// clean exit (see hostResumesScheduler / spmdGPULaunchesInFlight in
+	// scheduler_cooperative.go). defer insures against that regardless of
+	// what gets added between here and the receive.
+	spmdGPUInFlightCount++
+	defer func() { spmdGPUInFlightCount-- }()
 	<-ch
 
 	// I2: the launch is only "done" if the host says it SUCCEEDED. A shader
