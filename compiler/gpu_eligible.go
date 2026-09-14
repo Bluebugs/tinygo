@@ -128,6 +128,12 @@ func analyzeGPULoop(info *SPMDLoopInfo, thresholdOps uint64) *gpuLoopPlan {
 		}
 	}
 
+	// Concurrent GPU invocations must never write the same slice element.
+	if reject := a.writeIndexReject(rangeStmt.Body, plan.IterIdent); reject != "" {
+		plan.Reject = reject
+		return plan
+	}
+
 	// Free-variable discovery + classification.
 	free, reject := a.freeVars(rangeStmt)
 	if reject != "" {

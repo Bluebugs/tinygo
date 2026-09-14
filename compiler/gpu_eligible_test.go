@@ -845,7 +845,10 @@ func kernel(n int, output []int) {
 	}
 }
 
-// A store at a derived index need not cover [0, n).
+// A store at a derived index need not cover [0, n). output[idx/2] is also
+// genuinely racy (idx=0 and idx=1 both write output[0]), so the write-index
+// distinctness gate (gpu_write_index.go) now rejects the loop before the
+// WriteOnly classification is even reached.
 func TestGPUEligibleWriteOnlyRejectedWhenNonIdentityIndex(t *testing.T) {
 	src := `package test
 
@@ -855,9 +858,9 @@ func kernel(n int, output []int) {
 	}
 }
 `
-	out, _ := gpuWriteOnlyFlag(t, src, "output")
-	if out.WriteOnly {
-		t.Errorf("output: expected WriteOnly=false, index is idx/2 not idx")
+	plan := parseAndAnalyzeGPULoop(t, src, 1_000_000)
+	if !strings.Contains(plan.Reject, "slice write index") {
+		t.Fatalf("Reject = %q, want a slice write index rejection (idx/2 is not affine)", plan.Reject)
 	}
 }
 
@@ -895,7 +898,10 @@ func kernel(n int, output []int) {
 }
 
 // A second, differently-indexed store disqualifies: the recognised
-// top-level store is no longer the object's only write.
+// top-level store is no longer the object's only write. output[idx] and
+// output[1] also genuinely collide (at idx=1), so the write-index
+// distinctness gate (gpu_write_index.go) now rejects the loop before the
+// WriteOnly classification is even reached.
 func TestGPUEligibleWriteOnlyRejectedForSecondStore(t *testing.T) {
 	src := `package test
 
@@ -908,9 +914,9 @@ func kernel(n int, output []int) {
 	}
 }
 `
-	out, _ := gpuWriteOnlyFlag(t, src, "output")
-	if out.WriteOnly {
-		t.Errorf("output: expected WriteOnly=false, output has two stores")
+	plan := parseAndAnalyzeGPULoop(t, src, 1_000_000)
+	if !strings.Contains(plan.Reject, "slice write index") {
+		t.Fatalf("Reject = %q, want a slice write index rejection (output[idx] and output[1] can collide)", plan.Reject)
 	}
 }
 
