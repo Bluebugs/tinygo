@@ -14,6 +14,7 @@ package compiler
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 )
@@ -443,6 +444,19 @@ func (a *gpuAnalyzer) checkExpr(expr ast.Expr, depth int) string {
 		return "pointer dereference not eligible for GPU offload"
 
 	case *ast.IndexExpr:
+		if s, _, ok := constStringOf(a.info, x.X); ok {
+			if len(s) == 0 || len(s) > 256 {
+				return fmt.Sprintf("constant table index: table length %d not eligible for GPU offload (1..256)", len(s))
+			}
+			if reject := a.checkExpr(x.Index, depth); reject != "" {
+				return reject
+			}
+			m, proven := a.gpuIndexMax(x.Index)
+			if !proven || m >= uint64(len(s)) {
+				return fmt.Sprintf("constant table index into %s cannot be proven < %d (GPU clamps where Go panics)", exprString(x.X), len(s))
+			}
+			return ""
+		}
 		if reject := a.checkExpr(x.X, depth); reject != "" {
 			return reject
 		}
@@ -473,6 +487,101 @@ func (a *gpuAnalyzer) checkExpr(expr ast.Expr, depth int) string {
 	default:
 		return fmt.Sprintf("expression type %T not eligible for GPU offload", expr)
 	}
+}
+
+// constStringOf reports whether e names a string constant, returning its
+// value and object.
+func constStringOf(info *types.Info, e ast.Expr) (string, *types.Const, bool) {
+	ident, ok := e.(*ast.Ident)
+	if !ok {
+		return "", nil, false
+	}
+	c, ok := info.Uses[ident].(*types.Const)
+	if !ok || c.Val().Kind() != constant.String {
+		return "", nil, false
+	}
+	return constant.StringVal(c.Val()), c, true
+}
+
+// gpuIndexMax proves an upper bound on an index expression. WGSL clamps an
+// out-of-range array index where Go panics, so a table lookup is only
+// offloaded when its index provably stays in range.
+func (a *gpuAnalyzer) gpuIndexMax(e ast.Expr) (uint64, bool) {
+	if tv, ok := a.info.Types[e]; ok && tv.Value != nil {
+		v := constant.ToInt(tv.Value)
+		if v.Kind() == constant.Int && constant.Sign(v) >= 0 {
+			if u, exact := constant.Uint64Val(v); exact {
+				return u, true
+			}
+		}
+		return 0, false
+	}
+	switch x := e.(type) {
+	case *ast.ParenExpr:
+		return a.gpuIndexMax(x.X)
+	case *ast.BinaryExpr:
+		switch x.Op {
+		case token.AND:
+			lm, lok := a.gpuIndexMax(x.X)
+			rm, rok := a.gpuIndexMax(x.Y)
+			switch {
+			case lok && rok:
+				return min(lm, rm), true
+			case lok:
+				if _, isConst := a.info.Types[x.X]; isConst && a.info.Types[x.X].Value != nil {
+					return lm, true
+				}
+			case rok:
+				if a.info.Types[x.Y].Value != nil {
+					return rm, true
+				}
+			}
+		case token.SHR:
+			if a.info.Types[x.Y].Value == nil {
+				return 0, false
+			}
+			k, kok := a.gpuIndexMax(x.Y)
+			m, mok := a.gpuIndexMax(x.X)
+			if kok && mok && k < 64 {
+				return m >> k, true
+			}
+		case token.REM:
+			if a.info.Types[x.Y].Value != nil && gpuIsUnsigned(a.info.TypeOf(x.X)) {
+				if m, ok := a.gpuIndexMax(x.Y); ok && m > 0 {
+					return m - 1, true
+				}
+			}
+		}
+	}
+	if gpuIsUint8(a.info.TypeOf(e)) {
+		return 255, true
+	}
+	return 0, false
+}
+
+func gpuUnwrapSPMD(t types.Type) types.Type {
+	if s, ok := t.(*types.SPMDType); ok {
+		return s.Elem()
+	}
+	return t
+}
+
+func gpuIsUint8(t types.Type) bool {
+	t = gpuUnwrapSPMD(t)
+	if t == nil {
+		return false
+	}
+	b, ok := t.Underlying().(*types.Basic)
+	return ok && b.Kind() == types.Uint8
+}
+
+func gpuIsUnsigned(t types.Type) bool {
+	t = gpuUnwrapSPMD(t)
+	if t == nil {
+		return false
+	}
+	b, ok := t.Underlying().(*types.Basic)
+	return ok && b.Info()&types.IsUnsigned != 0
 }
 
 // exprString renders expr for error messages without pulling in go/printer;

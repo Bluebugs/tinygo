@@ -73,6 +73,7 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		locals:    map[types.Object]string{},
 		inlined:   plan.Inlined,
 		byteBufs:  map[types.Object]bool{},
+		tables:    map[*types.Const]string{},
 	}
 
 	// Params: RULING B - "n" (the launch trip count) is always the
@@ -152,6 +153,7 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		return name
 	}
 	e.tmpIdx, e.tmpShift, e.tmpRet = fresh("j"), fresh("sh"), fresh("spmd_bret")
+	e.freshName = fresh
 
 	padFields := wgslprint.PadTo16(len(params))
 	paramsSize := uint32((len(params) + padFields) * 4)
@@ -175,6 +177,7 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		used[name] = true
 		fieldName[p.Obj] = name
 		e.freeSubst[p.Obj] = "params." + name
+		taken[name] = true
 	}
 
 	var sb strings.Builder
@@ -194,12 +197,13 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		}
 		fmt.Fprintf(&sb, "@group(0) @binding(%d) var<storage, %s> %s: %s;\n", i+1, access, bufNames[b.Obj], b.WGSLTy)
 	}
-	fmt.Fprintf(&sb, "@compute @workgroup_size(%d)\n", wgslWorkgroupSize)
-	fmt.Fprintf(&sb, "fn %s(@builtin(global_invocation_id) gid: vec3<u32>) {\n", entry)
-	e.sb = &sb
+	var fn strings.Builder
+	fmt.Fprintf(&fn, "@compute @workgroup_size(%d)\n", wgslWorkgroupSize)
+	fmt.Fprintf(&fn, "fn %s(@builtin(global_invocation_id) gid: vec3<u32>) {\n", entry)
+	e.sb = &fn
 	if lanes == 1 {
-		fmt.Fprintf(&sb, "  let %s: i32 = i32(gid.x);\n", e.iterIdent)
-		fmt.Fprintf(&sb, "  if (%s >= params.n) { return; }\n", e.iterIdent)
+		fmt.Fprintf(&fn, "  let %s: i32 = i32(gid.x);\n", e.iterIdent)
+		fmt.Fprintf(&fn, "  if (%s >= params.n) { return; }\n", e.iterIdent)
 		e.indent = 1
 	} else {
 		// A body-level Go `continue` lowers to WGSL `continue;`, which
@@ -207,24 +211,38 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		// `break` is ineligible (checkStmt), so no Go break can end it.
 		w := fresh("w")
 		lane := fresh("lane")
-		fmt.Fprintf(&sb, "  let %s: u32 = gid.x;\n", w)
-		fmt.Fprintf(&sb, "  for (var %s: u32 = 0u; %s < %du; %s++) {\n", lane, lane, lanes, lane)
-		fmt.Fprintf(&sb, "    let %s: i32 = i32(%s * %du + %s);\n", e.iterIdent, w, lanes, lane)
-		fmt.Fprintf(&sb, "    if (%s >= params.n) { break; }\n", e.iterIdent)
+		fmt.Fprintf(&fn, "  let %s: u32 = gid.x;\n", w)
+		fmt.Fprintf(&fn, "  for (var %s: u32 = 0u; %s < %du; %s++) {\n", lane, lane, lanes, lane)
+		fmt.Fprintf(&fn, "    let %s: i32 = i32(%s * %du + %s);\n", e.iterIdent, w, lanes, lane)
+		fmt.Fprintf(&fn, "    if (%s >= params.n) { break; }\n", e.iterIdent)
 		e.indent = 2
 	}
 	if err := e.emitStmts(plan.Body.List, ""); err != nil {
 		return nil, err
 	}
 	if lanes != 1 {
-		sb.WriteString("  }\n")
+		fn.WriteString("  }\n")
 	}
-	sb.WriteString("}\n")
+	fn.WriteString("}\n")
+
+	// Constant lookup tables are emitted at module scope, before the entry
+	// point, but table names and references are only known after the body
+	// has been transpiled (a table's first use is discovered while walking
+	// the body). tableOrder records first-use order for determinism.
+	for _, c := range e.tableOrder {
+		s := constant.StringVal(c.Val())
+		elems := make([]string, len(s))
+		for i := 0; i < len(s); i++ {
+			elems[i] = strconv.Itoa(int(s[i])) + "u"
+		}
+		fmt.Fprintf(&sb, "var<private> %s: array<u32, %d> = array<u32, %d>(%s);\n",
+			e.tables[c], len(s), len(s), strings.Join(elems, ", "))
+	}
 
 	return &gpuKernel{
 		ID:         id,
 		Entry:      entry,
-		WGSL:       sb.String(),
+		WGSL:       sb.String() + fn.String(),
 		Params:     params,
 		ParamsSize: paramsSize,
 		Buffers:    buffers,
@@ -250,6 +268,17 @@ type wgslEmitter struct {
 	byteBufs                 map[types.Object]bool // free byte-slice buffers, packed 4 per u32 word
 	tmpIdx, tmpShift, tmpRet string                // collision-free WGSL names used by packed byte stores
 	byteRetCounter           int                   // numbers inlined-call result temporaries for packed byte stores
+
+	// tables/tableOrder/freshName support constant string lookup tables
+	// (T[x] where T is a Go string constant). tables maps the constant
+	// object to its emitted WGSL name (first use wins); tableOrder records
+	// that first-use order for deterministic module-scope emission.
+	// freshName is transpileWGSL's collision-free name generator, shared
+	// with the packed-byte-store temporaries so table names cannot shadow
+	// any Go identifier, buffer, or Params field.
+	tables     map[*types.Const]string
+	tableOrder []*types.Const
+	freshName  func(string) string
 }
 
 func (e *wgslEmitter) writeIndent() {
@@ -851,6 +880,19 @@ func (e *wgslEmitter) emitExpr(expr ast.Expr) (string, error) {
 		}
 
 	case *ast.IndexExpr:
+		if _, c, ok := constStringOf(e.info, x.X); ok {
+			name, seen := e.tables[c]
+			if !seen {
+				name = e.freshName(wgslSafeIdent(c.Name()) + "_tbl")
+				e.tables[c] = name
+				e.tableOrder = append(e.tableOrder, c)
+			}
+			idx, err := e.emitExpr(x.Index)
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%s[u32(%s)]", name, idx), nil
+		}
 		base, err := e.emitExpr(x.X)
 		if err != nil {
 			return "", err

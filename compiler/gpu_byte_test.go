@@ -349,3 +349,90 @@ func TestGPUPackedByteWriteOwnershipAccepted(t *testing.T) {
 		transpileOK(t, src)
 	}
 }
+
+const hexGPUSrc = `
+package p
+
+const hextable = "0123456789abcdef"
+
+func Encode(dst, src []byte) {
+	go for i := range dst {
+		v := src[i>>1]
+		if i%2 == 0 {
+			dst[i] = hextable[v>>4]
+		} else {
+			dst[i] = hextable[v&0x0f]
+		}
+	}
+}
+`
+
+const hexSrcGPUSrc = `
+package p
+
+const hextable = "0123456789abcdef"
+
+func EncodeSrc(dst, src []byte) {
+	go for i := range src {
+		dst[i*2] = hextable[src[i]>>4]
+		dst[i*2+1] = hextable[src[i]&0x0f]
+	}
+}
+`
+
+func TestGPUTableHexEncodeEligible(t *testing.T) {
+	for name, src := range map[string]string{"Encode": hexGPUSrc, "EncodeSrc": hexSrcGPUSrc} {
+		t.Run(name, func(t *testing.T) {
+			wgsl := transpileOK(t, src)
+			decl := "var<private> hextable_tbl: array<u32, 16> = array<u32, 16>(48u, 49u, 50u, 51u, 52u, 53u, 54u, 55u, 56u, 57u, 97u, 98u, 99u, 100u, 101u, 102u);"
+			if strings.Count(wgsl, decl) != 1 {
+				t.Errorf("want exactly one table declaration %q:\n%s", decl, wgsl)
+			}
+			if strings.Index(wgsl, decl) > strings.Index(wgsl, "@compute") {
+				t.Errorf("table must be declared at module scope before the entry point:\n%s", wgsl)
+			}
+			if !strings.Contains(wgsl, "hextable_tbl[") {
+				t.Errorf("table not referenced:\n%s", wgsl)
+			}
+		})
+	}
+}
+
+func TestGPUTableIndexUnprovenRejected(t *testing.T) {
+	for _, tc := range []struct{ name, idx string }{
+		{"raw int", "src[i]"},
+		{"mask too wide", "src[i] & 0x1f"},
+		{"shift too small", "byte(src[i]) >> 3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "package p\n\nconst tbl = \"0123456789abcdef\"\n\nfunc f(dst []byte, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = tbl[" + tc.idx + "]\n\t}\n}\n"
+			plan := parseAndAnalyzeGPULoop(t, src, 1)
+			if !strings.Contains(plan.Reject, "table index") {
+				t.Fatalf("Reject = %q, want a table index rejection", plan.Reject)
+			}
+		})
+	}
+}
+
+func TestGPUTableIndexProvenAccepted(t *testing.T) {
+	for _, tc := range []struct{ name, idx string }{
+		{"mask", "src[i] & 0x0f"},
+		{"mask rev", "0x0f & src[i]"},
+		{"byte shift", "byte(src[i]) >> 4"},
+		{"literal", "3"},
+		{"unsigned mod", "uint32(src[i]) % 16"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "package p\n\nconst tbl = \"0123456789abcdef\"\n\nfunc f(dst []byte, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = tbl[" + tc.idx + "]\n\t}\n}\n"
+			transpileOK(t, src)
+		})
+	}
+}
+
+func TestGPUTableNoTableUnchangedOutput(t *testing.T) {
+	// A kernel without tables must not gain any var<private> line.
+	wgsl := transpileOK(t, "package p\n\nfunc f(dst, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = src[i] + 1\n\t}\n}\n")
+	if strings.Contains(wgsl, "var<private>") {
+		t.Errorf("unexpected table declaration:\n%s", wgsl)
+	}
+}
