@@ -503,6 +503,13 @@ func (a *gpuAnalyzer) checkCall(call *ast.CallExpr, depth int) string {
 		if obj := a.info.Uses[fun]; obj != nil {
 			if tn, ok := obj.(*types.TypeName); ok && tn.Parent() == types.Universe {
 				// Predeclared type conversion: int(x), float32(x), etc.
+				if tn.Name() == "byte" || tn.Name() == "uint8" {
+					if len(call.Args) == 1 {
+						if b := asByteConversionSourceBasic(a.info, call.Args[0]); b != nil && b.Info()&types.IsFloat != 0 {
+							return "conversion from float to byte not eligible for GPU offload (out-of-range semantics differ)"
+						}
+					}
+				}
 				approved = true
 				break
 			}
@@ -1131,6 +1138,28 @@ func asBasic(t types.Type) *types.Basic {
 	return b
 }
 
+// asByteConversionSourceBasic resolves arg's Go type to its underlying
+// *types.Basic, unwrapping a *types.SPMDType (lanes.Varying[T]) first, for
+// the sole purpose of checking whether a byte(x)/uint8(x) conversion's
+// argument is a float. Returns nil if arg's type is not a basic type (or is
+// unresolvable), which the caller treats as "not a float" -- the reverse
+// mistake (accepting a float conversion) is the one that produces silently
+// wrong results, not the other way around.
+func asByteConversionSourceBasic(info *types.Info, arg ast.Expr) *types.Basic {
+	t := info.TypeOf(arg)
+	if t == nil {
+		return nil
+	}
+	if s, ok := t.(*types.SPMDType); ok {
+		t = s.Elem()
+	}
+	if t == nil {
+		return nil
+	}
+	b, _ := t.Underlying().(*types.Basic)
+	return b
+}
+
 // basicWGSLType maps an int/int32/uint32/float32/bool basic type to its
 // WGSL scalar name, rejecting unsupported basic kinds (notably float64,
 // per §D2/§D4).
@@ -1151,6 +1180,11 @@ func basicWGSLType(t *types.Basic) (string, string) {
 		// WGSL has a bool type but no dedicated buffer element mapping is
 		// defined by the design doc; treat as i32-compatible (0/1) for now.
 		return "i32", ""
+	case types.Uint8:
+		// A Go byte is carried as a WGSL u32 holding a value in [0, 255];
+		// the WGSL emitter re-establishes that range after every
+		// overflowing operation (see wgslEmitter.isByteExpr).
+		return "u32", ""
 	default:
 		return "", fmt.Sprintf("unsupported basic type for GPU offload: %s", t.String())
 	}

@@ -570,6 +570,21 @@ func (e *wgslEmitter) declareLocal(ident *ast.Ident) string {
 	return name
 }
 
+// isByteExpr reports whether x has Go type uint8 (possibly as
+// lanes.Varying[uint8]). Such values are carried as WGSL u32 restricted to
+// [0, 255]; overflowing operations must mask back into that range.
+func (e *wgslEmitter) isByteExpr(x ast.Expr) bool {
+	t := e.info.TypeOf(x)
+	if s, ok := t.(*types.SPMDType); ok {
+		t = s.Elem()
+	}
+	if t == nil {
+		return false
+	}
+	b, ok := t.Underlying().(*types.Basic)
+	return ok && b.Kind() == types.Uint8
+}
+
 // emitExpr lowers a single expression to WGSL text.
 func (e *wgslEmitter) emitExpr(expr ast.Expr) (string, error) {
 	switch x := expr.(type) {
@@ -616,7 +631,18 @@ func (e *wgslEmitter) emitExpr(expr ast.Expr) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("(%s %s %s)", lhs, op, rhs), nil
+		out := fmt.Sprintf("(%s %s %s)", lhs, op, rhs)
+		switch x.Op {
+		case token.ADD, token.SUB, token.MUL, token.SHL:
+			// A uint8 result of one of these ops can leave [0, 255]; every
+			// other Go byte op (/ % >> & | ^, comparisons) is
+			// range-preserving and needs no mask -- see the file comment
+			// and isByteExpr.
+			if e.isByteExpr(x) {
+				out = "(" + out + " & 0xffu)"
+			}
+		}
+		return out, nil
 
 	case *ast.UnaryExpr:
 		s, err := e.emitExpr(x.X)
@@ -625,6 +651,10 @@ func (e *wgslEmitter) emitExpr(expr ast.Expr) (string, error) {
 		}
 		switch x.Op {
 		case token.SUB:
+			if e.isByteExpr(x) {
+				// WGSL has no unary minus on u32.
+				return "((0u - " + s + ") & 0xffu)", nil
+			}
 			return "(-" + s + ")", nil
 		case token.NOT:
 			return "(!" + s + ")", nil
@@ -719,6 +749,21 @@ func (e *wgslEmitter) emitCall(call *ast.CallExpr) (string, error) {
 // conversions (int(x) -> i32(x)) and for builtin function calls
 // (sqrt(x)) which share the same "name(args)" shape.
 func (e *wgslEmitter) emitConversion(name string, args []ast.Expr) (string, error) {
+	// byte(x)/uint8(x) mask their result into [0, 255] like every other
+	// overflowing byte op (see the file comment); handled here, before the
+	// generic path below, because that path joins args with the target
+	// name as a plain call and has no notion of masking.
+	if name == "byte" || name == "uint8" {
+		if len(args) != 1 {
+			return "", fmt.Errorf("transpileWGSL: %s conversion takes one argument", name)
+		}
+		s, err := e.emitExpr(args[0])
+		if err != nil {
+			return "", err
+		}
+		return "(u32(" + s + ") & 0xffu)", nil
+	}
+
 	wgslName := name
 	switch name {
 	case "int", "int32":
@@ -840,7 +885,7 @@ func wgslTypeOf(t types.Type) (string, error) {
 	switch basic.Kind() {
 	case types.Int, types.Int32:
 		return "i32", nil
-	case types.Uint, types.Uint32:
+	case types.Uint, types.Uint32, types.Uint8:
 		return "u32", nil
 	case types.Float32:
 		return "f32", nil
