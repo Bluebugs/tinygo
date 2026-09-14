@@ -255,19 +255,9 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 		return e.emitAssign(x, retTarget)
 
 	case *ast.IncDecStmt:
-		lv, err := e.emitExpr(x.X)
+		lv, rhs, err := e.incDecText(x)
 		if err != nil {
 			return err
-		}
-		op := "+"
-		if x.Tok == token.DEC {
-			op = "-"
-		}
-		rhs := fmt.Sprintf("(%s %s 1)", lv, op)
-		if e.isByteExpr(x.X) {
-			// ++/-- on a byte value is ADD/SUB in disguise and can leave
-			// [0, 255] just like the binary-operator case above.
-			rhs = "(" + rhs + " & 0xffu)"
 		}
 		e.writeIndent()
 		fmt.Fprintf(e.sb, "%s = %s;\n", lv, rhs)
@@ -316,15 +306,11 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 			condTxt = s
 		}
 		if post, ok := x.Post.(*ast.IncDecStmt); ok && x.Post != nil {
-			lv, err := e.emitExpr(post.X)
+			lv, rhs, err := e.incDecText(post)
 			if err != nil {
 				return err
 			}
-			op := "+"
-			if post.Tok == token.DEC {
-				op = "-"
-			}
-			postTxt = fmt.Sprintf("%s = (%s %s 1)", lv, lv, op)
+			postTxt = fmt.Sprintf("%s = %s", lv, rhs)
 		}
 		e.writeIndent()
 		fmt.Fprintf(e.sb, "for (%s; %s; %s) {\n", initTxt, condTxt, postTxt)
@@ -600,6 +586,30 @@ func (e *wgslEmitter) isByteExpr(x ast.Expr) bool {
 	}
 	b, ok := t.Underlying().(*types.Basic)
 	return ok && b.Kind() == types.Uint8
+}
+
+// incDecText lowers an IncDecStmt's `x++`/`x--` to its WGSL lvalue text and
+// the masked-as-needed RHS text (`(lv + 1)` or `(lv - 1)`, wrapped in
+// `(... & 0xffu)` when x.X is a byte value). Shared by emitStmt's
+// *ast.IncDecStmt case and the *ast.ForStmt post-clause handling below, so
+// a byte-typed classic-for counter (`for b := byte(250); b != 4; b++`)
+// wraps at 256 exactly like Go on both paths.
+func (e *wgslEmitter) incDecText(x *ast.IncDecStmt) (lv, rhs string, err error) {
+	lv, err = e.emitExpr(x.X)
+	if err != nil {
+		return "", "", err
+	}
+	op := "+"
+	if x.Tok == token.DEC {
+		op = "-"
+	}
+	rhs = fmt.Sprintf("(%s %s 1)", lv, op)
+	if e.isByteExpr(x.X) {
+		// ++/-- on a byte value is ADD/SUB in disguise and can leave
+		// [0, 255] just like the binary-operator case above.
+		rhs = "(" + rhs + " & 0xffu)"
+	}
+	return lv, rhs, nil
 }
 
 // emitExpr lowers a single expression to WGSL text.

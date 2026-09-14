@@ -191,6 +191,50 @@ func f(dst []uint32, src []uint32, n int32) {
 	}
 }
 
+func TestGPUByteForPostCounterWraps(t *testing.T) {
+	src := `
+package p
+
+func f(dst, src []uint32) {
+	go for i := range len(src) {
+		var sum uint32 = 0
+		var b byte = 250
+		for ; b != 4; b++ {
+			sum++
+		}
+		dst[i] = src[i] + sum
+	}
+}
+`
+	wgsl := transpileOK(t, src)
+	// Isolate the for-post masking from the (already-tested) byte-var
+	// declaration and DeclStmt/IncDecStmt-outside-a-for-loop masking: the
+	// post clause itself, "b = (...)", must be the thing carrying the mask.
+	if !strings.Contains(wgsl, "b = ((b + 1) & 0xffu)") {
+		t.Errorf("byte counter in for-loop post clause must be masked with & 0xffu:\n%s", wgsl)
+	}
+}
+
+func TestGPUIntForPostCounterNotWrapped(t *testing.T) {
+	src := `
+package p
+
+func f(dst, src []uint32) {
+	go for i := range len(src) {
+		var sum uint32 = 0
+		for c := 0; c != 4; c++ {
+			sum++
+		}
+		dst[i] = src[i] + sum
+	}
+}
+`
+	wgsl := transpileOK(t, src)
+	if strings.Contains(wgsl, "0xffu") {
+		t.Errorf("int counter in for-loop post clause must not be masked:\n%s", wgsl)
+	}
+}
+
 func TestGPUNarrowSignedStillRejected(t *testing.T) {
 	for _, ty := range []string{"int8", "int16", "uint16"} {
 		t.Run(ty, func(t *testing.T) {
