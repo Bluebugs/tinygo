@@ -67,6 +67,8 @@ func spmdGPULaunchC(kernelID int32, n uint32, params unsafe.Pointer, paramsLen u
 //	2  write-only: do NOT upload, read back after.
 type gpuBufferDesc struct {
 	dataPtr uintptr
+	// byteLen is the Go byte length; the device buffer is rounded up to a
+	// multiple of 4.
 	byteLen uint32
 	mode    uint32
 }

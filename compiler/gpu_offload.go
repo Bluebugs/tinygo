@@ -65,7 +65,7 @@ type gpuLoopOffload struct {
 // the guard point (the end of the loop's EntryBlock), so b.getValue on them is
 // safe there.
 type gpuLaunchArgs struct {
-	bound   ssa.Value   // trip count; Params[0] ("n") and the launch's n argument
+	bound   ssa.Value   // trip count; Params[0] ("n"), and the launch's n argument after dividing by LanesPerInvocation
 	scalars []ssa.Value // one per kernel.Params[1:], same order
 	buffers []ssa.Value // one per kernel.Buffers, same order
 }
@@ -365,8 +365,8 @@ func (b *builder) gpuResolveArgs(loop *spmdActiveLoop, k *gpuKernel) (*gpuLaunch
 		if !ok {
 			return nil, fmt.Sprintf("buffer %s is not a slice", bufv.Obj.Name())
 		}
-		if size := b.targetData.TypeAllocSize(b.getLLVMType(slice.Elem())); size != 4 {
-			return nil, fmt.Sprintf("buffer %s has %d-byte elements, WGSL storage buffers require 4", bufv.Obj.Name(), size)
+		if size := b.targetData.TypeAllocSize(b.getLLVMType(slice.Elem())); size != 1 && size != 4 {
+			return nil, fmt.Sprintf("buffer %s has %d-byte elements, GPU buffers support 1 (packed) or 4", bufv.Obj.Name(), size)
 		}
 		args.buffers = append(args.buffers, v)
 	}
@@ -549,9 +549,21 @@ func (b *builder) gpuEmitGuard(loop *spmdActiveLoop) {
 	paramsPtr, paramsSize := b.gpuBuildParams(loop, bound, pos)
 	bufsPtr, bufCount := b.gpuBuildBuffers(loop, bound, pos)
 	i32 := b.ctx.Int32Type()
+	// launchN counts compute INVOCATIONS, not loop iterations: the host
+	// dispatches ceil(launchN / wgslWorkgroupSize) workgroups, and each
+	// invocation runs k.LanesPerInvocation iterations (Params.n, set from
+	// bound above, still bounds the iteration index in the shader).
+	launchN := b.gpuToI32(bound, false)
+	if k.LanesPerInvocation > 1 {
+		if k.LanesPerInvocation != 4 {
+			panic(fmt.Sprintf("gpu: kernel %s has unsupported LanesPerInvocation %d", k.Entry, k.LanesPerInvocation))
+		}
+		launchN = b.CreateLShr(b.CreateAdd(launchN, llvm.ConstInt(i32, 3, false), ""),
+			llvm.ConstInt(i32, 2, false), "gpu.launch.n")
+	}
 	b.createRuntimeCall("spmdGPULaunch", []llvm.Value{
 		llvm.ConstInt(i32, uint64(k.ID), true),
-		b.gpuToI32(bound, false),
+		launchN,
 		paramsPtr,
 		llvm.ConstInt(i32, uint64(paramsSize), false),
 		bufsPtr,
@@ -624,7 +636,11 @@ func (b *builder) gpuBuildParams(loop *spmdActiveLoop, bound llvm.Value, pos tok
 // gpuBufferDesc is {uptr dataPtr, u32 byteLen, u32 mode} -- see
 // src/runtime/gpu_wasm.go (wasm32, where the JS glue reads it as a flat
 // stride-3 Uint32Array) and src/runtime/gpu_native.go (native, 8-byte
-// dataPtr).  The layout is load-bearing on both sides; the
+// dataPtr).  byteLen is the Go byte length of the slice (len * elemSize);
+// the host rounds the device buffer up to a multiple of 4 and reads back
+// exactly byteLen bytes.  Byte slices travel unmodified, packed four per
+// WGSL u32 word (little-endian), so hosts never need the element size.
+// The layout is load-bearing on both sides; the
 // write-only optimization below therefore encodes itself as a new *value*
 // of the existing mode field (2), never as an extra field.
 //
@@ -675,9 +691,16 @@ func (b *builder) gpuBuildBuffers(loop *spmdActiveLoop, bound llvm.Value, pos to
 		// no narrowing happens on either target: i32 on wasm32, i64 on
 		// native, both exactly uintptrType.
 		dataPtr := b.CreatePtrToInt(b.CreateExtractValue(slice, 0, ""), ptrInt, "")
-		// Element size is asserted to be 4 in gpuResolveArgs.
-		byteLen := b.CreateShl(b.gpuToI32(b.CreateExtractValue(slice, 1, ""), false),
-			llvm.ConstInt(i32, 2, false), "")
+		// byteLen is the Go byte length of the slice. gpuResolveArgs admits
+		// 1-byte elements (byte slices, uploaded unmodified and packed four
+		// per u32 word by the shader; hosts round the device buffer up to a
+		// multiple of 4 and read back exactly byteLen) and 4-byte elements.
+		// No i32 overflow: gpuEmitGuard bounds n by gpuMaxSafeTrip, and
+		// gpuMaxSafeTrip*4 < 2^32.
+		byteLen := b.gpuToI32(b.CreateExtractValue(slice, 1, ""), false)
+		if b.targetData.TypeAllocSize(b.getLLVMType(bufv.Obj.Type().Underlying().(*types.Slice).Elem())) == 4 {
+			byteLen = b.CreateShl(byteLen, llvm.ConstInt(i32, 2, false), "")
+		}
 		// mode 0 = read-only (upload, no readback)
 		// mode 1 = read-write (upload AND read back)
 		// mode 2 = write-only (do NOT upload, but read back)

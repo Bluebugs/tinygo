@@ -50,6 +50,8 @@ func gpuLaunch(kernelID int32, n uint32, paramsPtr unsafe.Pointer, paramsLen uin
 // Any mode other than 0 is read back.
 type gpuBufferDesc struct {
 	dataPtr uint32
+	// byteLen is the Go byte length; the device buffer is rounded up to a
+	// multiple of 4.
 	byteLen uint32
 	mode    uint32
 }

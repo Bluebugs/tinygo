@@ -389,10 +389,20 @@ static int32_t spmd_gpu_launch_locked(int32_t kernelID, uint32_t n,
         // mode 2 (write-only, every element provably written by the kernel)
         // skips the upload; modes 0 and 1 upload. See gpuBuildBuffers.
         if (desc[i].mode != 2) {
-            uint32_t len = (desc[i].byteLen + 3u) & ~3u;
-            if (len > 0) {
-                wgpuQueueWriteBuffer(g_queue, g_buffers[i].dev, 0,
-                                     (const void *)(uintptr_t)desc[i].dataPtr, len);
+            // WebGPU writes must be 4-byte aligned, but byteLen is the Go
+            // byte length (a packed byte slice need not be a multiple of 4)
+            // and reading past it could run off the end of a mapping. Write
+            // the aligned prefix straight from Go memory and the trailing
+            // 1-3 bytes from a zero-padded stack word.
+            const uint8_t *data = (const uint8_t *)(uintptr_t)desc[i].dataPtr;
+            uint32_t aligned = desc[i].byteLen & ~3u;
+            if (aligned > 0) {
+                wgpuQueueWriteBuffer(g_queue, g_buffers[i].dev, 0, data, aligned);
+            }
+            if (aligned != desc[i].byteLen) {
+                uint8_t tail[4] = {0, 0, 0, 0};
+                memcpy(tail, data + aligned, desc[i].byteLen - aligned);
+                wgpuQueueWriteBuffer(g_queue, g_buffers[i].dev, aligned, tail, 4);
             }
         }
     }
@@ -503,6 +513,9 @@ static int32_t spmd_gpu_launch_locked(int32_t kernelID, uint32_t n,
         if (src == NULL) {
             ok = 0;
         } else {
+            // Exactly byteLen, never the 4-aligned staging length: this is
+            // what makes packed byte buffers safe, since the bytes past a
+            // byte slice's end belong to the caller (e.g. a sub-slice).
             memcpy((void *)(uintptr_t)desc[i].dataPtr, src, desc[i].byteLen);
         }
         wgpuBufferUnmap(g_buffers[i].staging);

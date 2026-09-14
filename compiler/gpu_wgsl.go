@@ -40,6 +40,13 @@ type gpuKernel struct {
 	Params     []gpuFreeVar // uniform scalars, in Params struct field order (excluding trailing alignment padding); Task 6 iterates this to fill the uniform buffer
 	ParamsSize uint32       // total byte size of the Params struct incl. padding (wgslprint.PadTo16-computed); Task 6 asserts LLVM struct size equals this
 	Buffers    []gpuFreeVar // slices, in @binding order starting at 1
+
+	// LanesPerInvocation is how many loop iterations one compute invocation
+	// runs: 4 when any buffer is a byte slice (bytes are packed four per
+	// u32 word, and an invocation owns whole words), else 1. The launch n
+	// argument is ceil(trip count / LanesPerInvocation); Params.n stays the
+	// trip count.
+	LanesPerInvocation int
 }
 
 // wgslWorkgroupSize is the fixed 1-D workgroup size used for every kernel.
@@ -65,6 +72,7 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		freeSubst: map[types.Object]string{},
 		locals:    map[types.Object]string{},
 		inlined:   plan.Inlined,
+		byteBufs:  map[types.Object]bool{},
 	}
 
 	// Params: RULING B - "n" (the launch trip count) is always the
@@ -108,7 +116,42 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		bufNames[b.Obj] = name
 		e.freeSubst[b.Obj] = name
 		buffers[i].Obj = b.Obj // no-op, keeps order explicit
+		if gpuIsByteSlice(b.Obj.Type()) {
+			e.byteBufs[b.Obj] = true
+		}
 	}
+	lanes := 1
+	if len(e.byteBufs) > 0 {
+		lanes = 4
+	}
+
+	// The packed byte store declares WGSL lets; pick names that cannot
+	// shadow any Go identifier or buffer the store's operands refer to.
+	taken := map[string]bool{"params": true}
+	for _, name := range bufNames {
+		taken[name] = true
+	}
+	collect := func(n ast.Node) {
+		ast.Inspect(n, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok {
+				taken[id.Name] = true
+			}
+			return true
+		})
+	}
+	collect(plan.Body)
+	for _, decl := range plan.Inlined {
+		collect(decl)
+	}
+	fresh := func(base string) string {
+		name := base
+		for i := 1; taken[name] || wgslReservedWords[name]; i++ {
+			name = fmt.Sprintf("%s_%d", base, i)
+		}
+		taken[name] = true
+		return name
+	}
+	e.tmpIdx, e.tmpShift, e.tmpRet = fresh("j"), fresh("sh"), fresh("spmd_bret")
 
 	padFields := wgslprint.PadTo16(len(params))
 	paramsSize := uint32((len(params) + padFields) * 4)
@@ -153,13 +196,28 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 	}
 	fmt.Fprintf(&sb, "@compute @workgroup_size(%d)\n", wgslWorkgroupSize)
 	fmt.Fprintf(&sb, "fn %s(@builtin(global_invocation_id) gid: vec3<u32>) {\n", entry)
-	fmt.Fprintf(&sb, "  let %s: i32 = i32(gid.x);\n", e.iterIdent)
-	fmt.Fprintf(&sb, "  if (%s >= params.n) { return; }\n", e.iterIdent)
-
 	e.sb = &sb
-	e.indent = 1
+	if lanes == 1 {
+		fmt.Fprintf(&sb, "  let %s: i32 = i32(gid.x);\n", e.iterIdent)
+		fmt.Fprintf(&sb, "  if (%s >= params.n) { return; }\n", e.iterIdent)
+		e.indent = 1
+	} else {
+		// A body-level Go `continue` lowers to WGSL `continue;`, which
+		// now targets this lane loop: exactly "next iteration". Body-level
+		// `break` is ineligible (checkStmt), so no Go break can end it.
+		w := fresh("w")
+		lane := fresh("lane")
+		fmt.Fprintf(&sb, "  let %s: u32 = gid.x;\n", w)
+		fmt.Fprintf(&sb, "  for (var %s: u32 = 0u; %s < %du; %s++) {\n", lane, lane, lanes, lane)
+		fmt.Fprintf(&sb, "    let %s: i32 = i32(%s * %du + %s);\n", e.iterIdent, w, lanes, lane)
+		fmt.Fprintf(&sb, "    if (%s >= params.n) { break; }\n", e.iterIdent)
+		e.indent = 2
+	}
 	if err := e.emitStmts(plan.Body.List, ""); err != nil {
 		return nil, err
+	}
+	if lanes != 1 {
+		sb.WriteString("  }\n")
 	}
 	sb.WriteString("}\n")
 
@@ -170,6 +228,8 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		Params:     params,
 		ParamsSize: paramsSize,
 		Buffers:    buffers,
+
+		LanesPerInvocation: lanes,
 	}, nil
 }
 
@@ -186,6 +246,10 @@ type wgslEmitter struct {
 	indent        int
 	inlineSuffix  string // "" when not inlining; else "_iN" for the Nth inline expansion (monotonic per call site, not per depth)
 	inlineCounter int    // monotonically increasing across the whole transpile; never reset on inline-exit
+
+	byteBufs                 map[types.Object]bool // free byte-slice buffers, packed 4 per u32 word
+	tmpIdx, tmpShift, tmpRet string                // collision-free WGSL names used by packed byte stores
+	byteRetCounter           int                   // numbers inlined-call result temporaries for packed byte stores
 }
 
 func (e *wgslEmitter) writeIndent() {
@@ -255,6 +319,13 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 		return e.emitAssign(x, retTarget)
 
 	case *ast.IncDecStmt:
+		if idx, ok := e.packedByteTarget(x.X); ok {
+			op := "+"
+			if x.Tok == token.DEC {
+				op = "-"
+			}
+			return e.emitPackedByteUpdate(idx, op, "1")
+		}
 		lv, rhs, err := e.incDecText(x)
 		if err != nil {
 			return err
@@ -306,6 +377,9 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 			condTxt = s
 		}
 		if post, ok := x.Post.(*ast.IncDecStmt); ok && x.Post != nil {
+			if _, packed := e.packedByteTarget(post.X); packed {
+				return fmt.Errorf("transpileWGSL: unsupported byte-slice element as for-loop post target")
+			}
 			lv, rhs, err := e.incDecText(post)
 			if err != nil {
 				return err
@@ -420,6 +494,17 @@ func (e *wgslEmitter) emitAssign(x *ast.AssignStmt, retTarget string) error {
 		return err
 	}
 
+	if idx, ok := e.packedByteTarget(x.Lhs[0]); ok {
+		if x.Tok == token.ASSIGN {
+			return e.emitPackedByteStore(idx, rhs)
+		}
+		op, ok := compoundAssignOp(x.Tok)
+		if !ok {
+			return fmt.Errorf("transpileWGSL: internal error: unmapped assignment operator %s (eligibility allowlist and compoundAssignOp disagree)", x.Tok)
+		}
+		return e.emitPackedByteUpdate(idx, op, rhs)
+	}
+
 	if x.Tok == token.DEFINE {
 		ident, ok := x.Lhs[0].(*ast.Ident)
 		if !ok {
@@ -478,6 +563,7 @@ func (e *wgslEmitter) emitAssign(x *ast.AssignStmt, retTarget string) error {
 // multi-return SPMD functions before a plan reaches here).
 func (e *wgslEmitter) emitInlinedCall(assign *ast.AssignStmt, call *ast.CallExpr, decl *ast.FuncDecl, outerRetTarget string) error {
 	var lhsName string
+	var packedIdx *ast.IndexExpr // non-nil: lhsName is a temporary to store into this packed byte element
 	var lhsWGSLTy string
 	if assign.Tok == token.DEFINE {
 		ident, ok := assign.Lhs[0].(*ast.Ident)
@@ -492,6 +578,18 @@ func (e *wgslEmitter) emitInlinedCall(assign *ast.AssignStmt, call *ast.CallExpr
 		lhsWGSLTy = ty
 		e.writeIndent()
 		fmt.Fprintf(e.sb, "var %s: %s;\n", lhsName, lhsWGSLTy)
+	} else if idx, ok := e.packedByteTarget(assign.Lhs[0]); ok {
+		// A packed byte element is not a WGSL lvalue: collect the callee's
+		// result in a temporary and store it once the body is spliced.
+		if assign.Tok != token.ASSIGN {
+			return fmt.Errorf("transpileWGSL: unsupported %s of an inlined call into a byte slice", assign.Tok)
+		}
+		e.byteRetCounter++
+		tmp := fmt.Sprintf("%s_%d", e.tmpRet, e.byteRetCounter)
+		e.writeIndent()
+		fmt.Fprintf(e.sb, "var %s: u32;\n", tmp)
+		packedIdx = idx
+		lhsName = tmp
 	} else {
 		lv, err := e.emitExpr(assign.Lhs[0])
 		if err != nil {
@@ -551,6 +649,11 @@ func (e *wgslEmitter) emitInlinedCall(assign *ast.AssignStmt, call *ast.CallExpr
 	if err != nil {
 		return err
 	}
+	if packedIdx != nil {
+		if err := e.emitPackedByteStore(packedIdx, lhsName); err != nil {
+			return err
+		}
+	}
 
 	_ = outerRetTarget // an inlined callee always assigns lhsName directly; nested inlining is depth-limited by gpu_eligible.go
 	return nil
@@ -586,6 +689,64 @@ func (e *wgslEmitter) isByteExpr(x ast.Expr) bool {
 	}
 	b, ok := t.Underlying().(*types.Basic)
 	return ok && b.Kind() == types.Uint8
+}
+
+// isByteSlice reports whether x names a free byte-slice buffer. Such a
+// buffer holds the Go bytes unmodified, packed four per u32 word
+// (little-endian: word w holds bytes 4w..4w+3), so its elements are read
+// and written through packedByteRead / emitPackedByteStore.
+func (e *wgslEmitter) isByteSlice(x ast.Expr) bool {
+	ident, ok := x.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	return e.byteBufs[e.info.Uses[ident]]
+}
+
+// packedByteTarget returns lhs as an index expression when it is an element
+// of a packed byte-slice buffer.
+func (e *wgslEmitter) packedByteTarget(lhs ast.Expr) (*ast.IndexExpr, bool) {
+	idx, ok := lhs.(*ast.IndexExpr)
+	if !ok || !e.isByteSlice(idx.X) {
+		return nil, false
+	}
+	return idx, true
+}
+
+// packedByteRead extracts byte idx from a packed u32-word buffer.
+func packedByteRead(buf, idx string) string {
+	return fmt.Sprintf("((%s[u32(%s) >> 2u] >> ((u32(%s) & 3u) * 8u)) & 0xffu)", buf, idx, idx)
+}
+
+// emitPackedByteStore writes the byte value text v into element idx of a
+// packed byte buffer by rewriting only that byte of its owning word. The
+// eligibility gate (writeIndexReject) guarantees no other invocation
+// touches the word.
+func (e *wgslEmitter) emitPackedByteStore(idx *ast.IndexExpr, v string) error {
+	buf, err := e.emitExpr(idx.X)
+	if err != nil {
+		return err
+	}
+	i, err := e.emitExpr(idx.Index)
+	if err != nil {
+		return err
+	}
+	j, sh := e.tmpIdx, e.tmpShift
+	e.writeIndent()
+	fmt.Fprintf(e.sb, "{ let %s = u32(%s); let %s = (%s & 3u) * 8u; %s[%s >> 2u] = (%s[%s >> 2u] & ~(0xffu << %s)) | ((%s & 0xffu) << %s); }\n",
+		j, i, sh, j, buf, j, buf, j, sh, v, sh)
+	return nil
+}
+
+// emitPackedByteUpdate lowers `s[E] op= rhs` (and ++/-- with rhs "1") on a
+// packed byte element: the old value is the packed read, and the store's
+// `& 0xffu` wraps the result like Go's byte arithmetic.
+func (e *wgslEmitter) emitPackedByteUpdate(idx *ast.IndexExpr, op, rhs string) error {
+	old, err := e.emitExpr(idx)
+	if err != nil {
+		return err
+	}
+	return e.emitPackedByteStore(idx, fmt.Sprintf("(%s %s %s)", old, op, rhs))
 }
 
 // incDecText lowers an IncDecStmt's `x++`/`x--` to its WGSL lvalue text and
@@ -697,6 +858,9 @@ func (e *wgslEmitter) emitExpr(expr ast.Expr) (string, error) {
 		idx, err := e.emitExpr(x.Index)
 		if err != nil {
 			return "", err
+		}
+		if e.isByteSlice(x.X) {
+			return packedByteRead(base, idx), nil
 		}
 		return fmt.Sprintf("%s[%s]", base, idx), nil
 

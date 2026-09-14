@@ -246,3 +246,106 @@ func TestGPUNarrowSignedStillRejected(t *testing.T) {
 		})
 	}
 }
+
+func TestGPUPackedByteReadWrite(t *testing.T) {
+	src := `
+package p
+
+func f(dst, src []byte) {
+	go for i := range len(src) {
+		dst[i] = src[i]*3 + 7
+	}
+}
+`
+	wgsl := transpileOK(t, src)
+	for _, want := range []string{
+		"var<storage, read> src: array<u32>;",
+		"var<storage, read_write> dst: array<u32>;",
+		"for (var lane: u32 = 0u; lane < 4u; lane++)",
+		">> 2u] >> ((u32(i) & 3u) * 8u)) & 0xffu)", // packed byte read of src
+		"& ~(0xffu << sh)) | (",                    // read-modify-write store into dst
+	} {
+		if !strings.Contains(wgsl, want) {
+			t.Errorf("WGSL missing %q:\n%s", want, wgsl)
+		}
+	}
+}
+
+func TestGPUNoByteBufferNoLaneLoop(t *testing.T) {
+	wgsl := transpileOK(t, "package p\n\nfunc f(dst, src []int32, b byte) {\n\tgo for i := range len(src) {\n\t\tdst[i] = src[i] + int32(b)\n\t}\n}\n")
+	if strings.Contains(wgsl, "lane") {
+		t.Errorf("kernel without byte buffers must keep the one-lane entry point:\n%s", wgsl)
+	}
+}
+
+func TestGPUPackedLanesPerInvocation(t *testing.T) {
+	for _, tc := range []struct {
+		name, src string
+		want      int
+	}{
+		{"byte", "package p\n\nfunc f(dst, src []byte) {\n\tgo for i := range len(src) {\n\t\tdst[i] = src[i]\n\t}\n}\n", 4},
+		{"int32", "package p\n\nfunc f(dst, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = src[i]\n\t}\n}\n", 1},
+		{"byte read only", "package p\n\nfunc f(dst []int32, src []byte) {\n\tgo for i := range len(src) {\n\t\tdst[i] = int32(src[i])\n\t}\n}\n", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := parseAndAnalyzeGPULoop(t, tc.src, 1)
+			if plan.Reject != "" {
+				t.Fatalf("plan rejected: %s", plan.Reject)
+			}
+			k, err := transpileWGSL(plan, 0)
+			if err != nil {
+				t.Fatalf("transpileWGSL: %v", err)
+			}
+			if k.LanesPerInvocation != tc.want {
+				t.Errorf("LanesPerInvocation = %d, want %d", k.LanesPerInvocation, tc.want)
+			}
+		})
+	}
+}
+
+func TestGPUPackedContinueStaysInLaneLoop(t *testing.T) {
+	src := `
+package p
+
+func f(dst, src []byte) {
+	go for i := range len(src) {
+		if src[i] == 0 {
+			continue
+		}
+		dst[i] = src[i]
+	}
+}
+`
+	wgsl := transpileOK(t, src)
+	body := wgsl[strings.Index(wgsl, "for (var lane"):]
+	if strings.Contains(body, "return;") && !strings.Contains(body, "continue;") {
+		t.Errorf("a Go continue must continue the lane loop, not return from the invocation:\n%s", wgsl)
+	}
+}
+
+func TestGPUPackedByteWriteOwnershipRejected(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"offset not word aligned", "dst[i+1] = src[i]", "slice write index"},
+		{"read while written", "dst[i] = dst[i] + src[i]", "both read and written"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "package p\n\nfunc f(dst, src []byte) {\n\tgo for i := range len(src) {\n\t\t" + tc.body + "\n\t}\n}\n"
+			plan := parseAndAnalyzeGPULoop(t, src, 1)
+			if !strings.Contains(plan.Reject, tc.want) {
+				t.Fatalf("Reject = %q, want %q", plan.Reject, tc.want)
+			}
+		})
+	}
+}
+
+func TestGPUPackedByteWriteOwnershipAccepted(t *testing.T) {
+	for _, body := range []string{
+		"dst[i] = src[i]",
+		"dst[i*2] = src[i]\n\t\tdst[i*2+1] = src[i]",
+		"dst[i*4+4] = src[i]",
+		"dst[i]++",
+	} {
+		src := "package p\n\nfunc f(dst, src []byte) {\n\tgo for i := range len(src) {\n\t\t" + body + "\n\t}\n}\n"
+		transpileOK(t, src)
+	}
+}
