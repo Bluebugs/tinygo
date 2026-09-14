@@ -129,6 +129,68 @@ func f(dst []byte, src []float32) {
 	}
 }
 
+func TestGPUByteCompoundAssignWraps(t *testing.T) {
+	for _, op := range []string{"+=", "-=", "*="} {
+		t.Run(op, func(t *testing.T) {
+			src := `
+package p
+
+func f(dst []uint32, src []uint32, n byte) {
+	go for i := range len(src) {
+		var v byte = 1
+		v ` + op + ` n
+		dst[i] = src[i] + uint32(v)
+	}
+}
+`
+			wgsl := transpileOK(t, src)
+			if !strings.Contains(wgsl, "& 0xffu)") {
+				t.Errorf("compound assign %s on byte must be masked with & 0xffu:\n%s", op, wgsl)
+			}
+		})
+	}
+}
+
+func TestGPUByteIncDecWraps(t *testing.T) {
+	for _, stmt := range []string{"v++", "v--"} {
+		t.Run(stmt, func(t *testing.T) {
+			src := `
+package p
+
+func f(dst []uint32, src []uint32) {
+	go for i := range len(src) {
+		var v byte = 1
+		` + stmt + `
+		dst[i] = src[i] + uint32(v)
+	}
+}
+`
+			wgsl := transpileOK(t, src)
+			if !strings.Contains(wgsl, "& 0xffu)") {
+				t.Errorf("%s on byte must be masked with & 0xffu:\n%s", stmt, wgsl)
+			}
+		})
+	}
+}
+
+func TestGPUNonByteCompoundAssignNotWrapped(t *testing.T) {
+	src := `
+package p
+
+func f(dst []uint32, src []uint32, n int32) {
+	go for i := range len(src) {
+		var x int32 = 1
+		x += n
+		dst[i] = src[i] + uint32(x)
+	}
+}
+`
+	wgsl := transpileOK(t, src)
+	if strings.Contains(wgsl, "0xffu") {
+		t.Errorf("non-byte compound assign must not be masked:\n%s", wgsl)
+	}
+}
+
 func TestGPUNarrowSignedStillRejected(t *testing.T) {
 	for _, ty := range []string{"int8", "int16", "uint16"} {
 		t.Run(ty, func(t *testing.T) {

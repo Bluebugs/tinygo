@@ -263,8 +263,14 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 		if x.Tok == token.DEC {
 			op = "-"
 		}
+		rhs := fmt.Sprintf("(%s %s 1)", lv, op)
+		if e.isByteExpr(x.X) {
+			// ++/-- on a byte value is ADD/SUB in disguise and can leave
+			// [0, 255] just like the binary-operator case above.
+			rhs = "(" + rhs + " & 0xffu)"
+		}
 		e.writeIndent()
-		fmt.Fprintf(e.sb, "%s = (%s %s 1);\n", lv, lv, op)
+		fmt.Fprintf(e.sb, "%s = %s;\n", lv, rhs)
 		return nil
 
 	case *ast.IfStmt:
@@ -461,8 +467,19 @@ func (e *wgslEmitter) emitAssign(x *ast.AssignStmt, retTarget string) error {
 	if !ok {
 		return fmt.Errorf("transpileWGSL: internal error: unmapped assignment operator %s (eligibility allowlist and compoundAssignOp disagree)", x.Tok)
 	}
+	computed := fmt.Sprintf("(%s %s %s)", lv, op, rhs)
+	switch x.Tok {
+	case token.ADD_ASSIGN, token.SUB_ASSIGN, token.MUL_ASSIGN:
+		// Mirrors the *ast.BinaryExpr ADD/SUB/MUL/SHL masking above: these
+		// compound forms can leave [0, 255] on a byte target. QUO_ASSIGN
+		// (/=) and REM_ASSIGN (%=) are range-preserving, matching the
+		// unmasked QUO/REM binary case, so they are deliberately excluded.
+		if e.isByteExpr(x.Lhs[0]) {
+			computed = "(" + computed + " & 0xffu)"
+		}
+	}
 	e.writeIndent()
-	fmt.Fprintf(e.sb, "%s = (%s %s %s);\n", lv, lv, op, rhs)
+	fmt.Fprintf(e.sb, "%s = %s;\n", lv, computed)
 	return nil
 }
 
