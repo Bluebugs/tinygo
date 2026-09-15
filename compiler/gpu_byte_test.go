@@ -9,6 +9,15 @@ import (
 	"testing"
 )
 
+// lanesImportFor returns the "lanes" import line when a snippet fragment
+// uses it; an unconditional import would be rejected as unused.
+func lanesImportFor(fragment string) string {
+	if strings.Contains(fragment, "lanes.") {
+		return "import \"lanes\"\n\n"
+	}
+	return ""
+}
+
 func transpileOK(t *testing.T, src string) string {
 	t.Helper()
 	plan := parseAndAnalyzeGPULoop(t, src, 1)
@@ -85,9 +94,11 @@ func TestGPUByteConversions(t *testing.T) {
 	src := `
 package p
 
+import "lanes"
+
 func f(dst []uint32, src []int32) {
 	go for i := range len(src) {
-		dst[i] = uint32(byte(src[i]))
+		dst[i] = lanes.Varying[uint32](lanes.Varying[byte](src[i]))
 	}
 }
 `
@@ -117,9 +128,11 @@ func TestGPUByteFromFloatRejected(t *testing.T) {
 	src := `
 package p
 
+import "lanes"
+
 func f(dst []byte, src []float32) {
 	go for i := range len(src) {
-		dst[i] = byte(src[i])
+		dst[i] = lanes.Varying[byte](src[i])
 	}
 }
 `
@@ -285,7 +298,7 @@ func TestGPUPackedLanesPerInvocation(t *testing.T) {
 	}{
 		{"byte", "package p\n\nfunc f(dst, src []byte) {\n\tgo for i := range len(src) {\n\t\tdst[i] = src[i]\n\t}\n}\n", 4},
 		{"int32", "package p\n\nfunc f(dst, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = src[i]\n\t}\n}\n", 1},
-		{"byte read only", "package p\n\nfunc f(dst []int32, src []byte) {\n\tgo for i := range len(src) {\n\t\tdst[i] = int32(src[i])\n\t}\n}\n", 4},
+		{"byte read only", "package p\n\nimport \"lanes\"\n\nfunc f(dst []int32, src []byte) {\n\tgo for i := range len(src) {\n\t\tdst[i] = lanes.Varying[int32](src[i])\n\t}\n}\n", 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan := parseAndAnalyzeGPULoop(t, tc.src, 1)
@@ -406,10 +419,10 @@ func TestGPUTableIndexUnprovenRejected(t *testing.T) {
 	for _, tc := range []struct{ name, idx string }{
 		{"raw int", "src[i]"},
 		{"mask too wide", "src[i] & 0x1f"},
-		{"shift too small", "byte(src[i]) >> 3"},
+		{"shift too small", "lanes.Varying[byte](src[i]) >> 3"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			src := "package p\n\nconst tbl = \"0123456789abcdef\"\n\nfunc f(dst []byte, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = tbl[" + tc.idx + "]\n\t}\n}\n"
+			src := "package p\n\n" + lanesImportFor(tc.idx) + "const tbl = \"0123456789abcdef\"\n\nfunc f(dst []byte, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = tbl[" + tc.idx + "]\n\t}\n}\n"
 			plan := parseAndAnalyzeGPULoop(t, src, 1)
 			if !strings.Contains(plan.Reject, "table index") {
 				t.Fatalf("Reject = %q, want a table index rejection", plan.Reject)
@@ -422,12 +435,12 @@ func TestGPUTableIndexProvenAccepted(t *testing.T) {
 	for _, tc := range []struct{ name, idx string }{
 		{"mask", "src[i] & 0x0f"},
 		{"mask rev", "0x0f & src[i]"},
-		{"byte shift", "byte(src[i]) >> 4"},
+		{"byte shift", "lanes.Varying[byte](src[i]) >> 4"},
 		{"literal", "3"},
-		{"unsigned mod", "uint32(src[i]) % 16"},
+		{"unsigned mod", "lanes.Varying[uint32](src[i]) % 16"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			src := "package p\n\nconst tbl = \"0123456789abcdef\"\n\nfunc f(dst []byte, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = tbl[" + tc.idx + "]\n\t}\n}\n"
+			src := "package p\n\n" + lanesImportFor(tc.idx) + "const tbl = \"0123456789abcdef\"\n\nfunc f(dst []byte, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = tbl[" + tc.idx + "]\n\t}\n}\n"
 			transpileOK(t, src)
 		})
 	}
@@ -473,12 +486,12 @@ func TestGPUForPostCompoundAssign(t *testing.T) {
 func TestGPUShiftCountRejected(t *testing.T) {
 	for _, tc := range []struct{ name, expr string }{
 		{"uniform count", "src[i] << s"},
-		{"varying count", "src[i] >> uint(src[i])"},
+		{"varying count", "src[i] >> lanes.Varying[uint](src[i])"},
 		{"constant too wide", "src[i] << 32"},
-		{"byte constant too wide", "int32(byte(src[i]) >> 8)"},
+		{"byte constant too wide", "lanes.Varying[int32](lanes.Varying[byte](src[i]) >> 8)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			src := "package p\n\nfunc f(dst, src []int32, s uint) {\n\tgo for i := range len(src) {\n\t\tdst[i] = " + tc.expr + "\n\t}\n}\n"
+			src := "package p\n\n" + lanesImportFor(tc.expr) + "func f(dst, src []int32, s uint) {\n\tgo for i := range len(src) {\n\t\tdst[i] = " + tc.expr + "\n\t}\n}\n"
 			plan := parseAndAnalyzeGPULoop(t, src, 1)
 			if !strings.Contains(plan.Reject, "shift") {
 				t.Fatalf("Reject = %q, want a shift rejection", plan.Reject)

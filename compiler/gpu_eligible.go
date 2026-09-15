@@ -726,6 +726,13 @@ func (a *gpuAnalyzer) checkCall(call *ast.CallExpr, depth int) string {
 		if !ok {
 			return reject
 		}
+		// lanes.Varying[byte](x) is the explicit spelling of byte(x) for a
+		// varying x, so it needs the same float->byte rejection.
+		if dst, ok := a.info.TypeOf(fun.Index).Underlying().(*types.Basic); ok && dst.Kind() == types.Uint8 && len(call.Args) == 1 {
+			if b := asByteConversionSourceBasic(a.info, call.Args[0]); b != nil && b.Info()&types.IsFloat != 0 {
+				return "conversion from float to byte not eligible for GPU offload (out-of-range semantics differ)"
+			}
+		}
 		approved = true
 
 	default:

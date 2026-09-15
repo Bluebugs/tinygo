@@ -1041,6 +1041,11 @@ func (e *wgslEmitter) emitCall(call *ast.CallExpr) (string, error) {
 		if pkgIdent, ok := sel.X.(*ast.Ident); ok && sel.Sel.Name == "Varying" {
 			if pn, ok := e.info.Uses[pkgIdent].(*types.PkgName); ok && pn.Imported().Path() == "lanes" {
 				tv := e.info.TypeOf(fun.Index)
+				// byte keeps its [0, 255] masking; wgslTypeOf maps it to
+				// plain u32, which would drop the mask.
+				if b, ok := tv.Underlying().(*types.Basic); ok && b.Kind() == types.Uint8 {
+					return e.emitConversion("byte", call.Args)
+				}
 				wty, err := wgslTypeOf(tv)
 				if err != nil {
 					return "", err
