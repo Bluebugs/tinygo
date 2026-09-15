@@ -3190,7 +3190,11 @@ func (b *builder) spmdMaskSelect(mask, trueVal, falseVal llvm.Value) llvm.Value 
 	// Efficient bitwise select only when mask and data have equal total bit width
 	// (e.g., <16 x i8> mask with <16 x i8> data, <4 x i32> mask with <4 x f32> data).
 	// For mismatched widths, fall back to trunc+CreateSelect which LLVM handles correctly.
-	if b.targetData.TypeAllocSize(maskType) == b.targetData.TypeAllocSize(valType) {
+	// Pointer vectors are excluded: LLVM forbids bitcast between <N x ptr> and
+	// <N x iW> (ptrtoint would be required), so they use the native select.
+	isPtrVec := valType.TypeKind() == llvm.VectorTypeKind &&
+		valType.ElementType().TypeKind() == llvm.PointerTypeKind
+	if !isPtrVec && b.targetData.TypeAllocSize(maskType) == b.targetData.TypeAllocSize(valType) {
 		var aBits, bBits llvm.Value
 		needBitcast := valType != maskType
 		if needBitcast {

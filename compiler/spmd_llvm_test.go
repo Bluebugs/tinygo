@@ -5486,6 +5486,56 @@ func TestSPMDAllocaFastPathLoad(t *testing.T) {
 	}
 }
 
+// TestSPMDAllocaFastPathLoadPointerElem verifies that the alloca fast-path load
+// of a pointer-element vector (e.g. `ptrs[i]` from a stack [4]*int in the
+// masked tail of a peeled go-for loop) produces valid IR. LLVM forbids
+// bitcast between <N x ptr> and <N x i32>, so the WASM bitwise mask select
+// must not be used for pointer vectors.
+func TestSPMDAllocaFastPathLoadPointerElem(t *testing.T) {
+	c := newTestCompilerContext(t)
+	defer c.dispose()
+	b := newTestBuilder(t, c)
+	defer b.Dispose()
+
+	laneCount := 4
+	i32Type := c.ctx.Int32Type()
+	ptrType := c.dataPtrType
+	vecType := llvm.VectorType(ptrType, laneCount)
+
+	arrType := llvm.ArrayType(ptrType, 4)
+	alloca := b.CreateAlloca(arrType, "test.ptrs")
+	zero := llvm.ConstInt(i32Type, 0, false)
+	scalarPtr := b.CreateInBoundsGEP(arrType, alloca, []llvm.Value{zero, zero}, "test.ptr")
+
+	mask := llvm.ConstVector([]llvm.Value{
+		llvm.ConstAllOnes(i32Type),
+		llvm.ConstAllOnes(i32Type),
+		llvm.ConstNull(i32Type),
+		llvm.ConstNull(i32Type),
+	}, false)
+
+	goPtrType := types.NewPointer(types.NewArray(types.NewPointer(types.Typ[types.Int]), 4))
+	ci := &spmdContiguousInfo{
+		scalarPtr:   scalarPtr,
+		loop:        &spmdActiveLoop{laneCount: laneCount},
+		ssaSource:   ssaAllocWithType(goPtrType, false),
+		scalarIndex: llvm.ConstInt(b.uintptrType, 0, false),
+	}
+
+	result := b.spmdFullLoadWithSelect(vecType, ci, mask)
+	b.CreateRetVoid()
+
+	if result.IsNil() {
+		t.Fatal("returned nil for pointer alloca fast-path")
+	}
+	if result.Type() != vecType {
+		t.Errorf("result type = %s, want %s", result.Type(), vecType)
+	}
+	if err := llvm.VerifyModule(c.mod, llvm.ReturnStatusAction); err != nil {
+		t.Errorf("invalid IR for pointer-vector alloca load: %v\n%s", err, c.mod.String())
+	}
+}
+
 // TestSPMDAllocaFastPathStore verifies that spmdFullStoreWithBlend emits a direct
 // load-blend-store when the contiguous access originates from a stack-allocated
 // array (alloca fast-path), with no runtime cap-check branch or masked.store fallback.
