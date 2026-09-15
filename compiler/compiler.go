@@ -2107,11 +2107,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		// <N x T> and addr is <N x ptr> — both are scatter semantics.
 		if b.spmdLoopState != nil && llvmAddr.Type().TypeKind() == llvm.VectorTypeKind {
 			laneCount := llvmAddr.Type().VectorSize()
-			if llvmVal.Type().TypeKind() != llvm.VectorTypeKind {
-				// Scalar value: broadcast to all lanes.
-				vecType := llvm.VectorType(llvmVal.Type(), laneCount)
-				llvmVal = b.splatScalar(llvmVal, vecType)
-			}
+			llvmVal = b.spmdScatterValue(llvmVal, laneCount)
 			// All-lanes-active mask (no varying control flow at this point).
 			maskElem := b.spmdMaskElemType(laneCount)
 			allOnes := llvm.ConstAllOnes(llvm.VectorType(maskElem, laneCount))

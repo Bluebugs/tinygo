@@ -1109,6 +1109,99 @@ type spmdVecShadowState struct {
 	pendingPhis []spmdVecShadowPendingPhi                     // phis awaiting finalization after all blocks compile
 }
 
+// spmdNestedLoopIndexesByIter reports whether a loop nested in the go for
+// body (the blocks dominated by body) contains an IndexAddr or Index whose
+// index depends on iter, returning that instruction's position.
+func spmdNestedLoopIndexesByIter(body *ssa.BasicBlock, iter *ssa.Phi) (token.Pos, bool) {
+	dependsOnIter := make(map[ssa.Value]bool)
+	var depends func(v ssa.Value) bool
+	depends = func(v ssa.Value) bool {
+		if v == iter {
+			return true
+		}
+		if seen, ok := dependsOnIter[v]; ok {
+			return seen
+		}
+		dependsOnIter[v] = false
+		instr, ok := v.(ssa.Instruction)
+		if !ok {
+			return false
+		}
+		if _, isPhi := v.(*ssa.Phi); isPhi {
+			return false
+		}
+		var ops []*ssa.Value
+		for _, op := range instr.Operands(ops[:0]) {
+			if *op != nil && depends(*op) {
+				dependsOnIter[v] = true
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, header := range body.Parent().Blocks {
+		if header == body || !body.Dominates(header) {
+			continue
+		}
+		for _, latch := range header.Preds {
+			if !header.Dominates(latch) {
+				continue
+			}
+			// Loop blocks: those reaching latch without passing header.
+			inLoop := map[*ssa.BasicBlock]bool{header: true}
+			work := []*ssa.BasicBlock{latch}
+			for len(work) > 0 {
+				blk := work[len(work)-1]
+				work = work[:len(work)-1]
+				if inLoop[blk] {
+					continue
+				}
+				inLoop[blk] = true
+				work = append(work, blk.Preds...)
+			}
+			for blk := range inLoop {
+				for _, instr := range blk.Instrs {
+					var index ssa.Value
+					switch instr := instr.(type) {
+					case *ssa.IndexAddr:
+						index = instr.Index
+					case *ssa.Index:
+						index = instr.Index
+					default:
+						continue
+					}
+					if depends(index) {
+						return instr.Pos(), true
+					}
+				}
+			}
+		}
+	}
+	return token.NoPos, false
+}
+
+// spmdLoopInfoForBody returns the AST SPMD loop containing body, using the
+// first positioned instruction found in body or in blocks it dominates.
+//
+// The block-index scan is sound only because go for loops cannot nest: every
+// positioned instruction dominated by a go for body belongs to that go for.
+func (b *builder) spmdLoopInfoForBody(body *ssa.BasicBlock) *SPMDLoopInfo {
+	for _, block := range b.fn.Blocks {
+		if !body.Dominates(block) {
+			continue
+		}
+		for _, instr := range block.Instrs {
+			if pos := instr.Pos(); pos != token.NoPos {
+				if info := b.isInSPMDLoop(pos); info != nil {
+					return info
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // analyzeSPMDLoops performs two-pass pre-analysis of SPMD loops before block compilation.
 //
 // Pass 1 detects range-over-int (rangeint) patterns via "rangeint.body" block comments.
@@ -1414,6 +1507,23 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		}
 	}
 
+	// The SSA loop metadata is authoritative about which rangeint.body belongs
+	// to a go for. Position lookup alone is not: when the go for body block
+	// holds no positioned instruction (e.g. its first statement is a nested
+	// counted loop), it is skipped and the nested loop's body would claim the
+	// SPMD loop instead, vectorizing the wrong loop.
+	ssaBodyLoopInfo := make(map[*ssa.BasicBlock]*SPMDLoopInfo)
+	ssaClaimedLoopInfo := make(map[*SPMDLoopInfo]bool)
+	for _, ssaLoop := range b.fn.SPMDLoops {
+		if ssaLoop.IsPeeled || ssaLoop.IsRangeIndex || ssaLoop.BodyBlock == nil {
+			continue
+		}
+		if info := b.spmdLoopInfoForBody(ssaLoop.BodyBlock); info != nil {
+			ssaBodyLoopInfo[ssaLoop.BodyBlock] = info
+			ssaClaimedLoopInfo[info] = true
+		}
+	}
+
 	// Iterate over ALL blocks (not just DomPreorder) to find rangeint patterns.
 	for _, block := range b.fn.Blocks {
 		// Look for rangeint.body blocks.
@@ -1442,6 +1552,12 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 					break
 				}
 			}
+		}
+		if info, ok := ssaBodyLoopInfo[block]; ok {
+			loopInfo = info
+		} else if ssaClaimedLoopInfo[loopInfo] {
+			// Nested regular loop inside a go for whose body is known from SSA.
+			continue
 		}
 		if loopInfo == nil {
 			continue
@@ -1523,6 +1639,17 @@ func (b *builder) analyzeSPMDLoops() *spmdLoopState {
 		// SPMD loop registration so the loop executes as a plain scalar loop.
 		if laneCount <= 1 {
 			continue
+		}
+
+		// Fail closed: an unpeeled go for body has no tail masking for the
+		// memory accesses of a nested loop, so indexing by the go for index
+		// there would read and write past the inactive tail lanes.
+		if _, ok := ssaBodyLoopInfo[block]; ok {
+			if pos, bad := spmdNestedLoopIndexesByIter(block, iterPhi); bad {
+				b.diagnostics = append(b.diagnostics, b.makeError(pos,
+					"SPMD: go for body with a nested loop that indexes memory by the go for index is not supported unless the loop can be peeled"))
+				continue
+			}
 		}
 
 		// Create the active loop entry.
@@ -3686,6 +3813,20 @@ func (b *builder) spmdReshapeVector(val llvm.Value, targetType llvm.Type) llvm.V
 	shuffleMask := llvm.ConstVector(maskElems, false)
 	undef := llvm.Undef(val.Type())
 	return b.CreateShuffleVector(val, undef, shuffleMask, "spmd.val.reshape")
+}
+
+// spmdScatterValue shapes val for a masked scatter over laneCount pointers:
+// a scalar is broadcast, and a vector of a different width is reshaped the
+// same way createSPMDStore does, since the scatter intrinsic requires exactly
+// one value element per pointer.
+func (b *builder) spmdScatterValue(val llvm.Value, laneCount int) llvm.Value {
+	if val.Type().TypeKind() != llvm.VectorTypeKind {
+		return b.splatScalar(val, llvm.VectorType(val.Type(), laneCount))
+	}
+	if val.Type().VectorSize() != laneCount {
+		return b.spmdReshapeVector(val, llvm.VectorType(val.Type().ElementType(), laneCount))
+	}
+	return val
 }
 
 // spmdCallMask returns the mask value to pass when calling an SPMD function

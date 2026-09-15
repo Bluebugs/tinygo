@@ -17,6 +17,7 @@ import (
 	"github.com/tinygo-org/tinygo/compileopts"
 	"github.com/tinygo-org/tinygo/loader"
 	"golang.org/x/tools/go/ssa"
+	"tinygo.org/x/go-llvm"
 )
 
 // TestSPMDExtractNoSPMDCode verifies that packages without SPMD code return empty results.
@@ -992,4 +993,239 @@ func extractAllocaLines(ir string) string {
 		return "(no alloca [ lines found)"
 	}
 	return strings.Join(lines, "\n")
+}
+
+// spmdInnerLoopTargets are the target configurations exercised by the
+// inner-loop go for lowering regression tests.
+var spmdInnerLoopTargets = []struct {
+	name string
+	opts compileopts.Options
+}{
+	{"sse", compileopts.Options{GOOS: "linux", GOARCH: "amd64", LLVMFeatures: "+ssse3,+sse4.2", GOExperiment: "spmd"}},
+	{"avx2", compileopts.Options{GOOS: "linux", GOARCH: "amd64", LLVMFeatures: "+ssse3,+sse4.2,+avx2", GOExperiment: "spmd"}},
+	{"wasm-simd", compileopts.Options{Target: "wasi", GOExperiment: "spmd"}},
+	{"wasm-scalar", compileopts.Options{Target: "wasi", GOExperiment: "spmd", SIMD: "false"}},
+}
+
+// compileSPMDSourceVerified compiles src for opts and fails the test if the
+// resulting module does not pass LLVM verification.
+func compileSPMDSourceVerified(t *testing.T, src string, opts compileopts.Options) string {
+	t.Helper()
+	ir, errs := compileSPMDSourceErrors(t, src, opts)
+	if len(errs) > 0 {
+		t.Fatalf("compile errors:\n%s", strings.Join(errs, "\n"))
+	}
+	return ir
+}
+
+// compileSPMDSourceErrors compiles src for opts and returns the IR and the
+// compile errors. It fails the test if a module without compile errors does
+// not pass LLVM verification.
+func compileSPMDSourceErrors(t *testing.T, src string, opts compileopts.Options) (string, []string) {
+	t.Helper()
+	t.Setenv("GOEXPERIMENT", "spmd")
+	f, err := os.CreateTemp("./testdata", "spmd_test_*.go")
+	if err != nil {
+		t.Fatalf("failed to create temp source file: %v", err)
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	if _, err := f.WriteString(src); err != nil {
+		f.Close()
+		t.Fatalf("failed to write source: %v", err)
+	}
+	f.Close()
+
+	mod, errs := testCompilePackage(t, &opts, strings.TrimPrefix(name, "./testdata/"))
+	if len(errs) > 0 {
+		msgs := make([]string, len(errs))
+		for i, e := range errs {
+			msgs[i] = e.Error()
+		}
+		return "", msgs
+	}
+	ir := mod.String()
+	if err := llvm.VerifyModule(mod, llvm.ReturnStatusAction); err != nil {
+		t.Fatalf("LLVM verification failed: %v", err)
+	}
+	return ir, nil
+}
+
+// spmdFuncIR returns the body of the LLVM function whose name contains name.
+func spmdFuncIR(t *testing.T, ir, name string) string {
+	t.Helper()
+	start := strings.Index(ir, "@"+name+"(")
+	if start < 0 {
+		t.Fatalf("function %s not found in IR", name)
+	}
+	end := strings.Index(ir[start:], "\n}\n")
+	if end < 0 {
+		t.Fatalf("function %s has no end in IR", name)
+	}
+	return ir[start : start+end]
+}
+
+// TestSPMDInnerLoopVaryingAccumulatorVerifies covers a go for body whose
+// constant-bound inner loop ORs table lookups into a varying accumulator.
+func TestSPMDInnerLoopVaryingAccumulatorVerifies(t *testing.T) {
+	src := `package main
+
+import "lanes"
+
+const tbl = "\x00\x01\x00\x02\x00\x04\x00\x08\x00\x10\x00\x20\x00\x40\x00\x80"
+
+var text [32 * 64]byte
+var sum [64]uint32
+
+func kernel() {
+	go for w := range 64 {
+		var acc lanes.Varying[uint32]
+		for j := range 32 {
+			c := tbl[text[32*w+j]&15]
+			acc = acc | lanes.Varying[uint32](c)
+		}
+		sum[w] = acc
+	}
+}
+`
+	for _, tc := range spmdInnerLoopTargets {
+		t.Run(tc.name, func(t *testing.T) {
+			ir := compileSPMDSourceVerified(t, src, tc.opts)
+			if tc.opts.SIMD == "false" {
+				return
+			}
+			// The outer w loop is the vectorized one: sum[w] is written through
+			// the contiguous pointer of the loop index, not a per-lane scatter.
+			fn := spmdFuncIR(t, ir, "main.kernel")
+			mustContain(t, fn, "spmd.contiguous.ptr")
+			mustNotContain(t, fn, "masked.scatter")
+		})
+	}
+}
+
+// TestSPMDInnerLoopOwnElementAccumulationRejected covers an inner loop that
+// accumulates straight into sum[w]. The go for cannot be peeled, and the
+// unpeeled lowering does not mask the inner loop's memory accesses, so SIMD
+// builds must fail closed; the scalar build is still correct.
+func TestSPMDInnerLoopOwnElementAccumulationRejected(t *testing.T) {
+	src := `package main
+
+import "lanes"
+
+const tbl = "\x00\x01\x00\x02\x00\x04\x00\x08\x00\x10\x00\x20\x00\x40\x00\x80"
+
+var text [32 * 64]byte
+var sum [64]uint32
+
+func kernel() {
+	go for w := range 64 {
+		for j := range 32 {
+			c := tbl[text[32*w+j]&15]
+			sum[w] = sum[w] | lanes.Varying[uint32](c)
+		}
+	}
+}
+`
+	for _, tc := range spmdInnerLoopTargets {
+		t.Run(tc.name, func(t *testing.T) {
+			_, errs := compileSPMDSourceErrors(t, src, tc.opts)
+			if tc.opts.SIMD == "false" {
+				if len(errs) > 0 {
+					t.Fatalf("scalar build rejected: %v", errs)
+				}
+				return
+			}
+			if len(errs) != 1 || !strings.Contains(errs[0], "nested loop that indexes memory by the go for index") {
+				t.Fatalf("want nested-loop rejection, got %v", errs)
+			}
+		})
+	}
+}
+
+// TestSPMDGoForBodyLeadingInnerLoop covers a go for body whose first
+// statement is a counted loop independent of the go for index. The go for
+// body block then has no positioned instruction, which used to let the inner
+// loop claim the SPMD loop and be vectorized instead of the go for.
+func TestSPMDGoForBodyLeadingInnerLoop(t *testing.T) {
+	src := `package main
+
+import "lanes"
+
+var sum [67]uint32
+var scratch [4]byte
+
+func kernel(n int) {
+	go for w := range n {
+		for j := range 4 {
+			scratch[j] = byte(j)
+		}
+		sum[w] = lanes.Varying[uint32](w) * 3
+	}
+}
+`
+	for _, tc := range spmdInnerLoopTargets {
+		t.Run(tc.name, func(t *testing.T) {
+			ir := compileSPMDSourceVerified(t, src, tc.opts)
+			if tc.opts.SIMD == "false" {
+				return
+			}
+			fn := spmdFuncIR(t, ir, "main.kernel")
+			mustContain(t, fn, "store i8")
+			mustContain(t, fn, "spmd.contiguous.ptr")
+			mustNotContain(t, fn, "masked.scatter")
+		})
+	}
+}
+
+// TestSPMDScatterValueWidth checks that the plain *ssa.Store scatter path
+// reconciles the value width with the pointer vector width, so the masked
+// scatter intrinsic always verifies.
+func TestSPMDScatterValueWidth(t *testing.T) {
+	tests := []struct {
+		name     string
+		valLanes int // 0 means a scalar value
+		ptrLanes int
+	}{
+		{"scalar", 0, 4},
+		{"same", 4, 4},
+		{"narrow", 2, 4},
+		{"wide", 8, 4},
+		{"narrow-avx2", 4, 8},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestCompilerContext(t)
+			defer c.dispose()
+			b := newTestBuilder(t, c)
+			defer b.Dispose()
+
+			i32 := c.ctx.Int32Type()
+			var val llvm.Value
+			if tc.valLanes == 0 {
+				val = llvm.ConstInt(i32, 7, false)
+			} else {
+				elems := make([]llvm.Value, tc.valLanes)
+				for i := range elems {
+					elems[i] = llvm.ConstInt(i32, uint64(i), false)
+				}
+				val = llvm.ConstVector(elems, false)
+			}
+			ptrType := llvm.VectorType(c.dataPtrType, tc.ptrLanes)
+			ptrs := b.splatScalar(b.CreateAlloca(llvm.ArrayType(i32, 8), "dst"), ptrType)
+			if ptrs.Type() != ptrType {
+				t.Fatalf("ptrs type = %s, want %s", ptrs.Type(), ptrType)
+			}
+
+			got := b.spmdScatterValue(val, tc.ptrLanes)
+			if want := llvm.VectorType(i32, tc.ptrLanes); got.Type() != want {
+				t.Fatalf("value type = %s, want %s", got.Type(), want)
+			}
+			mask := llvm.ConstAllOnes(llvm.VectorType(b.spmdMaskElemType(tc.ptrLanes), tc.ptrLanes))
+			b.spmdMaskedScatter(got, ptrs, mask)
+			b.CreateRetVoid()
+			if err := llvm.VerifyModule(c.mod, llvm.ReturnStatusAction); err != nil {
+				t.Errorf("invalid IR: %v\n%s", err, c.mod.String())
+			}
+		})
+	}
 }
