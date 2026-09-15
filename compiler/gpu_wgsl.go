@@ -446,6 +446,9 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 		return nil
 
 	case *ast.ForStmt:
+		if u, ok := e.unrollable(x); ok {
+			return e.emitUnrolled(u, retTarget)
+		}
 		var initTxt, postTxt string
 		if init, ok := x.Init.(*ast.AssignStmt); ok && x.Init != nil {
 			s, err := e.forInitText(init)
@@ -499,6 +502,9 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 		// "for i := range n" over an integer bound, allowlisted narrowly by
 		// gpu_eligible.go's checkStmt (key-only, DEFINE, integer X); lowers
 		// to the equivalent WGSL counted for-loop.
+		if u, ok := e.unrollable(x); ok {
+			return e.emitUnrolled(u, retTarget)
+		}
 		ident, ok := x.Key.(*ast.Ident)
 		if !ok {
 			return fmt.Errorf("transpileWGSL: unsupported range-loop key")
@@ -1381,4 +1387,183 @@ func gpuWritesByteSlice(buffers []gpuFreeVar) bool {
 		}
 	}
 	return false
+}
+
+// gpuUnrollMaxTrips is the largest constant trip count of an inner loop that
+// is unrolled into one block per iteration. On RADV (Radeon 680M) the unrolled
+// 32-trip hash4x-summary kernel launched in 423 us against 636 us for the WGSL
+// loop (hash4x-summary investigation, prototypes CE vs E, Vulkan 4 MiB).
+const gpuUnrollMaxTrips = 32
+
+// gpuUnrollMaxStmts caps trips times emitted statements of an unrolled loop
+// (nested unrolled loops multiply), bounding shader size and pipeline
+// creation time.
+const gpuUnrollMaxStmts = 512
+
+// gpuUnroll describes an inner loop with a constant index sequence
+// start, start+1, ..., start+trips-1.
+type gpuUnroll struct {
+	key          *ast.Ident
+	start, trips int64
+	body         *ast.BlockStmt
+}
+
+// unrollable reports whether loop is a `for k := range K` or
+// `for k := C; k < K; k++` (or <=) loop with constant bounds that can be
+// emitted as one block per iteration: at most gpuUnrollMaxTrips trips, within
+// gpuUnrollMaxStmts, no break/continue (which would need the loop), and a
+// body that never writes the index (it is bound with let).
+func (e *wgslEmitter) unrollable(loop ast.Stmt) (gpuUnroll, bool) {
+	u, ok := e.unrollShape(loop)
+	if !ok || u.trips < 1 || u.trips > gpuUnrollMaxTrips {
+		return gpuUnroll{}, false
+	}
+	obj := e.info.Defs[u.key]
+	if obj == nil {
+		return gpuUnroll{}, false
+	}
+	safe := true
+	ast.Inspect(u.body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.BranchStmt, *ast.FuncLit:
+			safe = false
+		case *ast.AssignStmt:
+			for _, l := range x.Lhs {
+				if id, ok := ast.Unparen(l).(*ast.Ident); ok && e.info.Uses[id] == obj {
+					safe = false
+				}
+			}
+		case *ast.IncDecStmt:
+			if id, ok := ast.Unparen(x.X).(*ast.Ident); ok && e.info.Uses[id] == obj {
+				safe = false
+			}
+		case *ast.UnaryExpr:
+			if id, ok := ast.Unparen(x.X).(*ast.Ident); ok && x.Op == token.AND && e.info.Uses[id] == obj {
+				safe = false
+			}
+		}
+		return safe
+	})
+	if !safe || u.trips*e.unrolledStmtCost(u.body.List) > gpuUnrollMaxStmts {
+		return gpuUnroll{}, false
+	}
+	return u, true
+}
+
+// unrollShape matches the constant-bound loop forms without size checks.
+func (e *wgslEmitter) unrollShape(loop ast.Stmt) (gpuUnroll, bool) {
+	switch x := loop.(type) {
+	case *ast.RangeStmt:
+		key, ok := x.Key.(*ast.Ident)
+		if !ok || x.Value != nil || x.Tok != token.DEFINE {
+			return gpuUnroll{}, false
+		}
+		end, ok := e.constInt64(x.X)
+		return gpuUnroll{key: key, start: 0, trips: end, body: x.Body}, ok
+	case *ast.ForStmt:
+		init, ok := x.Init.(*ast.AssignStmt)
+		if !ok || init.Tok != token.DEFINE || len(init.Lhs) != 1 || len(init.Rhs) != 1 {
+			return gpuUnroll{}, false
+		}
+		key, ok := init.Lhs[0].(*ast.Ident)
+		if !ok {
+			return gpuUnroll{}, false
+		}
+		obj := e.info.Defs[key]
+		start, ok := e.constInt64(init.Rhs[0])
+		if !ok || obj == nil {
+			return gpuUnroll{}, false
+		}
+		cond, ok := x.Cond.(*ast.BinaryExpr)
+		if !ok || (cond.Op != token.LSS && cond.Op != token.LEQ) {
+			return gpuUnroll{}, false
+		}
+		if id, ok := cond.X.(*ast.Ident); !ok || e.info.Uses[id] != obj {
+			return gpuUnroll{}, false
+		}
+		end, ok := e.constInt64(cond.Y)
+		if !ok {
+			return gpuUnroll{}, false
+		}
+		if cond.Op == token.LEQ {
+			end++
+		}
+		post, ok := x.Post.(*ast.IncDecStmt)
+		if !ok || post.Tok != token.INC {
+			return gpuUnroll{}, false
+		}
+		if id, ok := post.X.(*ast.Ident); !ok || e.info.Uses[id] != obj {
+			return gpuUnroll{}, false
+		}
+		return gpuUnroll{key: key, start: start, trips: end - start, body: x.Body}, true
+	}
+	return gpuUnroll{}, false
+}
+
+// unrolledStmtCost counts the statements stmts emits, counting a nested
+// constant loop as its trips times its body. There is no switch case because
+// gpu_eligible.go rejects switch statements in offloaded bodies.
+func (e *wgslEmitter) unrolledStmtCost(stmts []ast.Stmt) int64 {
+	var n int64
+	for _, st := range stmts {
+		n++
+		switch x := st.(type) {
+		case *ast.BlockStmt:
+			n += e.unrolledStmtCost(x.List)
+		case *ast.IfStmt:
+			n += e.unrolledStmtCost(x.Body.List)
+			if x.Else != nil {
+				n += e.unrolledStmtCost([]ast.Stmt{x.Else})
+			}
+		case *ast.ForStmt, *ast.RangeStmt:
+			body := gpuLoopBody(x)
+			if u, ok := e.unrollShape(x); ok && u.trips >= 1 && u.trips <= gpuUnrollMaxTrips {
+				n += u.trips * e.unrolledStmtCost(body.List)
+			} else {
+				n += e.unrolledStmtCost(body.List)
+			}
+		}
+	}
+	return n
+}
+
+func gpuLoopBody(loop ast.Stmt) *ast.BlockStmt {
+	if f, ok := loop.(*ast.ForStmt); ok {
+		return f.Body
+	}
+	return loop.(*ast.RangeStmt).Body
+}
+
+// constInt64 returns the value of a compile-time integer constant expression.
+func (e *wgslEmitter) constInt64(x ast.Expr) (int64, bool) {
+	tv, ok := e.info.Types[x]
+	if !ok || tv.Value == nil || tv.Value.Kind() != constant.Int {
+		return 0, false
+	}
+	return constant.Int64Val(tv.Value)
+}
+
+// emitUnrolled emits one block per iteration with the index bound to its
+// constant value. The block keeps body locals scoped per copy; variables
+// declared outside the loop (accumulators) chain across copies.
+func (e *wgslEmitter) emitUnrolled(u gpuUnroll, retTarget string) error {
+	ty, err := e.wgslTypeOfIdent(u.key)
+	if err != nil {
+		return err
+	}
+	for c := u.start; c < u.start+u.trips; c++ {
+		e.writeIndent()
+		e.sb.WriteString("{\n")
+		e.indent++
+		name := e.declareLocal(u.key)
+		e.writeIndent()
+		fmt.Fprintf(e.sb, "let %s: %s = %s;\n", name, ty, constLiteral(constant.MakeInt64(c), ty))
+		if err := e.emitStmts(u.body.List, retTarget); err != nil {
+			return err
+		}
+		e.indent--
+		e.writeIndent()
+		e.sb.WriteString("}\n")
+	}
+	return nil
 }

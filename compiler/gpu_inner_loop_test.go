@@ -1,9 +1,11 @@
 package compiler
 
 import (
+	"go/ast"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -36,7 +38,7 @@ func TestGPUInnerLoopSummaryEligible(t *testing.T) {
 		t.Fatalf("rejected: %s", plan.Reject)
 	}
 	wgsl := transpileOK(t, innerLoopSummarySrc)
-	for _, want := range []string{"var<storage, read_write> sum: array<u32>;", "for ("} {
+	for _, want := range []string{"var<storage, read_write> sum: array<u32>;", "let j: i32 = 0;"} {
 		if !strings.Contains(wgsl, want) {
 			t.Errorf("WGSL missing %q:\n%s", want, wgsl)
 		}
@@ -52,6 +54,8 @@ func TestGPUInnerLoopSummaryEligible(t *testing.T) {
 	}
 }
 
+// TestGPUInnerLoopSummaryGolden pins the kernel shape when the inner loop is
+// too long to unroll.
 func TestGPUInnerLoopSummaryGolden(t *testing.T) {
 	const golden = `struct Params {
   n: i32,
@@ -68,14 +72,16 @@ fn spmd_kernel_0(@builtin(global_invocation_id) gid: vec3<u32>) {
   let w: i32 = i32(gid.x);
   if (w >= params.n) { return; }
   var acc: u32 = 0;
-  for (var j: i32 = 0; j < 32; j = (j + 1)) {
+  for (var j: i32 = 0; j < 33; j = (j + 1)) {
     var c: u32 = tbl_tbl[u32((((text[u32(((32 * w) + j)) >> 2u] >> ((u32(((32 * w) + j)) & 3u) * 8u)) & 0xffu) & 15))];
     acc = (acc | u32(c));
   }
   sum[w] = acc;
 }
 `
-	if got := transpileOK(t, innerLoopSummarySrc); got != golden {
+	// Above gpuUnrollMaxTrips the inner loop stays a WGSL for loop.
+	src := strings.Replace(innerLoopSummarySrc, "range 32", "range 33", 1)
+	if got := transpileOK(t, src); got != golden {
 		t.Fatalf("WGSL mismatch.\n--- got ---\n%s\n--- want ---\n%s", got, golden)
 	}
 }
@@ -336,5 +342,145 @@ func f(dst []byte, src []uint32) {
 	}
 	if k.LanesPerInvocation != 4 || !strings.Contains(k.WGSL, "lane < 4u") {
 		t.Errorf("LanesPerInvocation = %d, want 4 with a lane loop:\n%s", k.LanesPerInvocation, k.WGSL)
+	}
+}
+
+// TestGPUInnerLoopUnrolledGolden checks that a constant 32-trip inner loop is
+// unrolled: each copy gets its own block with the index bound to a constant,
+// and the accumulator chains across copies. On RADV the unrolled body is
+// ~1.5x faster than the loop (prototype CE vs E).
+func TestGPUInnerLoopUnrolledGolden(t *testing.T) {
+	wgsl := transpileOK(t, innerLoopSummarySrc)
+	if strings.Contains(wgsl, "for (") {
+		t.Errorf("constant inner loop not unrolled:\n%s", wgsl)
+	}
+	entry := wgsl[strings.Index(wgsl, "fn spmd_kernel_"):]
+	var want strings.Builder
+	want.WriteString("fn spmd_kernel_0(@builtin(global_invocation_id) gid: vec3<u32>) {\n  let w: i32 = i32(gid.x);\n  if (w >= params.n) { return; }\n  var acc: u32 = 0;\n")
+	for j := 0; j < 32; j++ {
+		want.WriteString("  {\n")
+		want.WriteString("    let j: i32 = " + strconv.Itoa(j) + ";\n")
+		want.WriteString("    var c: u32 = tbl_tbl[u32((((text[u32(((32 * w) + j)) >> 2u] >> ((u32(((32 * w) + j)) & 3u) * 8u)) & 0xffu) & 15))];\n")
+		want.WriteString("    acc = (acc | u32(c));\n")
+		want.WriteString("  }\n")
+	}
+	want.WriteString("  sum[w] = acc;\n}\n")
+	if entry != want.String() {
+		t.Fatalf("WGSL mismatch.\n--- got ---\n%s\n--- want ---\n%s", entry, want.String())
+	}
+	nagaValidate(t, wgsl)
+}
+
+// TestGPUInnerLoopUnrollClassicFor checks the `j := 0; j < K; j++` form.
+func TestGPUInnerLoopUnrollClassicFor(t *testing.T) {
+	src := strings.Replace(innerLoopSummarySrc, "for j := range 32 {", "for j := 0; j < width; j++ {", 1) + "\nconst width = 32\n"
+	wgsl := transpileOK(t, src)
+	if strings.Contains(wgsl, "for (") || !strings.Contains(wgsl, "let j: i32 = 31;") || strings.Contains(wgsl, "let j: i32 = 32;") {
+		t.Errorf("classic constant loop not unrolled 0..31:\n%s", wgsl)
+	}
+	nagaValidate(t, wgsl)
+}
+
+// TestGPUInnerLoopUnrollKeepsFor checks the cases that must keep the WGSL loop.
+func TestGPUInnerLoopUnrollKeepsFor(t *testing.T) {
+	for _, tc := range []struct{ name, from, to string }{
+		{"trips above cap", "range 32", "range " + strconv.Itoa(gpuUnrollMaxTrips+1)},
+		{"continue inside", "c := tbl[text[32*w+j]&15]", "if j == 3 {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tc := tbl[text[32*w+j]&15]"},
+		{"index modified", "for j := range 32 {", "for j := 0; j < 32; j += 2 {"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := strings.Replace(innerLoopSummarySrc, tc.from, tc.to, 1)
+			plan := parseAndAnalyzeGPULoop(t, src, 1)
+			if plan.Reject != "" {
+				t.Skipf("rejected: %s", plan.Reject)
+			}
+			k, err := transpileWGSL(plan, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(k.WGSL, "for (") || strings.Contains(k.WGSL, "let j") {
+				t.Errorf("loop must be kept:\n%s", k.WGSL)
+			}
+			nagaValidate(t, k.WGSL)
+		})
+	}
+}
+
+// TestGPUInnerLoopUnrollSizeCap checks that a body whose trips times statement
+// count exceeds the size cap keeps the loop even with few trips.
+func TestGPUInnerLoopUnrollSizeCap(t *testing.T) {
+	var body strings.Builder
+	for i := 0; i < gpuUnrollMaxStmts/32+1; i++ {
+		body.WriteString("\t\t\tacc = acc | lanes.Varying[uint32](c)\n")
+	}
+	src := strings.Replace(innerLoopSummarySrc, "\t\t\tacc = acc | lanes.Varying[uint32](c)\n", body.String(), 1)
+	wgsl := transpileOK(t, src)
+	if !strings.Contains(wgsl, "for (") {
+		t.Errorf("oversized body must keep the loop:\n%s", wgsl)
+	}
+}
+
+// TestGPUInnerLoopUnrollNestedScoping unrolls two nested constant loops that
+// both declare locals; every copy must be block scoped so the shader is valid.
+func TestGPUInnerLoopUnrollNestedScoping(t *testing.T) {
+	const src = `
+package p
+
+import "lanes"
+
+func f(sum []uint32, text []byte) {
+	go for w := range len(sum) {
+		var acc lanes.Varying[uint32]
+		for j := range 4 {
+			x := lanes.Varying[uint32](text[16*w+4*j])
+			for k := range 4 {
+				y := x + lanes.Varying[uint32](text[16*w+4*j+k])
+				acc = acc + y
+			}
+		}
+		sum[w] = acc
+	}
+}
+`
+	wgsl := transpileOK(t, src)
+	if strings.Contains(wgsl, "for (") {
+		t.Errorf("nested constant loops not unrolled:\n%s", wgsl)
+	}
+	if got := strings.Count(wgsl, "var y: u32"); got != 16 {
+		t.Errorf("var y declared %d times, want 16:\n%s", got, wgsl)
+	}
+	if got := strings.Count(wgsl, "var x: u32"); got != 4 {
+		t.Errorf("var x declared %d times, want 4:\n%s", got, wgsl)
+	}
+	nagaValidate(t, wgsl)
+}
+
+// TestGPUInnerLoopUnrollParenIndexWrite checks the emitter's own guard: a
+// parenthesized write to the index must keep the loop. Eligibility may reject
+// such bodies first, so unrollable is called directly on the inner loop.
+func TestGPUInnerLoopUnrollParenIndexWrite(t *testing.T) {
+	for _, tc := range []struct{ name, stmt string }{
+		{"increment", "(j)++"},
+		{"assignment", "(j) = 1"},
+		{"address", "_ = &(j)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := strings.Replace(innerLoopSummarySrc, "c := tbl[text[32*w+j]&15]", tc.stmt+"\n\t\t\tc := tbl[text[32*w+j]&15]", 1)
+			plan := parseAndAnalyzeGPULoop(t, src, 1)
+			var inner *ast.RangeStmt
+			ast.Inspect(plan.Body, func(n ast.Node) bool {
+				if rs, ok := n.(*ast.RangeStmt); ok && inner == nil {
+					inner = rs
+				}
+				return inner == nil
+			})
+			if inner == nil {
+				t.Fatal("inner loop not found")
+			}
+			e := &wgslEmitter{info: plan.Loop.TypesInfo}
+			if _, ok := e.unrollable(inner); ok {
+				t.Errorf("loop writing %s must not be unrolled", tc.stmt)
+			}
+		})
 	}
 }
