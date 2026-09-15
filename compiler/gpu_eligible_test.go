@@ -616,14 +616,18 @@ func kernel(n int, out []int) {
 // a silent truncation on the GPU path only.
 func TestGPUEligibleBodyLocalWideTypeRejected(t *testing.T) {
 	for _, tc := range []struct{ name, decl string }{
-		{"int64", "var c int64 = int64(idx)"},
-		{"float64", "var c float64 = float64(idx)"},
+		{"int64", "var c lanes.Varying[int64] = int64(idx)"},
+		{"float64", "var c lanes.Varying[float64] = float64(idx)"},
 		{"int64-shortdecl", "c := int64(idx)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			imp := ""
+			if strings.Contains(tc.decl, "lanes.") {
+				imp = "import \"lanes\"\n\n"
+			}
 			src := `package test
 
-func kernel(n int, out []int) {
+` + imp + `func kernel(n int, out []int) {
 	go for idx := range n {
 		` + tc.decl + `
 		out[idx] = int(c)
