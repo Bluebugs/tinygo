@@ -73,6 +73,7 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		locals:    map[types.Object]string{},
 		inlined:   plan.Inlined,
 		byteBufs:  map[types.Object]bool{},
+		usedBufs:  map[types.Object]bool{},
 		tables:    map[*types.Const]string{},
 	}
 
@@ -191,13 +192,6 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 	}
 	sb.WriteString("}\n")
 	sb.WriteString("@group(0) @binding(0) var<uniform> params: Params;\n")
-	for i, b := range buffers {
-		access := "read"
-		if b.Kind == gpuSliceRW {
-			access = "read_write"
-		}
-		fmt.Fprintf(&sb, "@group(0) @binding(%d) var<storage, %s> %s: %s;\n", i+1, access, bufNames[b.Obj], b.WGSLTy)
-	}
 	var fn strings.Builder
 	fmt.Fprintf(&fn, "@compute @workgroup_size(%d)\n", wgslWorkgroupSize)
 	fmt.Fprintf(&fn, "fn %s(@builtin(global_invocation_id) gid: vec3<u32>) {\n", entry)
@@ -218,6 +212,9 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		fmt.Fprintf(&fn, "    if (%s >= params.n) { break; }\n", e.iterIdent)
 		e.indent = 2
 	}
+	if err := e.emitRangeValue(plan.Loop.RangeStmt); err != nil {
+		return nil, err
+	}
 	if err := e.emitStmts(plan.Body.List, ""); err != nil {
 		return nil, err
 	}
@@ -225,6 +222,27 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 		fn.WriteString("  }\n")
 	}
 	fn.WriteString("}\n")
+
+	// Declare only the buffers the shader references. A slice used solely as
+	// the range bound (its length is the SSA trip count) is never read, and a
+	// `layout: 'auto'` pipeline drops an unreferenced binding from its layout
+	// while both hosts bind every kernel buffer, so declaring it made wgpu
+	// reject the bind group. Filtering Buffers keeps compiler, native and JS
+	// hosts consistent with no host change.
+	kept := buffers[:0]
+	for _, b := range buffers {
+		if e.usedBufs[b.Obj] {
+			kept = append(kept, b)
+		}
+	}
+	buffers = kept
+	for i, b := range buffers {
+		access := "read"
+		if b.Kind == gpuSliceRW {
+			access = "read_write"
+		}
+		fmt.Fprintf(&sb, "@group(0) @binding(%d) var<storage, %s> %s: %s;\n", i+1, access, bufNames[b.Obj], b.WGSLTy)
+	}
 
 	// Constant lookup tables are emitted at module scope, before the entry
 	// point, but table names and references are only known after the body
@@ -252,6 +270,31 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 	}, nil
 }
 
+// emitRangeValue declares the value variable of `go for i, v := range s` as
+// the element read s[i], lowered exactly like the explicit IndexExpr (packed
+// for byte slices). rangeValueReject guarantees the shape.
+func (e *wgslEmitter) emitRangeValue(rs *ast.RangeStmt) error {
+	if rs == nil {
+		return nil
+	}
+	v, ok := rs.Value.(*ast.Ident)
+	if !ok || v.Name == "_" {
+		return nil
+	}
+	ty, err := e.wgslTypeOfIdent(v)
+	if err != nil {
+		return err
+	}
+	read, err := e.emitExpr(&ast.IndexExpr{X: rs.X, Index: rs.Key})
+	if err != nil {
+		return err
+	}
+	name := e.declareLocal(v)
+	e.writeIndent()
+	fmt.Fprintf(e.sb, "var %s: %s = %s;\n", name, ty, read)
+	return nil
+}
+
 // wgslEmitter carries the state needed to lower the plan's body (and, while
 // inlining, an SPMD callee's body) statement-by-statement into WGSL text.
 type wgslEmitter struct {
@@ -267,6 +310,7 @@ type wgslEmitter struct {
 	inlineCounter int    // monotonically increasing across the whole transpile; never reset on inline-exit
 
 	byteBufs                 map[types.Object]bool // free byte-slice buffers, packed 4 per u32 word
+	usedBufs                 map[types.Object]bool // free slice buffers referenced by the emitted shader
 	tmpIdx, tmpShift, tmpRet string                // collision-free WGSL names used by packed byte stores
 	lanes                    int                   // loop iterations per compute invocation (LanesPerInvocation)
 	loopDepth                int                   // WGSL loops enclosing the statement being emitted, excluding the lane loop
@@ -857,6 +901,9 @@ func (e *wgslEmitter) emitExpr(expr ast.Expr) (string, error) {
 			return s, nil
 		}
 		if s, ok := e.freeSubst[obj]; ok {
+			if _, isBuf := obj.Type().Underlying().(*types.Slice); isBuf {
+				e.usedBufs[obj] = true
+			}
 			return s, nil
 		}
 		if c, ok := obj.(*types.Const); ok {

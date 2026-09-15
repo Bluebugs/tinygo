@@ -109,6 +109,11 @@ func analyzeGPULoop(info *SPMDLoopInfo, thresholdOps uint64) *gpuLoopPlan {
 		inlined:   plan.Inlined,
 	}
 
+	if reject := a.rangeValueReject(rangeStmt); reject != "" {
+		plan.Reject = reject
+		return plan
+	}
+
 	// §D4 eligibility walk (also inlines same-package SPMD calls one level
 	// deep).
 	if reject := a.checkEligible(rangeStmt.Body, 0); reject != "" {
@@ -155,6 +160,36 @@ func analyzeGPULoop(info *SPMDLoopInfo, thresholdOps uint64) *gpuLoopPlan {
 	plan.MinTrip = trip
 
 	return plan
+}
+
+// rangeValueReject accepts the value variable of the `go for` itself
+// (`go for i, v := range s`) only when the WGSL emitter can declare it as the
+// element read `s[i]`: a named key and a free slice identifier as the range
+// operand. The checkEligible walk covers the body only, so without this gate
+// any range value reached the emitter undeclared.
+func (a *gpuAnalyzer) rangeValueReject(rs *ast.RangeStmt) string {
+	v, ok := rs.Value.(*ast.Ident)
+	if rs.Value == nil || (ok && v.Name == "_") {
+		return ""
+	}
+	if !ok || rs.Tok != token.DEFINE {
+		return "non-identifier or non-defining range value not eligible for GPU offload"
+	}
+	if key, ok := rs.Key.(*ast.Ident); !ok || key.Name == "_" {
+		return "range value without a named range key not eligible for GPU offload"
+	}
+	x, ok := rs.X.(*ast.Ident)
+	if !ok {
+		return "range value over a non-identifier operand not eligible for GPU offload"
+	}
+	obj, ok := a.info.Uses[x].(*types.Var)
+	if !ok {
+		return "range value over a non-variable operand not eligible for GPU offload"
+	}
+	if _, ok := gpuUnwrapSPMD(obj.Type()).Underlying().(*types.Slice); !ok {
+		return "range value over a non-slice operand not eligible for GPU offload"
+	}
+	return ""
 }
 
 // gpuAnalyzer carries the shared state for the eligibility walk, free-var
