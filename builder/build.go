@@ -667,7 +667,11 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 	// Check for wgpu-native only when actually linking (not for .o, .bc, .ll).
 	// This check must run here, not in compileopts/target.go, because target
 	// configuration has no knowledge of the output kind.
-	if config.Options.GPU == "webgpu" && config.GOARCH() != "wasm" {
+	if config.Options.GPU == "webgpu" && config.GOARCH() != "wasm" && config.GPUHost() == "vulkan" {
+		if _, err := os.Stat(filepath.Join(compileopts.VulkanIncludeDir(), "vulkan", "vulkan.h")); err != nil {
+			return result, fmt.Errorf("-gpu-host=vulkan requires Vulkan headers: set VULKAN_SDK or install libvulkan-dev (looked in $VULKAN_SDK/include and /usr/include)")
+		}
+	} else if config.Options.GPU == "webgpu" && config.GOARCH() != "wasm" {
 		wgpu := os.Getenv("WGPU_NATIVE_PATH")
 		if wgpu == "" {
 			wgpu = filepath.Join(os.Getenv("HOME"), ".local/share/wgpu-native")

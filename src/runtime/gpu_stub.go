@@ -2,7 +2,8 @@
 
 // SPMD GPU offload runtime ABI stub for every build that is not a
 // wasm/js (-target=wasm) build with -gpu=webgpu and is not a native
-// linux/amd64 build with -gpu=webgpu (gpu_native.go, Task 10) -- i.e. all other targets
+// linux/amd64 build with -gpu=webgpu (gpu_native.go, or gpu_vulkan.go with
+// -gpu-host=vulkan; the second clause below covers both) -- i.e. all other targets
 // (native, wasip1, other tinygo.wasm variants) AND ordinary wasm/js builds
 // without -gpu=webgpu, which must stay byte-identical to a pre-feature
 // build (I6). WebGPU is only

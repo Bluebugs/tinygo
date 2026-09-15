@@ -1,4 +1,4 @@
-//go:build !tinygo.wasm && linux && amd64 && spmd.gpu.webgpu
+//go:build !tinygo.wasm && linux && amd64 && spmd.gpu.webgpu && !spmd.gpu.host.vulkan
 
 // SPMD GPU offload runtime ABI for native targets (Task 10): wgpu-native +
 // Vulkan instead of the browser's WebGPU.
@@ -16,13 +16,14 @@
 // gpu_wasm.go needs are all absent rather than emulated: the C shim has
 // already finished the readback by the time spmd_gpu_launch returns.
 //
-// Build tag notes. The three GPU runtime files must partition every
+// Build tag notes. The four GPU runtime files must partition every
 // possible build exactly, because createRuntimeCall panics if any of these
-// names is missing on some target:
+// names is missing on some target (proved by compileopts/gpu_tags_test.go):
 //
-//	gpu_wasm.go    tinygo.wasm && js && spmd.gpu.webgpu
-//	gpu_native.go  !tinygo.wasm && linux && amd64 && spmd.gpu.webgpu
-//	gpu_stub.go    everything else (the negation of both of the above)
+//	gpu_wasm.go    tinygo.wasm && (js || spmd.gpu.host.browser) && spmd.gpu.webgpu
+//	gpu_native.go  !tinygo.wasm && linux && amd64 && spmd.gpu.webgpu && !spmd.gpu.host.vulkan
+//	gpu_vulkan.go  !tinygo.wasm && linux && amd64 && spmd.gpu.webgpu && spmd.gpu.host.vulkan
+//	gpu_stub.go    everything else (the negation of wasm and native+vulkan)
 package runtime
 
 import "unsafe"

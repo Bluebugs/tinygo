@@ -529,21 +529,27 @@ func defaultTarget(options *Options) (*TargetSpec, error) {
 			}
 			ldflags = append(ldflags, f)
 		}
-		wgpu := os.Getenv("WGPU_NATIVE_PATH")
-		if wgpu == "" {
-			wgpu = filepath.Join(os.Getenv("HOME"), ".local/share/wgpu-native")
+		// TinyGo's code generator emits non-PIC code (R_X86_64_32 against
+		// .rodata), so the executable must not be a PIE.
+		ldflags = append(ldflags, "-no-pie")
+		// The wgpu-native / Vulkan header presence checks are deferred to
+		// builder/build.go, where they run only when the build will actually
+		// link. Object files (.o, .bc, .ll) should not fail on them.
+		if options.GPUHost == "vulkan" {
+			// Direct Vulkan host: link the loader by soname so the binary
+			// does not depend on where the SDK or distro put libvulkan.so.
+			ldflags = append(ldflags, "-l:libvulkan.so.1", "-lm", "-lpthread", "-ldl")
+		} else {
+			wgpu := os.Getenv("WGPU_NATIVE_PATH")
+			if wgpu == "" {
+				wgpu = filepath.Join(os.Getenv("HOME"), ".local/share/wgpu-native")
+			}
+			ldflags = append(ldflags,
+				"-L"+filepath.Join(wgpu, "lib"),
+				"-lwgpu_native", "-lm", "-lpthread", "-ldl",
+				"-Wl,-rpath,"+filepath.Join(wgpu, "lib"),
+			)
 		}
-		// The wgpu-native presence check is deferred to builder/build.go,
-		// where it can run only when the build will actually link. Object files
-		// (.o, .bc, .ll) do not link and should not fail on missing wgpu-native.
-		ldflags = append(ldflags,
-			// TinyGo's code generator emits non-PIC code (R_X86_64_32
-			// against .rodata), so the executable must not be a PIE.
-			"-no-pie",
-			"-L"+filepath.Join(wgpu, "lib"),
-			"-lwgpu_native", "-lm", "-lpthread", "-ldl",
-			"-Wl,-rpath,"+filepath.Join(wgpu, "lib"),
-		)
 		spec.LDFlags = ldflags
 		// See builder/cc.go: -fno-lto makes the C files compile to real ELF
 		// objects rather than ThinLTO bitcode, which `cc` cannot link.
@@ -556,8 +562,20 @@ func defaultTarget(options *Options) (*TargetSpec, error) {
 		// path against the CPU path must be built as two separate binaries
 		// (as test/e2e and the Task 10 measurements do) rather than assuming
 		// the CPU half of a -gpu build is representative.
-		spec.CFlags = append(spec.CFlags, "-fno-lto", "-I"+filepath.Join(wgpu, "include"))
-		spec.ExtraFiles = append(spec.ExtraFiles, "src/runtime/gpu_native.c")
+		if options.GPUHost == "vulkan" {
+			// -idirafter, not -I: an SDK include dir (e.g. the Flatpak
+			// org.freedesktop.Sdk) also ships libc headers such as stdint.h
+			// that would shadow the system ones and break the C compile.
+			spec.CFlags = append(spec.CFlags, "-fno-lto", "-idirafter", VulkanIncludeDir())
+			spec.ExtraFiles = append(spec.ExtraFiles, "src/runtime/gpu_vulkan.c")
+		} else {
+			wgpu := os.Getenv("WGPU_NATIVE_PATH")
+			if wgpu == "" {
+				wgpu = filepath.Join(os.Getenv("HOME"), ".local/share/wgpu-native")
+			}
+			spec.CFlags = append(spec.CFlags, "-fno-lto", "-I"+filepath.Join(wgpu, "include"))
+			spec.ExtraFiles = append(spec.ExtraFiles, "src/runtime/gpu_native.c")
+		}
 	}
 
 	// Add extra assembly files (needed for the scheduler etc).
@@ -621,4 +639,17 @@ func (spec *TargetSpec) LookupGDB() (string, error) {
 		}
 	}
 	return "", errors.New("no gdb found configured in the target specification (" + strings.Join(spec.GDB, ", ") + ")")
+}
+
+// VulkanIncludeDir returns the include directory used for -gpu-host=vulkan:
+// $VULKAN_SDK/include when it contains vulkan/vulkan.h, else /usr/include.
+// builder/build.go checks that the header really exists there.
+func VulkanIncludeDir() string {
+	if sdk := os.Getenv("VULKAN_SDK"); sdk != "" {
+		dir := filepath.Join(sdk, "include")
+		if _, err := os.Stat(filepath.Join(dir, "vulkan", "vulkan.h")); err == nil {
+			return dir
+		}
+	}
+	return "/usr/include"
 }
