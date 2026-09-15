@@ -171,6 +171,10 @@ func (b *builder) gpuAnalyzeLoop(loop *spmdActiveLoop) {
 		b.gpuReport(loop, "skipped: WGSL transpilation failed: %v", err)
 		return
 	}
+	if reason := gpuHostBufferLimitReject(b.GPUHost, len(kernel.Buffers)); reason != "" {
+		b.gpuReport(loop, "skipped: %s", reason)
+		return
+	}
 	if b.GPUHost == "vulkan" {
 		if _, err := exec.LookPath(nagaPath()); err != nil {
 			// Hard error, not a CPU fallback: silently skipping every loop
@@ -200,6 +204,20 @@ func (b *builder) gpuAnalyzeLoop(loop *spmdActiveLoop) {
 	loop.gpuArgs = args
 	b.gpuReport(loop, "offload (kernel=%s, cost=%d, minTrip=%d, maxSafeTrip=%d, params=%d, buffers=%d)",
 		kernel.Entry, plan.BodyCost, plan.MinTrip, gpuMaxSafeTrip, len(kernel.Params), len(kernel.Buffers))
+}
+
+// gpuVulkanMaxBuffers is the storage-buffer cap of the direct Vulkan host.
+// It must match SPMD_VK_MAX_BUFFERS in src/runtime/gpu_vulkan.c: register
+// rejects a larger bufCount, which would panic after the guard picked the GPU.
+const gpuVulkanMaxBuffers = 8
+
+// gpuHostBufferLimitReject returns a skip reason when a kernel binding n
+// storage buffers cannot be registered on host, or "" when it fits.
+func gpuHostBufferLimitReject(host string, n int) string {
+	if host == "vulkan" && n > gpuVulkanMaxBuffers {
+		return fmt.Sprintf("%d buffers exceeds the Vulkan host limit of %d", n, gpuVulkanMaxBuffers)
+	}
+	return ""
 }
 
 // gpuLoopShapeReject holds the parts of the eligibility proof that depend only

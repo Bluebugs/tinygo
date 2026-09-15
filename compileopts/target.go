@@ -566,6 +566,9 @@ func defaultTarget(options *Options) (*TargetSpec, error) {
 			// -idirafter, not -I: an SDK include dir (e.g. the Flatpak
 			// org.freedesktop.Sdk) also ships libc headers such as stdint.h
 			// that would shadow the system ones and break the C compile.
+			// Consequence: with a full-sysroot VULKAN_SDK, if
+			// /usr/include/vulkan/vulkan.h also exists the system header
+			// wins. Harmless: gpu_vulkan.c uses Vulkan 1.1 core only.
 			spec.CFlags = append(spec.CFlags, "-fno-lto", "-idirafter", VulkanIncludeDir())
 			spec.ExtraFiles = append(spec.ExtraFiles, "src/runtime/gpu_vulkan.c")
 		} else {

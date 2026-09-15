@@ -35,7 +35,11 @@
 
 #include <vulkan/vulkan.h>
 
+// Fixed-size kernel table (also sizes the descriptor pool); a 65th distinct
+// kernel fails register. Tracked in PLAN.md (Vulkan register failures).
 #define SPMD_VK_MAX_KERNELS 64
+// Must match gpuVulkanMaxBuffers in compiler/gpu_offload.go, which keeps
+// larger kernels on the CPU at compile time.
 #define SPMD_VK_MAX_BUFFERS 8
 #define SPMD_VK_SLOTS (1 + SPMD_VK_MAX_BUFFERS)
 #define SPMD_VK_PAGE 4096u
@@ -98,6 +102,10 @@ static VkCommandPool g_cmdpool;
 static VkCommandBuffer g_cmd;
 static VkFence g_fence;
 static VkDescriptorPool g_descpool;
+// Device limits read at init (VkPhysicalDeviceLimits).
+static uint32_t g_max_storage_buffers;
+static uint32_t g_max_storage_range;
+static uint32_t g_max_uniform_range;
 
 static int g_init_done;
 static int g_available;
@@ -214,6 +222,9 @@ static int32_t spmd_vk_available_locked(void) {
         return 0;
     }
     vkGetPhysicalDeviceMemoryProperties(g_phys, &g_memprops);
+    g_max_storage_buffers = bestProps.limits.maxPerStageDescriptorStorageBuffers;
+    g_max_storage_range = bestProps.limits.maxStorageBufferRange;
+    g_max_uniform_range = bestProps.limits.maxUniformBufferRange;
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -384,6 +395,12 @@ static int32_t spmd_vk_register_locked(int32_t kernelID, const char *spirv, uint
                 (int)kernelID, (int)bufCount, SPMD_VK_MAX_BUFFERS);
         return 0;
     }
+    if ((uint32_t)bufCount > g_max_storage_buffers) {
+        // Pipeline layout creation would fail on this device.
+        fprintf(stderr, "spmd_gpu(vulkan): kernel %d wants %d storage buffers, device maxPerStageDescriptorStorageBuffers is %u\n",
+                (int)kernelID, (int)bufCount, g_max_storage_buffers);
+        return 0;
+    }
     if (spirv == NULL || spirvLen == 0 || spirvLen % 4 != 0) {
         fprintf(stderr, "spmd_gpu(vulkan): kernel %d has invalid SPIR-V length %u\n", (int)kernelID, spirvLen);
         return 0;
@@ -498,11 +515,24 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
     // of their 4-byte alignment and are never smaller than the Go blob).
     VkDeviceSize paramsSize = ((VkDeviceSize)paramsLen + 15u) & ~(VkDeviceSize)15u;
     if (paramsSize < 16) paramsSize = 16;
+    // Descriptors are bound with VK_WHOLE_SIZE, so the range is the slot's
+    // page-rounded size; that must fit the device's per-descriptor range limit.
+    if (((paramsSize + SPMD_VK_PAGE - 1) & ~(VkDeviceSize)(SPMD_VK_PAGE - 1)) > g_max_uniform_range) {
+        fprintf(stderr, "spmd_gpu(vulkan): kernel %d params (%llu bytes) exceed device maxUniformBufferRange %u\n",
+                (int)kernelID, (unsigned long long)paramsSize, g_max_uniform_range);
+        return 0;
+    }
     if (!spmd_vk_slot_ensure(&g_slots[0], paramsSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
         return 0;
     }
     for (uint32_t i = 0; i < bufCount; i++) {
         VkDeviceSize sz = ((VkDeviceSize)desc[i].byteLen + 3u) & ~(VkDeviceSize)3u;
+        VkDeviceSize szPage = ((sz < 4 ? 4 : sz) + SPMD_VK_PAGE - 1) & ~(VkDeviceSize)(SPMD_VK_PAGE - 1);
+        if (szPage > g_max_storage_range) {
+            fprintf(stderr, "spmd_gpu(vulkan): kernel %d buffer %u (%llu bytes) exceeds device maxStorageBufferRange %u\n",
+                    (int)kernelID, i, (unsigned long long)sz, g_max_storage_range);
+            return 0;
+        }
         if (!spmd_vk_slot_ensure(&g_slots[i + 1], sz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
             return 0;
         }
@@ -519,14 +549,14 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
             continue;
         }
         uint32_t len = desc[i].byteLen;
-        uint32_t rounded = (len + 3u) & ~3u;
+        VkDeviceSize rounded = ((VkDeviceSize)len + 3u) & ~(VkDeviceSize)3u;
         if (len > 0) {
             memcpy(g_slots[i + 1].mapped, (const void *)(uintptr_t)desc[i].dataPtr, len);
         }
         // Byte slices are packed into u32 words: the last word's unused
         // bytes must be zero, not stale data from an earlier launch.
         if (rounded != len) {
-            memset((uint8_t *)g_slots[i + 1].mapped + len, 0, rounded - len);
+            memset((uint8_t *)g_slots[i + 1].mapped + len, 0, (size_t)(rounded - len));
         }
     }
 
