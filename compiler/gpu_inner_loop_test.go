@@ -65,17 +65,14 @@ func TestGPUInnerLoopSummaryGolden(t *testing.T) {
 var<private> tbl_tbl: array<u32, 16> = array<u32, 16>(0u, 1u, 0u, 2u, 0u, 4u, 0u, 8u, 0u, 16u, 0u, 32u, 0u, 64u, 0u, 128u);
 @compute @workgroup_size(64)
 fn spmd_kernel_0(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let w_1: u32 = gid.x;
-  for (var lane: u32 = 0u; lane < 4u; lane++) {
-    let w: i32 = i32(w_1 * 4u + lane);
-    if (w >= params.n) { break; }
-    var acc: u32 = 0;
-    for (var j: i32 = 0; j < 32; j = (j + 1)) {
-      var c: u32 = tbl_tbl[u32((((text[u32(((32 * w) + j)) >> 2u] >> ((u32(((32 * w) + j)) & 3u) * 8u)) & 0xffu) & 15))];
-      acc = (acc | u32(c));
-    }
-    sum[w] = acc;
+  let w: i32 = i32(gid.x);
+  if (w >= params.n) { return; }
+  var acc: u32 = 0;
+  for (var j: i32 = 0; j < 32; j = (j + 1)) {
+    var c: u32 = tbl_tbl[u32((((text[u32(((32 * w) + j)) >> 2u] >> ((u32(((32 * w) + j)) & 3u) * 8u)) & 0xffu) & 15))];
+    acc = (acc | u32(c));
   }
+  sum[w] = acc;
 }
 `
 	if got := transpileOK(t, innerLoopSummarySrc); got != golden {
@@ -283,4 +280,61 @@ func captureStderr(t *testing.T, fn func()) string {
 	w.Close()
 	os.Stderr = old
 	return <-done
+}
+
+// TestGPUInnerLoopPackedReadOneLane checks that a kernel reading a packed byte
+// slice inside an inner loop runs one iteration per invocation: on RADV an
+// inner loop nested in the packed lane loop is ~10x slower, and removing the
+// lane loop recovers it (prototype E). Reads keep the packed unpack, and the
+// launch dispatches one invocation per trip.
+func TestGPUInnerLoopPackedReadOneLane(t *testing.T) {
+	plan := parseAndAnalyzeGPULoop(t, innerLoopSummarySrc, 1)
+	k, err := transpileWGSL(plan, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k.LanesPerInvocation != 1 {
+		t.Errorf("LanesPerInvocation = %d, want 1", k.LanesPerInvocation)
+	}
+	if strings.Contains(k.WGSL, "lane") {
+		t.Errorf("inner-loop kernel must not emit a lane loop:\n%s", k.WGSL)
+	}
+	for _, want := range []string{"let w: i32 = i32(gid.x);", "if (w >= params.n) { return; }", ">> 2u]"} {
+		if !strings.Contains(k.WGSL, want) {
+			t.Errorf("WGSL missing %q:\n%s", want, k.WGSL)
+		}
+	}
+	nagaValidate(t, k.WGSL)
+}
+
+// TestGPUInnerLoopPackedWriteKeepsLaneLoop checks that a body with an inner
+// loop that WRITES a packed byte slice keeps four lanes per invocation: a u32
+// word holds four bytes, so one invocation must own the whole word.
+func TestGPUInnerLoopPackedWriteKeepsLaneLoop(t *testing.T) {
+	const src = `
+package p
+
+import "lanes"
+
+func f(dst []byte, src []uint32) {
+	go for i := range len(dst) {
+		var acc lanes.Varying[uint32]
+		for j := range 8 {
+			acc = acc + src[i] + lanes.Varying[uint32](j)
+		}
+		dst[i] = lanes.Varying[byte](acc)
+	}
+}
+`
+	plan := parseAndAnalyzeGPULoop(t, src, 1)
+	if plan.Reject != "" {
+		t.Fatalf("rejected: %s", plan.Reject)
+	}
+	k, err := transpileWGSL(plan, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k.LanesPerInvocation != 4 || !strings.Contains(k.WGSL, "lane < 4u") {
+		t.Errorf("LanesPerInvocation = %d, want 4 with a lane loop:\n%s", k.LanesPerInvocation, k.WGSL)
+	}
 }

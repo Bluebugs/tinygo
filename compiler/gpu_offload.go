@@ -693,10 +693,12 @@ func (b *builder) gpuEmitGuard(loop *spmdActiveLoop) {
 	paramsPtr, paramsSize := b.gpuBuildParams(loop, bound, pos)
 	bufsPtr, bufCount := b.gpuBuildBuffers(loop, bound, pos)
 	i32 := b.ctx.Int32Type()
-	// launchN counts compute INVOCATIONS, not loop iterations: the host
-	// dispatches ceil(launchN / wgslWorkgroupSize) workgroups, and each
-	// invocation runs k.LanesPerInvocation iterations (Params.n, set from
-	// bound above, still bounds the iteration index in the shader).
+	// launchN counts compute INVOCATIONS, not loop iterations (it is the
+	// trip count when LanesPerInvocation is 1, including inner-loop kernels
+	// over byte slices): the host dispatches
+	// ceil(launchN / wgslWorkgroupSize) workgroups, and each invocation runs
+	// k.LanesPerInvocation iterations (Params.n, set from bound above, still
+	// bounds the iteration index in the shader).
 	launchN := b.gpuToI32(bound, false)
 	if k.LanesPerInvocation > 1 {
 		if k.LanesPerInvocation != 4 {

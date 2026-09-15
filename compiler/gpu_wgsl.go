@@ -128,6 +128,14 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 	if len(e.byteBufs) > 0 {
 		lanes = 4
 	}
+	// An inner loop nested in the packed lane loop gives a ~6x slower launch (measured) on RADV
+	// (see docs/gpu-offload-webgpu.md "Inner loops"), so such a body gets one
+	// iteration per invocation. Packed reads are unaffected; a packed byte
+	// WRITE still needs the lane loop, because one invocation must own the
+	// whole u32 word it read-modify-writes.
+	if lanes == 4 && gpuPlanHasNestedLoop(plan) && !gpuWritesByteSlice(buffers) {
+		lanes = 1
+	}
 
 	// The packed byte store declares WGSL lets; pick names that cannot
 	// shadow any Go identifier or buffer the store's operands refer to.
@@ -1339,4 +1347,38 @@ func constLiteral(v constant.Value, wgslTy string) string {
 		return s
 	}
 	return v.String()
+}
+
+// gpuPlanHasNestedLoop reports whether the go for body, or a function inlined
+// into it, contains a for or range statement.
+func gpuPlanHasNestedLoop(plan *gpuLoopPlan) bool {
+	found := false
+	visit := func(n ast.Node) {
+		ast.Inspect(n, func(n ast.Node) bool {
+			switch n.(type) {
+			case *ast.ForStmt, *ast.RangeStmt:
+				found = true
+			case *ast.FuncLit:
+				return false
+			}
+			return !found
+		})
+	}
+	visit(plan.Body)
+	for _, decl := range plan.Inlined {
+		if decl.Body != nil {
+			visit(decl.Body)
+		}
+	}
+	return found
+}
+
+// gpuWritesByteSlice reports whether any buffer is a written byte slice.
+func gpuWritesByteSlice(buffers []gpuFreeVar) bool {
+	for _, b := range buffers {
+		if b.Kind == gpuSliceRW && gpuIsByteSlice(b.Obj.Type()) {
+			return true
+		}
+	}
+	return false
 }
