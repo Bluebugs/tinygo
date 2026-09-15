@@ -66,3 +66,34 @@ func TestGPUWriteIndexRejected(t *testing.T) {
 		})
 	}
 }
+
+func TestGPUWrittenSliceReadAccepted(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"own element plain", "dst[i] = dst[i] + 1"},
+		{"own element scaled", "dst[i*2+1] = dst[i*2+1] ^ src[i]"},
+		{"compound", "dst[i] += src[i]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := parseAndAnalyzeGPULoop(t, gpuWriteIndexSrc(tc.body), 1)
+			if plan.Reject != "" {
+				t.Fatalf("unexpected reject: %s", plan.Reject)
+			}
+		})
+	}
+}
+
+func TestGPUWrittenSliceReadRejected(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"neighbor", "dst[i] = dst[i+1]"},
+		{"constant", "dst[i] = dst[0]"},
+		{"other statement", "x := dst[i+1]\n\t\tdst[i] = x"},
+		{"same index other statement", "x := dst[i]\n\t\tdst[i] = x + 1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := parseAndAnalyzeGPULoop(t, gpuWriteIndexSrc(tc.body), 1)
+			if !strings.Contains(plan.Reject, "both read and written") {
+				t.Fatalf("Reject = %q, want a read-while-written rejection", plan.Reject)
+			}
+		})
+	}
+}

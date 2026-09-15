@@ -317,8 +317,12 @@ func f(dst, src []byte) {
 }
 `
 	wgsl := transpileOK(t, src)
-	body := wgsl[strings.Index(wgsl, "for (var lane"):]
-	if strings.Contains(body, "return;") && !strings.Contains(body, "continue;") {
+	at := strings.Index(wgsl, "for (var lane")
+	if at < 0 {
+		t.Fatalf("missing lane loop:\n%s", wgsl)
+	}
+	body := wgsl[at:]
+	if !strings.Contains(body, "continue;") || strings.Contains(body, "return;") {
 		t.Errorf("a Go continue must continue the lane loop, not return from the invocation:\n%s", wgsl)
 	}
 }
@@ -435,4 +439,54 @@ func TestGPUTableNoTableUnchangedOutput(t *testing.T) {
 	if strings.Contains(wgsl, "var<private>") {
 		t.Errorf("unexpected table declaration:\n%s", wgsl)
 	}
+}
+
+func TestGPUOneLaneBodyContinueReturns(t *testing.T) {
+	wgsl := transpileOK(t, "package p\n\nfunc f(dst, src []int32) {\n\tgo for i := range len(src) {\n\t\tif src[i] == 0 {\n\t\t\tcontinue\n\t\t}\n\t\tdst[i] = src[i]\n\t}\n}\n")
+	if !strings.Contains(wgsl, "return;") || strings.Contains(wgsl, "continue;") {
+		t.Errorf("a body-level continue at one lane per invocation must lower to return;:\n%s", wgsl)
+	}
+}
+
+func TestGPUOneLaneNestedContinueStays(t *testing.T) {
+	wgsl := transpileOK(t, "package p\n\nfunc f(dst, src []int32) {\n\tgo for i := range len(src) {\n\t\tvar s int32 = 0\n\t\tfor c := 0; c < 4; c++ {\n\t\t\tif c == 1 {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\ts++\n\t\t}\n\t\tdst[i] = src[i] + s\n\t}\n}\n")
+	if !strings.Contains(wgsl, "continue;") {
+		t.Errorf("a continue inside a nested for must stay continue;:\n%s", wgsl)
+	}
+}
+
+func TestGPUForPostCompoundAssign(t *testing.T) {
+	for _, tc := range []struct{ name, decl, loop, want string }{
+		{"int", "", "for c := 0; c < 8; c += 2", "c = (c + 2)"},
+		{"byte", "var b byte = 250\n\t\t", "for ; b != 4; b += 2", "b = ((b + 2) & 0xffu)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "package p\n\nfunc f(dst, src []uint32) {\n\tgo for i := range len(src) {\n\t\tvar sum uint32 = 0\n\t\t" + tc.decl + tc.loop + " {\n\t\t\tsum++\n\t\t}\n\t\tdst[i] = src[i] + sum\n\t}\n}\n"
+			wgsl := transpileOK(t, src)
+			if !strings.Contains(wgsl, tc.want) {
+				t.Errorf("for post clause must emit %q:\n%s", tc.want, wgsl)
+			}
+		})
+	}
+}
+
+func TestGPUShiftCountRejected(t *testing.T) {
+	for _, tc := range []struct{ name, expr string }{
+		{"uniform count", "src[i] << s"},
+		{"varying count", "src[i] >> uint(src[i])"},
+		{"constant too wide", "src[i] << 32"},
+		{"byte constant too wide", "int32(byte(src[i]) >> 8)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "package p\n\nfunc f(dst, src []int32, s uint) {\n\tgo for i := range len(src) {\n\t\tdst[i] = " + tc.expr + "\n\t}\n}\n"
+			plan := parseAndAnalyzeGPULoop(t, src, 1)
+			if !strings.Contains(plan.Reject, "shift") {
+				t.Fatalf("Reject = %q, want a shift rejection", plan.Reject)
+			}
+		})
+	}
+}
+
+func TestGPUShiftConstantCountAccepted(t *testing.T) {
+	transpileOK(t, "package p\n\nfunc f(dst, src []int32) {\n\tgo for i := range len(src) {\n\t\tdst[i] = src[i] >> 4 + src[i] << 31 + (1 << 20)\n\t}\n}\n")
 }

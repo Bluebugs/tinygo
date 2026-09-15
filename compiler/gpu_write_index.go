@@ -22,6 +22,11 @@ package compiler
 // words [Cw+minK/4, Cw+minK/4+C), disjoint across invocations. A written
 // byte slice must also not be read elsewhere in the kernel, or one
 // invocation could observe a word another is rewriting.
+//
+// Any other written slice may be read only as the old value of the
+// element being stored: the target of its own `++`/`--`/`op=`, or a read
+// in the right-hand side of a plain `=` at the same C and K as the
+// left-hand side. Any other read could be another invocation's write.
 
 import (
 	"fmt"
@@ -46,8 +51,9 @@ func (a *gpuAnalyzer) writeIndexReject(body *ast.BlockStmt, iterIdent *ast.Ident
 
 	writes := map[*types.Var][]gpuAffineWrite{}
 	targets := map[*ast.IndexExpr]bool{}
+	ownReads := map[*ast.IndexExpr]bool{}
 	var reject string
-	record := func(target ast.Expr) {
+	record := func(target ast.Expr, rhs []ast.Expr) {
 		if reject != "" {
 			return
 		}
@@ -73,15 +79,35 @@ func (a *gpuAnalyzer) writeIndexReject(body *ast.BlockStmt, iterIdent *ast.Ident
 		}
 		writes[v] = append(writes[v], gpuAffineWrite{c, k})
 		targets[idx] = true
+		for _, r := range rhs {
+			ast.Inspect(r, func(n ast.Node) bool {
+				ri, ok := n.(*ast.IndexExpr)
+				if !ok {
+					return true
+				}
+				rid, ok := ri.X.(*ast.Ident)
+				if !ok || a.info.Uses[rid] != v {
+					return true
+				}
+				if rc, rk, ok := a.affineInIter(ri.Index, iterObj); ok && rc == c && rk == k {
+					ownReads[ri] = true
+				}
+				return true
+			})
+		}
 	}
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch s := n.(type) {
 		case *ast.AssignStmt:
+			var rhs []ast.Expr
+			if s.Tok == token.ASSIGN {
+				rhs = s.Rhs
+			}
 			for _, lhs := range s.Lhs {
-				record(lhs)
+				record(lhs, rhs)
 			}
 		case *ast.IncDecStmt:
-			record(s.X)
+			record(s.X, nil)
 		}
 		return reject == ""
 	})
@@ -119,8 +145,16 @@ func (a *gpuAnalyzer) writeIndexReject(body *ast.BlockStmt, iterIdent *ast.Ident
 		if !ok {
 			return true
 		}
-		if v, ok := a.info.Uses[ident].(*types.Var); ok && writes[v] != nil && gpuIsByteSlice(v.Type()) {
+		v, ok := a.info.Uses[ident].(*types.Var)
+		if !ok || writes[v] == nil {
+			return true
+		}
+		if gpuIsByteSlice(v.Type()) {
+			// Stricter than the non-byte rule: even an own-element read
+			// stays rejected, as before.
 			reject = fmt.Sprintf("byte slice %s is both read and written in GPU-offloaded loop (invocations could race on a shared word)", ident.Name)
+		} else if !ownReads[idx] {
+			reject = fmt.Sprintf("slice %s is both read and written in GPU-offloaded loop at an index other than the stored element's own (invocations could race)", ident.Name)
 		}
 		return true
 	})

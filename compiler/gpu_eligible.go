@@ -425,6 +425,11 @@ func (a *gpuAnalyzer) checkExpr(expr ast.Expr, depth int) string {
 		return a.checkExpr(x.X, depth)
 
 	case *ast.BinaryExpr:
+		if x.Op == token.SHL || x.Op == token.SHR {
+			if reject := a.checkShift(x); reject != "" {
+				return reject
+			}
+		}
 		if reject := a.checkExpr(x.X, depth); reject != "" {
 			return reject
 		}
@@ -487,6 +492,33 @@ func (a *gpuAnalyzer) checkExpr(expr ast.Expr, depth int) string {
 	default:
 		return fmt.Sprintf("expression type %T not eligible for GPU offload", expr)
 	}
+}
+
+// checkShift fails closed on shift counts Go and WGSL disagree on: Go
+// defines a count >= the operand width (0 or sign fill), WGSL does not.
+// Only constant counts below the width are eligible. int/uint/uintptr are
+// held to 32 bits because they lower to 32-bit WGSL types.
+func (a *gpuAnalyzer) checkShift(x *ast.BinaryExpr) string {
+	if a.info.Types[x].Value != nil {
+		return "" // folded by the type checker
+	}
+	count, ok := a.constInt(x.Y)
+	if !ok {
+		return fmt.Sprintf("shift count %s is not a compile-time constant (not eligible for GPU offload)", exprString(x.Y))
+	}
+	width := int64(32)
+	if b, ok := gpuUnwrapSPMD(a.info.TypeOf(x.X)).Underlying().(*types.Basic); ok {
+		switch b.Kind() {
+		case types.Int8, types.Uint8:
+			width = 8
+		case types.Int16, types.Uint16:
+			width = 16
+		}
+	}
+	if count < 0 || count >= width {
+		return fmt.Sprintf("shift count %d >= operand width %d not eligible for GPU offload", count, width)
+	}
+	return ""
 }
 
 // constStringOf reports whether e names a string constant, returning its

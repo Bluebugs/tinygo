@@ -154,6 +154,7 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 	}
 	e.tmpIdx, e.tmpShift, e.tmpRet = fresh("j"), fresh("sh"), fresh("spmd_bret")
 	e.freshName = fresh
+	e.lanes = lanes
 
 	padFields := wgslprint.PadTo16(len(params))
 	paramsSize := uint32((len(params) + padFields) * 4)
@@ -267,7 +268,8 @@ type wgslEmitter struct {
 
 	byteBufs                 map[types.Object]bool // free byte-slice buffers, packed 4 per u32 word
 	tmpIdx, tmpShift, tmpRet string                // collision-free WGSL names used by packed byte stores
-	byteRetCounter           int                   // numbers inlined-call result temporaries for packed byte stores
+	lanes                    int                   // loop iterations per compute invocation (LanesPerInvocation)
+	loopDepth                int                   // WGSL loops enclosing the statement being emitted, excluding the lane loop
 
 	// tables/tableOrder/freshName support constant string lookup tables
 	// (T[x] where T is a Go string constant). tables maps the constant
@@ -405,7 +407,9 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 			}
 			condTxt = s
 		}
-		if post, ok := x.Post.(*ast.IncDecStmt); ok && x.Post != nil {
+		switch post := x.Post.(type) {
+		case nil:
+		case *ast.IncDecStmt:
 			if _, packed := e.packedByteTarget(post.X); packed {
 				return fmt.Errorf("transpileWGSL: unsupported byte-slice element as for-loop post target")
 			}
@@ -414,13 +418,23 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 				return err
 			}
 			postTxt = fmt.Sprintf("%s = %s", lv, rhs)
+		case *ast.AssignStmt:
+			s, err := e.forPostAssignText(post)
+			if err != nil {
+				return err
+			}
+			postTxt = s
+		default:
+			return fmt.Errorf("transpileWGSL: unsupported for-loop post statement %T", x.Post)
 		}
 		e.writeIndent()
 		fmt.Fprintf(e.sb, "for (%s; %s; %s) {\n", initTxt, condTxt, postTxt)
 		e.indent++
+		e.loopDepth++
 		if err := e.emitStmts(x.Body.List, retTarget); err != nil {
 			return err
 		}
+		e.loopDepth--
 		e.indent--
 		e.writeIndent()
 		e.sb.WriteString("}\n")
@@ -442,9 +456,11 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 		e.writeIndent()
 		fmt.Fprintf(e.sb, "for (var %s: i32 = 0; %s < %s; %s = (%s + 1)) {\n", name, name, bound, name, name)
 		e.indent++
+		e.loopDepth++
 		if err := e.emitStmts(x.Body.List, retTarget); err != nil {
 			return err
 		}
+		e.loopDepth--
 		e.indent--
 		e.writeIndent()
 		e.sb.WriteString("}\n")
@@ -456,7 +472,13 @@ func (e *wgslEmitter) emitStmt(stmt ast.Stmt, retTarget string) error {
 		case token.BREAK:
 			e.sb.WriteString("break;\n")
 		case token.CONTINUE:
-			e.sb.WriteString("continue;\n")
+			if e.loopDepth == 0 && e.lanes == 1 {
+				// No lane loop encloses the body at one lane per
+				// invocation; ending the invocation is "next iteration".
+				e.sb.WriteString("return;\n")
+			} else {
+				e.sb.WriteString("continue;\n")
+			}
 		default:
 			return fmt.Errorf("transpileWGSL: unsupported branch statement %s", x.Tok)
 		}
@@ -613,8 +635,7 @@ func (e *wgslEmitter) emitInlinedCall(assign *ast.AssignStmt, call *ast.CallExpr
 		if assign.Tok != token.ASSIGN {
 			return fmt.Errorf("transpileWGSL: unsupported %s of an inlined call into a byte slice", assign.Tok)
 		}
-		e.byteRetCounter++
-		tmp := fmt.Sprintf("%s_%d", e.tmpRet, e.byteRetCounter)
+		tmp := e.freshName(e.tmpRet)
 		e.writeIndent()
 		fmt.Fprintf(e.sb, "var %s: u32;\n", tmp)
 		packedIdx = idx
@@ -776,6 +797,28 @@ func (e *wgslEmitter) emitPackedByteUpdate(idx *ast.IndexExpr, op, rhs string) e
 		return err
 	}
 	return e.emitPackedByteStore(idx, fmt.Sprintf("(%s %s %s)", old, op, rhs))
+}
+
+// forPostAssignText lowers a for-loop post assignment (e.g. `c += 2`)
+// through emitAssign, so it gets the same byte masking, and returns the
+// single statement without indent or `;` for the for header.
+func (e *wgslEmitter) forPostAssignText(x *ast.AssignStmt) (string, error) {
+	if _, packed := e.packedByteTarget(x.Lhs[0]); packed || x.Tok == token.DEFINE {
+		return "", fmt.Errorf("transpileWGSL: unsupported for-loop post assignment")
+	}
+	saved, savedIndent := e.sb, e.indent
+	var tmp strings.Builder
+	e.sb, e.indent = &tmp, 0
+	err := e.emitAssign(x, "")
+	e.sb, e.indent = saved, savedIndent
+	if err != nil {
+		return "", err
+	}
+	s := strings.TrimSuffix(tmp.String(), ";\n")
+	if strings.ContainsAny(s, ";\n") {
+		return "", fmt.Errorf("transpileWGSL: for-loop post assignment does not lower to one statement")
+	}
+	return s, nil
 }
 
 // incDecText lowers an IncDecStmt's `x++`/`x--` to its WGSL lvalue text and

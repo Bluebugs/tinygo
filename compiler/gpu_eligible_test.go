@@ -761,7 +761,8 @@ func kernel(n int, output []int) {
 	}
 }
 
-// A read through a *different* index still counts as a read.
+// A read through a *different* index could observe another invocation's
+// write, so the whole loop is ineligible (not merely non-write-only).
 func TestGPUEligibleWriteOnlyRejectedWhenReadAtOtherIndex(t *testing.T) {
 	src := `package test
 
@@ -771,9 +772,9 @@ func kernel(n int, output []int) {
 	}
 }
 `
-	out, _ := gpuWriteOnlyFlag(t, src, "output")
-	if out.WriteOnly {
-		t.Errorf("output: expected WriteOnly=false, output[0] is a read")
+	plan := parseAndAnalyzeGPULoop(t, src, 1_000_000)
+	if !strings.Contains(plan.Reject, "both read and written") {
+		t.Errorf("Reject = %q, want a read-while-written rejection", plan.Reject)
 	}
 }
 
