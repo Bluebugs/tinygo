@@ -16,6 +16,7 @@ var (
 	validPanicStrategyOptions = []string{"print", "trap"}
 	validOptOptions           = []string{"none", "0", "1", "2", "s", "z"}
 	validGPUOptions           = []string{"none", "webgpu"}
+	validGPUHostOptions       = []string{"browser", "vulkan"}
 )
 
 // Options contains extra options to give to the compiler. These options are
@@ -136,8 +137,8 @@ func (o *Options) Verify() error {
 		}
 	}
 
-	if o.GPUHost != "" && o.GPUHost != "browser" {
-		return fmt.Errorf("invalid -gpu-host=%s: valid values are browser", o.GPUHost)
+	if o.GPUHost != "" && !isInArray(validGPUHostOptions, o.GPUHost) {
+		return fmt.Errorf("invalid -gpu-host=%s: valid values are %s", o.GPUHost, strings.Join(validGPUHostOptions, ", "))
 	}
 
 	return nil

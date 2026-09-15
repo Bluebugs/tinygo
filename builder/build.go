@@ -213,6 +213,7 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 		GPU:                config.GPU(),
 		GPUThresholdOps:    config.GPUThresholdOps(),
 		GPUVerbose:         config.GPUVerbose(),
+		GPUHost:            config.GPUHost(),
 		Scheduler:          config.Scheduler(),
 		AutomaticStackSize: config.AutomaticStackSize(),
 		DefaultStackSize:   config.StackSize(),

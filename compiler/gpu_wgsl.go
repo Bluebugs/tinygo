@@ -40,6 +40,7 @@ type gpuKernel struct {
 	Params     []gpuFreeVar // uniform scalars, in Params struct field order (excluding trailing alignment padding); Task 6 iterates this to fill the uniform buffer
 	ParamsSize uint32       // total byte size of the Params struct incl. padding (wgslprint.PadTo16-computed); Task 6 asserts LLVM struct size equals this
 	Buffers    []gpuFreeVar // slices, in @binding order starting at 1
+	SPIRV      []byte       // naga-compiled WGSL; set only for -gpu-host=vulkan
 
 	// LanesPerInvocation is how many loop iterations one compute invocation
 	// runs: 4 when any buffer is a byte slice (bytes are packed four per

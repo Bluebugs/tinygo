@@ -58,6 +58,7 @@ type Config struct {
 	GPU                string // "none" (default) or "webgpu" (-gpu flag)
 	GPUThresholdOps    uint64 // minimum estimated op count for GPU offload (-gpu-threshold flag)
 	GPUVerbose         bool   // print GPU offload decisions (-gpu-verbose flag)
+	GPUHost            string // GPU host backend: "" (default), "browser" or "vulkan" (-gpu-host flag)
 	Scheduler          string
 	AutomaticStackSize bool
 	DefaultStackSize   uint64
@@ -94,6 +95,7 @@ type compilerContext struct {
 	uintptrType      llvm.Type
 	program          *ssa.Program
 	diagnostics      []error
+	gpuNagaMissing   bool // the missing-naga hard error was already reported
 	functionInfos    map[*ssa.Function]functionInfo
 	astComments      map[string]*ast.CommentGroup
 	embedGlobals     map[string][]*loader.EmbedFile

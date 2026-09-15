@@ -37,6 +37,15 @@ func NewConfig(options *compileopts.Options) (*compileopts.Config, error) {
 		}
 	}
 
+	if options.GPUHost == "vulkan" {
+		if options.GPU != "webgpu" {
+			return nil, fmt.Errorf("-gpu-host=vulkan requires -gpu=webgpu")
+		}
+		if spec.GOARCH == "wasm" || spec.GOOS != "linux" || spec.GOARCH != "amd64" {
+			return nil, fmt.Errorf("-gpu-host=vulkan currently requires native linux/amd64, got %s/%s", spec.GOOS, spec.GOARCH)
+		}
+	}
+
 	if options.OpenOCDCommands != nil {
 		// Override the OpenOCDCommands from the target spec if specified on
 		// the command-line

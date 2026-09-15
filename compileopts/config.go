@@ -246,6 +246,9 @@ func (c *Config) BuildTags() []string {
 	if c.GPUHost() == "browser" {
 		tags = append(tags, "spmd.gpu.host.browser") // gates src/runtime/gpu_wasm.go (I6)
 	}
+	if c.GPUHost() == "vulkan" {
+		tags = append(tags, "spmd.gpu.host.vulkan") // gates src/runtime/gpu_vulkan.go
+	}
 	switch c.Scheduler() {
 	case "threads", "cores":
 	default:

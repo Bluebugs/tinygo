@@ -182,6 +182,22 @@ func Get(name string) string {
 		}
 
 		return findWasmOpt()
+	case "NAGA":
+		// WGSL -> SPIR-V translator for -gpu-host=vulkan. cargo installs to
+		// ~/.cargo/bin, which is often not on PATH.
+		if path := os.Getenv("NAGA"); path != "" {
+			return path
+		}
+		if path, err := exec.LookPath("naga"); err == nil {
+			return path
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			path := filepath.Join(home, ".cargo", "bin", "naga")
+			if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() && st.Mode().Perm()&0o111 != 0 {
+				return path
+			}
+		}
+		return ""
 	case "WASMTOOLS":
 		if path := os.Getenv("WASMTOOLS"); path != "" {
 			return path

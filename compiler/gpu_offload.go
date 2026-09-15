@@ -42,6 +42,7 @@ import (
 	"hash/fnv"
 	"math"
 	"os"
+	"os/exec"
 	"sort"
 	"sync"
 
@@ -169,6 +170,23 @@ func (b *builder) gpuAnalyzeLoop(loop *spmdActiveLoop) {
 	if err != nil {
 		b.gpuReport(loop, "skipped: WGSL transpilation failed: %v", err)
 		return
+	}
+	if b.GPUHost == "vulkan" {
+		if _, err := exec.LookPath(nagaPath()); err != nil {
+			// Hard error, not a CPU fallback: silently skipping every loop
+			// would make all GPU correctness gates vacuous.
+			if !b.gpuNagaMissing {
+				b.gpuNagaMissing = true
+				b.addError(loop.info.ForPos, "-gpu-host=vulkan requires the naga WGSL compiler (set NAGA or install naga-cli)")
+			}
+			return
+		}
+		spv, err := wgslToSPIRV(kernel.WGSL)
+		if err != nil {
+			b.gpuReport(loop, "skipped: SPIR-V conversion failed: %v", err)
+			return
+		}
+		kernel.SPIRV = spv
 	}
 	// Resolve every launch argument to an SSA value available at the guard
 	// point *before* committing to the GPU path, so a failure here is a clean
@@ -535,6 +553,30 @@ func (b *builder) spmdGPUMaybeEmitGuard(block *ssa.BasicBlock, instr ssa.Instruc
 	}
 }
 
+// gpuRegisterArgs describes the host-specific part of the spmdGPURegister
+// call. It is kept free of LLVM so the per-host call shape can be unit-tested.
+type gpuRegisterArgs struct {
+	shader       string // WGSL source, or SPIR-V bytes for the vulkan host
+	shaderName   string // LLVM global name for the shader constant
+	withBufCount bool   // vulkan: trailing i32 buffer count argument
+	bufCount     int32
+}
+
+// gpuRegisterPayload selects the spmdGPURegister arguments for host:
+// runtime.spmdGPURegister(id, spirv, entry, bufCount) for "vulkan", and the
+// original runtime.spmdGPURegister(id, wgsl, entry) for every other host.
+func gpuRegisterPayload(host string, k *gpuKernel) gpuRegisterArgs {
+	if host == "vulkan" {
+		return gpuRegisterArgs{
+			shader:       string(k.SPIRV),
+			shaderName:   "spmd$gpu$spirv",
+			withBufCount: true,
+			bufCount:     int32(len(k.Buffers)),
+		}
+	}
+	return gpuRegisterArgs{shader: k.WGSL, shaderName: "spmd$gpu$wgsl"}
+}
+
 func (b *builder) gpuEmitGuard(loop *spmdActiveLoop) {
 	off := loop.gpu
 	k := off.kernel
@@ -579,11 +621,16 @@ func (b *builder) gpuEmitGuard(loop *spmdActiveLoop) {
 	b.CreateCondBr(registered, launchBlock, regBlock)
 
 	b.SetInsertPointAtEnd(regBlock)
-	b.createRuntimeCall("spmdGPURegister", []llvm.Value{
+	payload := gpuRegisterPayload(b.GPUHost, k)
+	regArgs := []llvm.Value{
 		llvm.ConstInt(b.ctx.Int32Type(), uint64(k.ID), true),
-		b.gpuStringConstant(k.WGSL, "spmd$gpu$wgsl"),
+		b.gpuStringConstant(payload.shader, payload.shaderName),
 		b.gpuStringConstant(k.Entry, "spmd$gpu$entry"),
-	}, "")
+	}
+	if payload.withBufCount {
+		regArgs = append(regArgs, llvm.ConstInt(b.ctx.Int32Type(), uint64(payload.bufCount), true))
+	}
+	b.createRuntimeCall("spmdGPURegister", regArgs, "")
 	b.CreateStore(llvm.ConstInt(b.ctx.Int1Type(), 1, false), flag)
 	b.CreateBr(launchBlock)
 
