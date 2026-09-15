@@ -37,6 +37,7 @@ package compiler
 
 import (
 	"fmt"
+	"go/ast"
 	"go/token"
 	"go/types"
 	"hash/fnv"
@@ -244,12 +245,44 @@ func gpuLoopShapeReject(ssaLoop *ssa.SPMDLoopInfo) string {
 	if ssaLoop.TrampolineBlock != nil {
 		return "loop has an accumulator trampoline block"
 	}
+	// A body-level inner loop is transpiled to a WGSL for loop and costed by
+	// its trip count, so only constant-bound inner loops are offloaded.
+	for _, inner := range ssaLoop.InnerLoops {
+		if inner.TripCount < 0 {
+			return "inner loop has non-constant bound"
+		}
+	}
 	// The guard is appended after every instruction of entry, so entry must
 	// have at least a terminator for that to mean anything.
 	if len(entry.Instrs) == 0 {
 		return "loop entry block is empty"
 	}
 	return ""
+}
+
+// gpuInnerLoopNotPeeledReason is reported instead of the generic "not peeled"
+// reason when an unpeeled go for body contains a nested loop: the peeler only
+// handles a single constant-bound inner loop, so the user needs to know the
+// inner loop is what blocked offload.
+const gpuInnerLoopNotPeeledReason = "inner loop not peeled (non-constant bound or unsupported inner-loop shape)"
+
+// gpuBodyHasNestedLoop reports whether the go for body contains a for or
+// range statement.
+func gpuBodyHasNestedLoop(rs *ast.RangeStmt) bool {
+	if rs == nil || rs.Body == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(rs.Body, func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.ForStmt, *ast.RangeStmt:
+			found = true
+		case *ast.FuncLit:
+			return false
+		}
+		return !found
+	})
+	return found
 }
 
 // gpuCFGReject proves that adding the edge guard->DoneBlock cannot invalidate
@@ -276,6 +309,9 @@ func gpuLoopShapeReject(ssaLoop *ssa.SPMDLoopInfo) string {
 // meaningful value to contribute (this is the accumulator/reduction case the
 // design excludes).
 func (b *builder) gpuCFGReject(loop *spmdActiveLoop) string {
+	if loop.ssaLoopInfo == nil && loop.info != nil && gpuBodyHasNestedLoop(loop.info.RangeStmt) {
+		return gpuInnerLoopNotPeeledReason
+	}
 	if reason := gpuLoopShapeReject(loop.ssaLoopInfo); reason != "" {
 		return reason
 	}

@@ -246,6 +246,12 @@ func testCompilePackage(t *testing.T, options *compileopts.Options, file string)
 		// SIMDRegisterBytes has no effect on the generated IR.
 		SIMDEnabled:       config.SIMDEnabled(),
 		SIMDRegisterBytes: int(config.SIMDRegisterSize()),
+		// GPU options are propagated so GPU offload tests can exercise the
+		// gate through the full pipeline.
+		GPU:             config.GPU(),
+		GPUThresholdOps: config.GPUThresholdOps(),
+		GPUVerbose:      config.GPUVerbose(),
+		GPUHost:         config.GPUHost(),
 	}
 	machine, err := NewTargetMachine(compilerConfig)
 	if err != nil {

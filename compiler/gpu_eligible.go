@@ -1435,9 +1435,9 @@ func basicWGSLType(t *types.Basic) (string, string) {
 // bodyCost computes the §D3 weighted AST op count for a statement list:
 // arithmetic ops (+,-,*,&,|,^,<<,>>,&&,||) weight 1; division/remainder
 // (/, %) and sqrt calls weight 8; a nested uniform `for` loop multiplies
-// its own body's cost by its constant bound if the loop condition is of
-// the form `x < <int literal>`, or by 16 if the bound is not a compile-time
-// constant.
+// its own body's cost by its trip count when that is a compile-time
+// constant (`x < N` / `x <= N` for an integer constant N, or `range N` for a
+// constant N), or by 16 otherwise.
 func (a *gpuAnalyzer) bodyCost(stmts []ast.Stmt) uint64 {
 	var total uint64
 	for _, stmt := range stmts {
@@ -1450,18 +1450,20 @@ func (a *gpuAnalyzer) stmtCost(stmt ast.Stmt) uint64 {
 	if forStmt, ok := stmt.(*ast.ForStmt); ok {
 		innerCost := a.bodyCost(forStmt.Body.List)
 		mult := uint64(dynamicBoundMultiplier)
-		if n, ok := constLoopBound(forStmt.Cond); ok {
+		if n, ok := a.constLoopBound(forStmt.Cond); ok {
 			mult = n
 		}
 		return innerCost * mult
 	}
 	if rangeStmt, ok := stmt.(*ast.RangeStmt); ok {
 		// "for i := range n" over an integer bound (allowlisted by
-		// checkStmt above): no compile-time-constant-bound fast path
-		// (unlike the classic for's literal-comparison form), so always
-		// use the dynamic-bound multiplier.
+		// checkStmt above).
 		innerCost := a.bodyCost(rangeStmt.Body.List)
-		return innerCost * dynamicBoundMultiplier
+		mult := uint64(dynamicBoundMultiplier)
+		if n, ok := a.constUint(rangeStmt.X); ok {
+			mult = n
+		}
+		return innerCost * mult
 	}
 
 	var total uint64
@@ -1500,19 +1502,15 @@ const (
 )
 
 // constLoopBound reports whether cond is of the form `x < N` (or `x <= N`)
-// for an integer literal N, returning N (adjusted for <=) as the loop's
-// compile-time-constant trip count.
-func constLoopBound(cond ast.Expr) (uint64, bool) {
+// for an integer constant N (a literal or a named constant), returning N
+// (adjusted for <=) as the loop's compile-time-constant trip count.
+func (a *gpuAnalyzer) constLoopBound(cond ast.Expr) (uint64, bool) {
 	bin, ok := cond.(*ast.BinaryExpr)
 	if !ok {
 		return 0, false
 	}
-	lit, ok := bin.Y.(*ast.BasicLit)
-	if !ok || lit.Kind != token.INT {
-		return 0, false
-	}
-	var n uint64
-	if _, err := fmt.Sscanf(lit.Value, "%d", &n); err != nil {
+	n, ok := a.constUint(bin.Y)
+	if !ok {
 		return 0, false
 	}
 	switch bin.Op {
@@ -1523,4 +1521,14 @@ func constLoopBound(cond ast.Expr) (uint64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// constUint returns the value of e when the type checker proved it is a
+// non-negative integer constant.
+func (a *gpuAnalyzer) constUint(e ast.Expr) (uint64, bool) {
+	tv, ok := a.info.Types[e]
+	if !ok || tv.Value == nil || tv.Value.Kind() != constant.Int {
+		return 0, false
+	}
+	return constant.Uint64Val(tv.Value)
 }
