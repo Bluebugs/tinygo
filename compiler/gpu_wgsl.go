@@ -69,6 +69,7 @@ func transpileWGSL(plan *gpuLoopPlan, id int32) (*gpuKernel, error) {
 	e := &wgslEmitter{
 		info:      plan.Loop.TypesInfo,
 		iterIdent: plan.IterIdent.Name,
+		iterObj:   plan.Loop.TypesInfo.Defs[plan.IterIdent],
 		freeSubst: map[types.Object]string{},
 		locals:    map[types.Object]string{},
 		inlined:   plan.Inlined,
@@ -299,7 +300,8 @@ func (e *wgslEmitter) emitRangeValue(rs *ast.RangeStmt) error {
 // inlining, an SPMD callee's body) statement-by-statement into WGSL text.
 type wgslEmitter struct {
 	info      *types.Info
-	iterIdent string // the loop's own iteration variable; passed through unchanged
+	iterIdent string       // the loop's own iteration variable; passed through unchanged
+	iterObj   types.Object // iterIdent's defining object
 	freeSubst map[types.Object]string
 	locals    map[types.Object]string // ephemeral: active only while inlining a callee (param args + renamed callee locals)
 	inlined   map[*ast.CallExpr]*ast.FuncDecl
@@ -912,6 +914,15 @@ func (e *wgslEmitter) emitExpr(expr ast.Expr) (string, error) {
 				return "", err
 			}
 			return constLiteral(c.Val(), ty), nil
+		}
+		if v, ok := obj.(*types.Var); ok {
+			if e.iterObj != nil && v == e.iterObj {
+				return e.iterIdent, nil
+			}
+			// Neither a local, a free substitution, nor the iteration
+			// variable: the shader would reference an undeclared name and
+			// fail at shader creation. Fail closed to the CPU path.
+			return "", fmt.Errorf("transpileWGSL: variable %s is not declared in the kernel", x.Name)
 		}
 		return x.Name, nil
 

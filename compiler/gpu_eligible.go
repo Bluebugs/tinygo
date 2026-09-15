@@ -17,6 +17,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"sort"
 )
 
 // gpuFreeVar classifies a single free variable referenced by an
@@ -893,12 +894,18 @@ func (a *gpuAnalyzer) checkLocalTypes(node ast.Node) string {
 // freeVars discovers the loop body's free variables (objects declared
 // outside the RangeStmt's body and used inside it) via types.Info.Uses, and
 // classifies each as a uniform scalar or a read/read-write slice per §D2.
+//
+// Inlined callee bodies are part of the kernel, so they are scanned too: a
+// package-level variable referenced only inside a callee is just as free as
+// one referenced in the loop body. Objects declared inside a callee
+// (parameters and locals) are not free.
 func (a *gpuAnalyzer) freeVars(rangeStmt *ast.RangeStmt) ([]gpuFreeVar, string) {
 	bodyStart := rangeStmt.Body.Lbrace
 	bodyEnd := rangeStmt.Body.Rbrace
+	decls := a.inlinedDecls()
 
-	writes := a.writtenSliceObjs(rangeStmt.Body)
-	scalarWrites := a.writtenScalarObjs(rangeStmt.Body)
+	writes := a.writtenSliceObjs(rangeStmt.Body, decls...)
+	scalarWrites := a.writtenScalarObjs(rangeStmt.Body, decls...)
 	// Write-only candidates for the upload-skipping optimization (see
 	// gpuFreeVar.WriteOnly).  iterIdent is rangeStmt.Key when it is a
 	// plain identifier; anything else yields no candidates at all.
@@ -941,8 +948,11 @@ func (a *gpuAnalyzer) freeVars(rangeStmt *ast.RangeStmt) ([]gpuFreeVar, string) 
 			if iterVars[v] {
 				return true
 			}
-			// Declared inside the loop body -> not free.
+			// Declared inside the loop body or an inlined callee -> not free.
 			if v.Pos() >= bodyStart && v.Pos() < bodyEnd {
+				return true
+			}
+			if declaredInAny(v, decls) {
 				return true
 			}
 			if seen[v] {
@@ -969,6 +979,9 @@ func (a *gpuAnalyzer) freeVars(rangeStmt *ast.RangeStmt) ([]gpuFreeVar, string) 
 
 	visit(rangeStmt.X)
 	visit(rangeStmt.Body)
+	for _, d := range decls {
+		visit(d.Body)
+	}
 
 	if reject != "" {
 		return nil, reject
@@ -976,10 +989,43 @@ func (a *gpuAnalyzer) freeVars(rangeStmt *ast.RangeStmt) ([]gpuFreeVar, string) 
 	return free, ""
 }
 
+// inlinedDecls returns the distinct inlined callee declarations in source
+// order of their first call site. a.inlined is a map; iterating it directly
+// would make free-variable (and therefore buffer binding) order
+// nondeterministic.
+func (a *gpuAnalyzer) inlinedDecls() []*ast.FuncDecl {
+	calls := make([]*ast.CallExpr, 0, len(a.inlined))
+	for c := range a.inlined {
+		calls = append(calls, c)
+	}
+	sort.Slice(calls, func(i, j int) bool { return calls[i].Pos() < calls[j].Pos() })
+	seen := map[*ast.FuncDecl]bool{}
+	var out []*ast.FuncDecl
+	for _, c := range calls {
+		if d := a.inlined[c]; !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// declaredInAny reports whether v is declared (as a parameter, result or
+// local) within one of decls.
+func declaredInAny(v types.Object, decls []*ast.FuncDecl) bool {
+	for _, d := range decls {
+		if v.Pos() >= d.Pos() && v.Pos() < d.End() {
+			return true
+		}
+	}
+	return false
+}
+
 // writtenSliceObjs returns the set of *types.Var free slice objects that
 // appear as the target of an IndexExpr assignment ("slice[i] = ...") or an
-// increment/decrement ("slice[i]++") inside body.
-func (a *gpuAnalyzer) writtenSliceObjs(body *ast.BlockStmt) map[*types.Var]bool {
+// increment/decrement ("slice[i]++") inside body or any of extra (the
+// inlined callee declarations).
+func (a *gpuAnalyzer) writtenSliceObjs(body *ast.BlockStmt, extra ...*ast.FuncDecl) map[*types.Var]bool {
 	writes := map[*types.Var]bool{}
 	record := func(target ast.Expr) {
 		idx, ok := target.(*ast.IndexExpr)
@@ -994,17 +1040,23 @@ func (a *gpuAnalyzer) writtenSliceObjs(body *ast.BlockStmt) map[*types.Var]bool 
 			writes[v] = true
 		}
 	}
-	ast.Inspect(body, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.AssignStmt:
-			for _, lhs := range x.Lhs {
-				record(lhs)
+	scan := func(n ast.Node) {
+		ast.Inspect(n, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range x.Lhs {
+					record(lhs)
+				}
+			case *ast.IncDecStmt:
+				record(x.X)
 			}
-		case *ast.IncDecStmt:
-			record(x.X)
-		}
-		return true
-	})
+			return true
+		})
+	}
+	scan(body)
+	for _, d := range extra {
+		scan(d)
+	}
 	return writes
 }
 
@@ -1247,8 +1299,9 @@ func (a *gpuAnalyzer) writeOnlySliceObjs(body *ast.BlockStmt, iterIdent *ast.Ide
 // anywhere inside body. Local variables declared inside the body will
 // spuriously appear here too; callers must combine this with a
 // declared-outside-body check (as freeVars does) before treating it as a
-// free-scalar write.
-func (a *gpuAnalyzer) writtenScalarObjs(body *ast.BlockStmt) map[*types.Var]bool {
+// free-scalar write. extra are the inlined callee declarations, scanned the
+// same way.
+func (a *gpuAnalyzer) writtenScalarObjs(body *ast.BlockStmt, extra ...*ast.FuncDecl) map[*types.Var]bool {
 	writes := map[*types.Var]bool{}
 	record := func(target ast.Expr) {
 		ident, ok := target.(*ast.Ident)
@@ -1259,20 +1312,26 @@ func (a *gpuAnalyzer) writtenScalarObjs(body *ast.BlockStmt) map[*types.Var]bool
 			writes[v] = true
 		}
 	}
-	ast.Inspect(body, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.AssignStmt:
-			if x.Tok == token.DEFINE {
-				return true
+	scan := func(n ast.Node) {
+		ast.Inspect(n, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.AssignStmt:
+				if x.Tok == token.DEFINE {
+					return true
+				}
+				for _, lhs := range x.Lhs {
+					record(lhs)
+				}
+			case *ast.IncDecStmt:
+				record(x.X)
 			}
-			for _, lhs := range x.Lhs {
-				record(lhs)
-			}
-		case *ast.IncDecStmt:
-			record(x.X)
-		}
-		return true
-	})
+			return true
+		})
+	}
+	scan(body)
+	for _, d := range extra {
+		scan(d)
+	}
 	return writes
 }
 

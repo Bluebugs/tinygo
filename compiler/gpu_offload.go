@@ -361,7 +361,7 @@ func (b *builder) gpuResolveArgs(loop *spmdActiveLoop, k *gpuKernel) (*gpuLaunch
 		if reason != "" {
 			return nil, reason
 		}
-		slice, ok := v.Type().Underlying().(*types.Slice)
+		slice, ok := gpuArgType(v).Underlying().(*types.Slice)
 		if !ok {
 			return nil, fmt.Sprintf("buffer %s is not a slice", bufv.Obj.Name())
 		}
@@ -434,6 +434,17 @@ func (b *builder) gpuValueForObject(obj types.Object, loop *spmdActiveLoop) (ssa
 	default:
 		v = gpuParamForObject(b.fn, obj)
 	}
+	if len(inBody) == 0 {
+		// A package-level variable referenced only inside an inlined callee
+		// has no DebugRef in this function. Load it from its global at the
+		// guard: the eligibility gate rejects every write to it inside the
+		// kernel and the body calls nothing else, so the guard-time value is
+		// the one every iteration reads. This also takes precedence over a
+		// pre-loop read in the caller, which a call in between could stale.
+		if g := b.gpuGlobalForObject(obj); g != nil {
+			v = g
+		}
+	}
 	if v == nil {
 		return nil, fmt.Sprintf("cannot resolve free variable %s to an SSA value", obj.Name())
 	}
@@ -441,6 +452,38 @@ func (b *builder) gpuValueForObject(obj types.Object, loop *spmdActiveLoop) (ssa
 		return nil, fmt.Sprintf("free variable %s is not available at the guard point", obj.Name())
 	}
 	return v, ""
+}
+
+// gpuGlobalForObject returns the *ssa.Global for a package-level variable,
+// or nil.
+func (b *builder) gpuGlobalForObject(obj types.Object) *ssa.Global {
+	v, ok := obj.(*types.Var)
+	if !ok || v.Pkg() == nil || v.Parent() != v.Pkg().Scope() {
+		return nil
+	}
+	pkg := b.fn.Prog.Package(v.Pkg())
+	if pkg == nil {
+		return nil
+	}
+	return pkg.Var(v.Name())
+}
+
+// gpuArgType is the Go type of the launch argument v: for a *ssa.Global
+// (see gpuValueForObject) that is the variable's type, not the pointer.
+func gpuArgType(v ssa.Value) types.Type {
+	if g, ok := v.(*ssa.Global); ok {
+		return g.Type().(*types.Pointer).Elem()
+	}
+	return v.Type()
+}
+
+// gpuArgValue lowers a launch argument, loading a *ssa.Global at the current
+// insert point (the guard).
+func (b *builder) gpuArgValue(v ssa.Value, pos token.Pos) llvm.Value {
+	if g, ok := v.(*ssa.Global); ok {
+		return b.CreateLoad(b.getLLVMType(gpuArgType(g)), b.getValue(g, pos), "")
+	}
+	return b.getValue(v, pos)
 }
 
 func gpuParamForObject(fn *ssa.Function, obj types.Object) ssa.Value {
@@ -620,7 +663,7 @@ func (b *builder) gpuBuildParams(loop *spmdActiveLoop, bound llvm.Value, pos tok
 			// The mandatory trip-count field.
 			val = b.gpuToI32(bound, false)
 		} else {
-			val = b.gpuCoerce(b.getValue(loop.gpuArgs.scalars[i-1], pos), p.WGSLTy, p.Obj.Name())
+			val = b.gpuCoerce(b.gpuArgValue(loop.gpuArgs.scalars[i-1], pos), p.WGSLTy, p.Obj.Name())
 		}
 		ptr := b.CreateStructGEP(structTy, alloca, i, "")
 		b.CreateStore(val, ptr)
@@ -682,7 +725,7 @@ func (b *builder) gpuBuildBuffers(loop *spmdActiveLoop, bound llvm.Value, pos to
 	alloca := b.gpuEntryAlloca(arrTy, "gpu.buffers")
 
 	for i, bufv := range k.Buffers {
-		slice := b.getValue(loop.gpuArgs.buffers[i], pos)
+		slice := b.gpuArgValue(loop.gpuArgs.buffers[i], pos)
 		// Convert at pointer width (the convention everywhere else in this
 		// compiler), then narrow to the descriptor's 32-bit field explicitly.
 		// gpuCFGReject guarantees uintptrType is already i32 here, so the

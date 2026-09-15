@@ -133,6 +133,70 @@ func (a *gpuAnalyzer) writeIndexReject(body *ast.BlockStmt, iterIdent *ast.Ident
 		}
 	}
 
+	// Inlined callees: their indices are expressed in the callee's own
+	// parameters, which this caller-side proof cannot relate to the loop
+	// iteration variable, so any write to a slice not declared in the callee
+	// fails closed, and any read of a slice the body writes is a potential
+	// cross-invocation race (no own-element exemption).
+	decls := a.inlinedDecls()
+	for _, d := range decls {
+		ast.Inspect(d.Body, func(n ast.Node) bool {
+			if reject != "" {
+				return false
+			}
+			var targets []ast.Expr
+			switch s := n.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range s.Lhs {
+					if _, ok := lhs.(*ast.IndexExpr); ok {
+						targets = append(targets, lhs)
+					}
+				}
+			case *ast.IncDecStmt:
+				targets = append(targets, s.X)
+			}
+			for _, target := range targets {
+				idx, ok := target.(*ast.IndexExpr)
+				if !ok {
+					continue
+				}
+				if ident, ok := idx.X.(*ast.Ident); ok {
+					if v, ok := a.info.Uses[ident].(*types.Var); ok && declaredInAny(v, decls) {
+						continue
+					}
+				}
+				reject = fmt.Sprintf("slice write to %s inside inlined function %s not eligible for GPU offload (index cannot be proven distinct across invocations)", exprString(idx.X), d.Name.Name)
+				return false
+			}
+			return true
+		})
+	}
+	inspectReads := func(n ast.Node) {
+		ast.Inspect(n, func(n ast.Node) bool {
+			if reject != "" {
+				return false
+			}
+			idx, ok := n.(*ast.IndexExpr)
+			if !ok {
+				return true
+			}
+			ident, ok := idx.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if v, ok := a.info.Uses[ident].(*types.Var); ok && writes[v] != nil {
+				reject = fmt.Sprintf("slice %s is written in GPU-offloaded loop and read inside an inlined function (invocations could race)", ident.Name)
+			}
+			return true
+		})
+	}
+	for _, d := range decls {
+		inspectReads(d.Body)
+	}
+	if reject != "" {
+		return reject
+	}
+
 	ast.Inspect(body, func(n ast.Node) bool {
 		if reject != "" {
 			return false
