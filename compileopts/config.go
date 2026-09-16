@@ -194,9 +194,17 @@ func (c *Config) GPUVerbose() bool {
 	return c.Options.GPUVerbose
 }
 
-// GPUZeroCopy reports whether GPU-pool allocation and zero-copy binding are
-// enabled. It is on by default for the Vulkan host and unavailable elsewhere:
-// no other host can bind Go memory, and the pool needs the Boehm GC.
+// GPUZeroCopy reports whether the compiler should mark GPU-bound allocations so
+// they are allocated from the GPU pool (and can therefore be bound without a
+// copy at launch). It is on by default for the Vulkan host and unavailable
+// elsewhere: no other host can bind Go memory, and the pool needs the Boehm GC.
+//
+// This gates the marking pass only (its sole consumer is builder.Build). It does
+// NOT disable the runtime pool or the host's binding path, so memory that
+// reaches the pool by other means — e.g. a //go:linkname to
+// runtime.spmdAllocGPUBytes — is still bound zero-copy when this returns false.
+// It is an A/B and escape hatch for compiler-marked allocations, not a runtime
+// kill switch; SPMD_GPU_POOL_FAIL_AFTER disables the pool itself.
 func (c *Config) GPUZeroCopy() bool {
 	if c.Options.GPUZeroCopy == "off" {
 		return false
