@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/token"
 	"go/types"
 	"hash/crc32"
 	"math/bits"
@@ -265,6 +266,28 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 	// program so it's pretty fast and doesn't need to be parallelized.
 	program := lprogram.LoadSSA()
 
+	// SPMD GPU zero copy: one whole-program marking pass, run here because it
+	// needs every package's SSA at once, but before the per-package compile
+	// loop below. Each package's marks are folded into its OWN Config copy, so
+	// they become part of that package's cache key (see packageAction.Config)
+	// and a kernel change invalidates exactly the packages whose marks change.
+	//
+	// Keyed by the TYPES package path, which is what MarkGPUZeroCopySites
+	// returns and what the per-package compile below sees: CompilePackage is
+	// handed program.Package(pkg.Pkg), and for a main package the types path
+	// ("main") differs from pkg.ImportPath (the module-relative path).
+	var gpuZCMarks map[string]map[string]compiler.GPUSiteKind
+	if config.GPUZeroCopy() {
+		program.Build() // the marking pass needs every function's SSA body
+		loops := map[string]map[token.Pos]*compiler.SPMDLoopInfo{}
+		for _, pkg := range lprogram.Sorted() {
+			loops[pkg.ImportPath] = compiler.ExtractSPMDLoopsForPackage(pkg)
+		}
+		// Use the configured threshold, not a constant: marking and the later
+		// offload decision must agree on which loops are eligible.
+		gpuZCMarks = compiler.MarkGPUZeroCopySites(program, loops, config.GPUThresholdOps())
+	}
+
 	// Add jobs to compile each package.
 	// Packages that have a cache hit will not be compiled again.
 	var packageJobs []*compileJob
@@ -273,6 +296,22 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 	var embedFileObjects []*compileJob
 	for _, pkg := range lprogram.Sorted() {
 		pkg := pkg // necessary to avoid a race condition
+
+		// The Config this package is compiled AND cached with. It differs from
+		// the shared compilerConfig only when this package has marked
+		// zero-copy allocation sites, so a build with no marks (every build
+		// without -gpu-host=vulkan, and every unmarked package within one)
+		// serialises byte-identically to before and keeps its cache entries.
+		//
+		// Both the action-ID job and the compile job below must read THIS
+		// value: if they disagreed, the cache key would not describe the code
+		// actually generated.
+		pkgCompilerConfig := compilerConfig
+		if sites := gpuZCMarks[pkg.Pkg.Path()]; len(sites) != 0 {
+			cfgCopy := *compilerConfig
+			cfgCopy.GPUZeroCopySites = sites
+			pkgCompilerConfig = &cfgCopy
+		}
 
 		var undefinedGlobals []string
 		for name := range globalValues[pkg.Pkg.Path()] {
@@ -346,7 +385,7 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 					ImportPath:       pkg.ImportPath,
 					CompilerBuildID:  string(compilerBuildID),
 					LLVMVersion:      llvm.Version,
-					Config:           compilerConfig,
+					Config:           pkgCompilerConfig,
 					CFlags:           pkg.CFlags,
 					FileHashes:       make(map[string]string, len(pkg.FileHashes)),
 					EmbeddedFiles:    make(map[string]string, len(allFiles)),
@@ -392,7 +431,7 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 
 				// Compile AST to IR. The compiler.CompilePackage function will
 				// build the SSA as needed.
-				mod, errs := compiler.CompilePackage(pkg.ImportPath, pkg, program.Package(pkg.Pkg), machine, compilerConfig, config.DumpSSA())
+				mod, errs := compiler.CompilePackage(pkg.ImportPath, pkg, program.Package(pkg.Pkg), machine, pkgCompilerConfig, config.DumpSSA())
 				defer mod.Context().Dispose()
 				defer mod.Dispose()
 				if errs != nil {
