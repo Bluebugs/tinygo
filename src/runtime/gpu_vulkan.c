@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <vulkan/vulkan.h>
 
@@ -83,6 +84,14 @@ typedef struct {
     uint64_t gen;
 } spmd_vk_slot;
 
+// One binding's descriptor contents, cached so vkUpdateDescriptorSets is
+// called only when something actually changes.
+typedef struct {
+    VkBuffer buf;
+    VkDeviceSize off, range;
+    uint64_t gen; // slot generation for copied bindings; 0 when bound zero-copy
+} spmd_vk_binding;
+
 typedef struct {
     int32_t id;
     VkShaderModule module;
@@ -91,9 +100,20 @@ typedef struct {
     VkPipeline pipeline;
     VkDescriptorSet set;
     int bufCount;
-    // Slot generations this kernel's descriptor set was last written with;
-    // 0 means never written (slot generations start at 1).
-    uint64_t boundGen[SPMD_VK_SLOTS];
+    // The descriptor contents this kernel's set was last written with, one
+    // entry per binding. Replaces the old boundGen[] scheme, which could only
+    // express "the slot's VkBuffer was recreated": a zero-copy binding also
+    // varies by offset and range, so the full triple must be compared.
+    //
+    // gen is still part of the identity for COPIED bindings. Destroying and
+    // recreating a slot buffer can hand back the SAME VkBuffer handle value,
+    // which would make (buf, off, range) compare equal while the descriptor
+    // actually referenced a destroyed object. Chunk buffers are never
+    // destroyed, so bound bindings carry gen 0.
+    spmd_vk_binding bound[SPMD_VK_SLOTS];
+    // Per-phase minimum wall time over all launches of this kernel, in
+    // nanoseconds. Only maintained when g_phases is set (SPMD_GPU_PHASES).
+    uint64_t ph_upload_min, ph_dispatch_min, ph_readback_min, launches;
     int valid;
 } spmd_vk_kernel;
 
@@ -117,6 +137,10 @@ static int g_available;
 static int g_broken; // a fence timed out: the command buffer may still be pending
 static int g_verbose;
 static int g_memtype_printed;
+// SPMD_GPU_PHASES: maintain and print per-kernel per-phase minimum times.
+// Off by default; when off the only cost on the launch path is this flag test.
+static int g_phases;
+static void spmd_vk_phases_atexit(void);
 
 static spmd_vk_kernel g_kernels[SPMD_VK_MAX_KERNELS];
 static spmd_vk_slot g_slots[SPMD_VK_SLOTS];
@@ -179,6 +203,13 @@ static int32_t spmd_vk_available_locked(void) {
     // destroyed: this runs once per process and the loop falls back to CPU.
     const char *v = getenv("SPMD_GPU_VERBOSE");
     g_verbose = (v != NULL && v[0] != '\0' && v[0] != '0');
+    const char *ph = getenv("SPMD_GPU_PHASES");
+    g_phases = (ph != NULL && ph[0] != '\0' && ph[0] != '0');
+    if (g_phases) {
+        // This is the host C file, not bdwgc, so atexit is available (bdwgc's
+        // DONT_USE_ATEXIT does not apply here).
+        atexit(spmd_vk_phases_atexit);
+    }
 
     VkApplicationInfo ai = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                             .pApplicationName = "tinygo-spmd",
@@ -481,6 +512,78 @@ static int spmd_vk_chunk_alloc(size_t bytes, GC_gpu_chunk *out) {
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// Zero-copy launch binding
+// ---------------------------------------------------------------------------
+
+static uint64_t spmd_vk_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void spmd_vk_phase_min(uint64_t *slot, uint64_t v, uint64_t launches) {
+    if (launches == 0 || v < *slot) {
+        *slot = v;
+    }
+}
+
+static void spmd_vk_phases_atexit(void) {
+    for (int i = 0; i < SPMD_VK_MAX_KERNELS; i++) {
+        spmd_vk_kernel *k = &g_kernels[i];
+        if (!k->valid || k->launches == 0) {
+            continue;
+        }
+        fprintf(stderr,
+                "spmd_gpu(vulkan): phases kernel=%d launches=%llu upload_ns=%llu "
+                "dispatch_ns=%llu readback_ns=%llu\n",
+                (int)k->id, (unsigned long long)k->launches,
+                (unsigned long long)k->ph_upload_min,
+                (unsigned long long)k->ph_dispatch_min,
+                (unsigned long long)k->ph_readback_min);
+    }
+}
+
+// Decide the binding for one buffer. Returns 1 when the caller must bind
+// (*buf/*off/*range filled) and 0 when it must use the slot + memcpy path;
+// *why names the reason in the latter case.
+//
+// LOCKING: GC_gpu_lookup is a lock-free read of a sorted, grow-only chunk
+// table, so it is safe here. GC_gpu_pool_enabled() is deliberately NOT called
+// -- it can create the GPU allocation kind and take bdwgc's allocation lock.
+// g_pool_enabled is the plain flag, re-read every launch because the pool can
+// be disabled mid-run by a failing chunk request.
+static int spmd_vk_zerocopy(const spmd_vk_buffer_desc *desc, uint32_t i, uint32_t bufCount,
+                            VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range,
+                            const char **why) {
+    *why = "pool-disabled";
+    if (!g_pool_enabled) return 0;
+    uintptr_t p = (uintptr_t)desc[i].dataPtr;
+    uint32_t len = desc[i].byteLen;
+    VkDeviceSize bound = ((VkDeviceSize)len + 3u) & ~(VkDeviceSize)3u;
+    const GC_gpu_chunk *c = GC_gpu_lookup(p);
+    if (c == NULL) { *why = "outside-pool"; return 0; }
+    if (p + (uintptr_t)bound > c->base + c->size) { *why = "spans-chunks"; return 0; }
+    VkDeviceSize o = (VkDeviceSize)(p - c->base);
+    if (g_min_ssbo_align != 0 && (o % (VkDeviceSize)g_min_ssbo_align) != 0) { *why = "misaligned"; return 0; }
+    // Byte-tail rule: a whole-word write could change bytes past the slice's
+    // end, which belong to the caller. Read-only bindings are always safe.
+    if (desc[i].mode != 0 && (len % 4u) != 0) { *why = "byte-tail-write"; return 0; }
+    if (bound > (VkDeviceSize)g_max_storage_range) { *why = "outside-pool"; return 0; }
+    // Aliasing: a written binding that overlaps any other buffer in this
+    // launch would let the kernel observe partially written data, which the
+    // copy path never does. Measured, not theoretical: deliberately aliasing a
+    // bound RW over a bound RO corrupted 100% of output bytes (spike 2).
+    for (uint32_t j = 0; j < bufCount; j++) {
+        if (j == i) continue;
+        uintptr_t q = (uintptr_t)desc[j].dataPtr;
+        uintptr_t qe = q + (((uintptr_t)desc[j].byteLen + 3u) & ~(uintptr_t)3u);
+        if (desc[i].mode != 0 && p < qe && q < p + (uintptr_t)bound) { *why = "aliased-write"; return 0; }
+    }
+    *buf = (VkBuffer)c->tag; *off = o; *range = bound;
+    return 1;
+}
+
 static void spmd_vk_slot_free(spmd_vk_slot *s) {
     if (s->mapped != NULL) {
         vkUnmapMemory(g_device, s->mem);
@@ -693,6 +796,28 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
     }
     const spmd_vk_buffer_desc *desc = (const spmd_vk_buffer_desc *)bufs;
 
+    // --- zero-copy decisions ---------------------------------------------
+    // Decided for every buffer ONCE, before sizing, because the rest of the
+    // launch keys off it: a bound buffer needs no slot, no upload and no
+    // readback. A single launch may freely mix bound and copied buffers.
+    int zbound[SPMD_VK_MAX_BUFFERS];
+    VkBuffer zbuf[SPMD_VK_MAX_BUFFERS];
+    VkDeviceSize zoff[SPMD_VK_MAX_BUFFERS], zrange[SPMD_VK_MAX_BUFFERS];
+    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    for (uint32_t i = 0; i < bufCount; i++) {
+        const char *why = NULL;
+        zbound[i] = spmd_vk_zerocopy(desc, i, bufCount, &zbuf[i], &zoff[i], &zrange[i], &why);
+        if (g_verbose) {
+            if (zbound[i]) {
+                fprintf(stderr, "spmd_gpu(vulkan): launch kernel=%d buf=%u mode=%u len=%u zerocopy=bound\n",
+                        (int)kernelID, i, desc[i].mode, desc[i].byteLen);
+            } else {
+                fprintf(stderr, "spmd_gpu(vulkan): launch kernel=%d buf=%u mode=%u len=%u zerocopy=copied(%s)\n",
+                        (int)kernelID, i, desc[i].mode, desc[i].byteLen, why);
+            }
+        }
+    }
+
     // --- sizes ---------------------------------------------------------------
     // Uniform: round to 16 so the bound range always covers the std140 size
     // of the Params struct naga declares (struct sizes round to a multiple
@@ -710,6 +835,9 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
         return 0;
     }
     for (uint32_t i = 0; i < bufCount; i++) {
+        if (zbound[i]) {
+            continue; // bound straight into its chunk buffer: no slot needed
+        }
         VkDeviceSize sz = ((VkDeviceSize)desc[i].byteLen + 3u) & ~(VkDeviceSize)3u;
         VkDeviceSize szPage = ((sz < 4 ? 4 : sz) + SPMD_VK_PAGE - 1) & ~(VkDeviceSize)(SPMD_VK_PAGE - 1);
         if (szPage > g_max_storage_range) {
@@ -722,12 +850,18 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
         }
     }
 
+    if (g_phases) t0 = spmd_vk_now();
     // --- upload --------------------------------------------------------------
     if (paramsLen > 0) {
         memcpy(g_slots[0].mapped, params, paramsLen);
     }
     memset((uint8_t *)g_slots[0].mapped + paramsLen, 0, (size_t)(paramsSize - paramsLen));
     for (uint32_t i = 0; i < bufCount; i++) {
+        // A bound buffer IS the program's memory: there is nothing to upload,
+        // for any mode (RO, RW and WO alike).
+        if (zbound[i]) {
+            continue;
+        }
         // mode 2 (write-only, every element provably written) skips upload.
         if (desc[i].mode == 2) {
             continue;
@@ -749,15 +883,32 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
     // than this launch needs). Safe for the same reason as gpu_native.c: the
     // transpiled shader bounds every index by params.n and never calls
     // arrayLength().
+    // Binding 0 (the uniform Params slot) is always a copied slot and is
+    // untouched by zero-copy. Bindings 1..bufCount are per-buffer: a bound
+    // buffer points into its chunk VkBuffer at an offset, a copied one at its
+    // slot with VK_WHOLE_SIZE, exactly as before.
+    spmd_vk_binding want[SPMD_VK_SLOTS];
+    want[0] = (spmd_vk_binding){.buf = g_slots[0].buf, .off = 0, .range = VK_WHOLE_SIZE, .gen = g_slots[0].gen};
+    for (uint32_t i = 0; i < bufCount; i++) {
+        if (zbound[i]) {
+            want[i + 1] = (spmd_vk_binding){.buf = zbuf[i], .off = zoff[i], .range = zrange[i], .gen = 0};
+        } else {
+            want[i + 1] = (spmd_vk_binding){
+                .buf = g_slots[i + 1].buf, .off = 0, .range = VK_WHOLE_SIZE, .gen = g_slots[i + 1].gen};
+        }
+    }
     int dirty = 0;
     for (uint32_t i = 0; i <= bufCount; i++) {
-        if (k->boundGen[i] != g_slots[i].gen) dirty = 1;
+        if (k->bound[i].buf != want[i].buf || k->bound[i].off != want[i].off ||
+            k->bound[i].range != want[i].range || k->bound[i].gen != want[i].gen) {
+            dirty = 1;
+        }
     }
     if (dirty) {
         VkDescriptorBufferInfo bi[SPMD_VK_SLOTS];
         VkWriteDescriptorSet wr[SPMD_VK_SLOTS];
         for (uint32_t i = 0; i <= bufCount; i++) {
-            bi[i] = (VkDescriptorBufferInfo){.buffer = g_slots[i].buf, .offset = 0, .range = VK_WHOLE_SIZE};
+            bi[i] = (VkDescriptorBufferInfo){.buffer = want[i].buf, .offset = want[i].off, .range = want[i].range};
             wr[i] = (VkWriteDescriptorSet){
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = k->set, .dstBinding = i,
                 .descriptorCount = 1,
@@ -766,9 +917,10 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
         }
         vkUpdateDescriptorSets(g_device, bufCount + 1, wr, 0, NULL);
         for (uint32_t i = 0; i <= bufCount; i++) {
-            k->boundGen[i] = g_slots[i].gen;
+            k->bound[i] = want[i];
         }
     }
+    if (g_phases) t1 = spmd_vk_now();
 
     // --- record + submit --------------------------------------------------------
     VkResult r = vkResetCommandBuffer(g_cmd, 0);
@@ -808,14 +960,27 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
         fprintf(stderr, "spmd_gpu(vulkan): vkWaitForFences failed or timed out (%d)\n", (int)r);
         return 0;
     }
+    if (g_phases) t2 = spmd_vk_now();
 
     // --- readback ---------------------------------------------------------------
     for (uint32_t i = 0; i < bufCount; i++) {
+        // A bound buffer was written in place: there is nothing to read back,
+        // for RW and WO alike.
+        if (zbound[i]) {
+            continue;
+        }
         // Exactly byteLen, never the rounded length: bytes past a byte
         // slice's end belong to the caller (e.g. a sub-slice).
         if (desc[i].mode != 0 && desc[i].byteLen > 0) {
             memcpy((void *)(uintptr_t)desc[i].dataPtr, g_slots[i + 1].mapped, desc[i].byteLen);
         }
+    }
+    if (g_phases) {
+        t3 = spmd_vk_now();
+        spmd_vk_phase_min(&k->ph_upload_min, t1 - t0, k->launches);
+        spmd_vk_phase_min(&k->ph_dispatch_min, t2 - t1, k->launches);
+        spmd_vk_phase_min(&k->ph_readback_min, t3 - t2, k->launches);
+        k->launches++;
     }
     vkResetFences(g_device, 1, &g_fence);
     vkResetCommandBuffer(g_cmd, 0);
