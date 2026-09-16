@@ -53,12 +53,22 @@ type Config struct {
 	TinyGoVersion   string // for llvm.ident
 
 	// Various compiler options that determine how code is generated.
-	SIMDEnabled        bool   // false for scalar fallback mode (-simd=false)
-	SIMDRegisterBytes  int    // SIMD register width in bytes: 16 (SSE/WASM), 32 (AVX2), 64 (AVX-512)
-	GPU                string // "none" (default) or "webgpu" (-gpu flag)
-	GPUThresholdOps    uint64 // minimum estimated op count for GPU offload (-gpu-threshold flag)
-	GPUVerbose         bool   // print GPU offload decisions (-gpu-verbose flag)
-	GPUHost            string // GPU host backend: "" (default), "browser" or "vulkan" (-gpu-host flag)
+	SIMDEnabled       bool   // false for scalar fallback mode (-simd=false)
+	SIMDRegisterBytes int    // SIMD register width in bytes: 16 (SSE/WASM), 32 (AVX2), 64 (AVX-512)
+	GPU               string // "none" (default) or "webgpu" (-gpu flag)
+	GPUThresholdOps   uint64 // minimum estimated op count for GPU offload (-gpu-threshold flag)
+	GPUVerbose        bool   // print GPU offload decisions (-gpu-verbose flag)
+	GPUHost           string // GPU host backend: "" (default), "browser" or "vulkan" (-gpu-host flag)
+
+	// GPUZeroCopySites are the allocation sites IN THIS PACKAGE that the
+	// whole-program marking pass (gpu_zerocopy_mark.go) decided should come
+	// from the GPU buffer pool, keyed by GPUZeroCopySiteKey. Marked sites
+	// lower to runtime.allocGPU / runtime.sliceAppendGPU instead of
+	// runtime.alloc / runtime.sliceAppend. Empty (or nil) means no site in
+	// this package is marked, which is the default and compiles exactly as
+	// before. It is JSON-serialisable so the builder's package action ID
+	// covers it automatically.
+	GPUZeroCopySites   map[string]GPUSiteKind
 	Scheduler          string
 	AutomaticStackSize bool
 	DefaultStackSize   uint64
@@ -2140,7 +2150,18 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		elemsLen := b.CreateExtractValue(elems, 1, "append.elemsLen")
 		elemType := b.getLLVMType(argTypes[0].Underlying().(*types.Slice).Elem())
 		elemSize := llvm.ConstInt(b.uintptrType, b.targetData.TypeAllocSize(elemType), false)
-		result := b.createRuntimeCall("sliceAppend", []llvm.Value{srcBuf, elemsBuf, srcLen, srcCap, elemsLen, elemSize}, "append.new")
+		// As for MakeSlice above: a marked append grows into the GPU buffer
+		// pool via sliceAppendGPU, which mirrors sliceAppend (and produces
+		// identical capacities) but takes its new backing array from the pool.
+		// Element type in the key, plus the same belt-and-braces pointer-free
+		// re-check as the MakeSlice path above.
+		goElemType := argTypes[0].Underlying().(*types.Slice).Elem()
+		appendFn := "sliceAppend"
+		if gpuZCElemPointerFree(goElemType) &&
+			b.GPUZeroCopySites[GPUZeroCopySiteKey(b.program.Fset, pos, GPUSiteAppend, goElemType)] != "" {
+			appendFn = "sliceAppendGPU"
+		}
+		result := b.createRuntimeCall(appendFn, []llvm.Value{srcBuf, elemsBuf, srcLen, srcCap, elemsLen, elemSize}, "append.new")
 		newPtr := b.CreateExtractValue(result, 0, "append.newPtr")
 		newLen := b.CreateExtractValue(result, 1, "append.newLen")
 		newCap := b.CreateExtractValue(result, 2, "append.newCap")
@@ -3994,7 +4015,22 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		}
 		sliceSize := b.CreateBinOp(llvm.Mul, elemSizeValue, sliceCapCast, "makeslice.cap")
 		layoutValue := b.createObjectLayout(llvmElemType, expr.Pos())
-		slicePtr := b.createRuntimeCall("alloc", []llvm.Value{sliceSize, layoutValue}, "makeslice.buf")
+		// A site marked by the GPU zero-copy pass allocates from the GPU
+		// buffer pool instead, so an offloaded `go for` can bind it without
+		// copying. allocGPU has the same signature as alloc and falls back to
+		// it whenever the pool is unavailable.
+		// The element type is part of the site key because generic instances
+		// share a source position (see GPUZeroCopySiteKey). gpuZCElemPointerFree
+		// is re-checked HERE as a belt-and-braces guard: no matter what the
+		// marking pass put in the map, a pointer-containing element type must
+		// never reach the pool's atomic, unscanned allocation kind.
+		goElemType := sliceType.Elem()
+		allocFn := "alloc"
+		if gpuZCElemPointerFree(goElemType) &&
+			b.GPUZeroCopySites[GPUZeroCopySiteKey(b.program.Fset, expr.Pos(), GPUSiteMakeSlice, goElemType)] != "" {
+			allocFn = "allocGPU"
+		}
+		slicePtr := b.createRuntimeCall(allocFn, []llvm.Value{sliceSize, layoutValue}, "makeslice.buf")
 		slicePtr.AddCallSiteAttribute(0, b.ctx.CreateEnumAttribute(llvm.AttributeKindID("align"), uint64(elemAlign)))
 
 		// Extend or truncate if necessary. This is safe as we've already done

@@ -51,16 +51,32 @@ func parseAndAnalyzeGPULoop(t *testing.T, src string, thresholdOps uint64) *gpuL
 		t.Fatalf("no `go for` loop found in test source")
 	}
 
-	loopInfo := &SPMDLoopInfo{
-		ForPos:    rangeStmt.For,
-		BodyStart: rangeStmt.Body.Lbrace,
-		BodyEnd:   rangeStmt.Body.Rbrace,
-		RangeStmt: rangeStmt,
-		TypesInfo: info,
-		Files:     []*ast.File{f},
+	loops := testSPMDLoopInfos(fset, f, info)
+	loopInfo := loops[rangeStmt.For]
+	if loopInfo == nil {
+		t.Fatalf("testSPMDLoopInfos did not return the `go for` loop at %v", fset.Position(rangeStmt.For))
 	}
 
 	return analyzeGPULoop(loopInfo, thresholdOps)
+}
+
+// testSPMDLoopInfos returns the `go for` loops of f keyed by their `for`
+// position -- the same shape extractSPMDLoops (compiler/spmd.go:76) returns,
+// so tests and the builder feed MarkGPUZeroCopySites identical data.
+func testSPMDLoopInfos(fset *token.FileSet, f *ast.File, info *types.Info) map[token.Pos]*SPMDLoopInfo {
+	out := map[token.Pos]*SPMDLoopInfo{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		rs, ok := n.(*ast.RangeStmt)
+		if !ok || !rs.IsSpmd {
+			return true
+		}
+		out[rs.For] = &SPMDLoopInfo{
+			ForPos: rs.For, BodyStart: rs.Body.Lbrace, BodyEnd: rs.Body.Rbrace,
+			RangeStmt: rs, TypesInfo: info, Files: []*ast.File{f},
+		}
+		return false
+	})
+	return out
 }
 
 func freeVarKind(t *testing.T, plan *gpuLoopPlan, name string) (gpuFreeVar, bool) {

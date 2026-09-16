@@ -194,6 +194,16 @@ func (c *Config) GPUVerbose() bool {
 	return c.Options.GPUVerbose
 }
 
+// GPUZeroCopy reports whether GPU-pool allocation and zero-copy binding are
+// enabled. It is on by default for the Vulkan host and unavailable elsewhere:
+// no other host can bind Go memory, and the pool needs the Boehm GC.
+func (c *Config) GPUZeroCopy() bool {
+	if c.Options.GPUZeroCopy == "off" {
+		return false
+	}
+	return c.GPU() == "webgpu" && c.GPUHost() == "vulkan" && c.GC() == "boehm"
+}
+
 // ABI returns the -mabi= flag for this target (like -mabi=lp64). A zero-length
 // string is returned if the target doesn't specify an ABI.
 func (c *Config) ABI() string {

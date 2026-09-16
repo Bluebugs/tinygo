@@ -1637,6 +1637,7 @@ func main() {
 	gpuHost := flag.String("gpu-host", "", "GPU host environment: browser (only with -gpu=webgpu on a wasm target)")
 	gpuThreshold := flag.Uint64("gpu-threshold", 50_000_000, "minimum estimated op count for a `go for` loop to be offloaded to the GPU")
 	gpuVerbose := flag.Bool("gpu-verbose", false, "print GPU offload decisions")
+	gpuZeroCopy := flag.String("gpu-zerocopy", "", "GPU zero-copy buffers: on (default, -gpu-host=vulkan only), off")
 	cpuprofile := flag.String("cpuprofile", "", "cpuprofile output")
 	monitor := flag.Bool("monitor", false, "enable serial monitor")
 	baudrate := flag.Int("baudrate", 115200, "baudrate of serial monitor")
@@ -1765,6 +1766,7 @@ func main() {
 		GPUHost:         *gpuHost,
 		GPUThresholdOps: *gpuThreshold,
 		GPUVerbose:      *gpuVerbose,
+		GPUZeroCopy:     *gpuZeroCopy,
 		Monitor:         *monitor,
 		BaudRate:        *baudrate,
 		Timeout:         *timeout,

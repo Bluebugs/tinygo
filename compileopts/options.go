@@ -17,6 +17,7 @@ var (
 	validOptOptions           = []string{"none", "0", "1", "2", "s", "z"}
 	validGPUOptions           = []string{"none", "webgpu"}
 	validGPUHostOptions       = []string{"browser", "vulkan"}
+	validGPUZeroCopyOptions   = []string{"on", "off"}
 )
 
 // Options contains extra options to give to the compiler. These options are
@@ -61,6 +62,7 @@ type Options struct {
 	GPUHost         string // -gpu-host flag: "" (default) or "browser"
 	GPUThresholdOps uint64 // -gpu-threshold flag: minimum estimated op count to offload a `go for` loop
 	GPUVerbose      bool   // -gpu-verbose flag: print GPU offload decisions
+	GPUZeroCopy     string // -gpu-zerocopy flag: "" (default, on), "on" or "off"
 	Monitor         bool
 	BaudRate        int
 	Timeout         time.Duration
@@ -139,6 +141,10 @@ func (o *Options) Verify() error {
 
 	if o.GPUHost != "" && !isInArray(validGPUHostOptions, o.GPUHost) {
 		return fmt.Errorf("invalid -gpu-host=%s: valid values are %s", o.GPUHost, strings.Join(validGPUHostOptions, ", "))
+	}
+
+	if o.GPUZeroCopy != "" && !isInArray(validGPUZeroCopyOptions, o.GPUZeroCopy) {
+		return fmt.Errorf("invalid -gpu-zerocopy=%s: valid values are %s", o.GPUZeroCopy, strings.Join(validGPUZeroCopyOptions, ", "))
 	}
 
 	return nil

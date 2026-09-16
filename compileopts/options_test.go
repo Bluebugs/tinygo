@@ -163,3 +163,43 @@ func TestVerifyOptions(t *testing.T) {
 		})
 	}
 }
+
+// TestGPUZeroCopyConfig covers Config.GPUZeroCopy()'s truth table: zero-copy
+// is on by default ONLY for the Vulkan host with the Boehm GC (no other host
+// can bind Go memory, and the pool needs Boehm), and -gpu-zerocopy=off always
+// wins. This is what keeps every existing build unaffected by default.
+func TestGPUZeroCopyConfig(t *testing.T) {
+	tests := []struct {
+		name                    string
+		gpu, host, gc, zerocopy string
+		want                    bool
+	}{
+		{"vulkan+boehm default on", "webgpu", "vulkan", "boehm", "", true},
+		{"vulkan+boehm explicit on", "webgpu", "vulkan", "boehm", "on", true},
+		{"explicit off wins", "webgpu", "vulkan", "boehm", "off", false},
+		{"browser host not eligible", "webgpu", "browser", "boehm", "", false},
+		{"no host not eligible", "webgpu", "", "boehm", "", false},
+		{"no gpu not eligible", "", "vulkan", "boehm", "", false},
+		{"non-boehm gc not eligible", "webgpu", "vulkan", "conservative", "", false},
+		{"plain build not eligible", "", "", "", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &compileopts.Config{Options: &compileopts.Options{
+				GPU: tc.gpu, GPUHost: tc.host, GC: tc.gc, GPUZeroCopy: tc.zerocopy,
+			}}
+			if got := c.GPUZeroCopy(); got != tc.want {
+				t.Errorf("GPUZeroCopy() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGPUZeroCopyOption(t *testing.T) {
+	if err := (&compileopts.Options{GPUZeroCopy: "off"}).Verify(); err != nil {
+		t.Errorf("-gpu-zerocopy=off rejected: %v", err)
+	}
+	if err := (&compileopts.Options{GPUZeroCopy: "maybe"}).Verify(); err == nil {
+		t.Error("-gpu-zerocopy=maybe accepted, want an error")
+	}
+}
