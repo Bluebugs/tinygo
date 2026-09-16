@@ -518,8 +518,8 @@ func gpuZCElemOf(a *ssa.IndexAddr) types.Type {
 	return gpuZCDeref(a.Type())
 }
 
-// callerArgs returns the actual arguments passed at every call site that VTA
-// says can reach p's function.
+// callerArgs returns the actual arguments passed at every call site that the
+// CHA-style call graph (gpuZCCallGraph) records as reaching p's function.
 func (m *gpuZCMarker) callerArgs(p *ssa.Parameter) []ssa.Value {
 	fn := p.Parent()
 	if fn == nil {
@@ -578,8 +578,8 @@ func (m *gpuZCMarker) closureBindings(fv *ssa.FreeVar) []ssa.Value {
 	return out
 }
 
-// calleeResults returns the idx'th returned value of every callee VTA says the
-// call can reach.
+// calleeResults returns the idx'th returned value of every callee the
+// CHA-style call graph (gpuZCCallGraph) records for the call.
 func (m *gpuZCMarker) calleeResults(call ssa.CallInstruction, idx int) []ssa.Value {
 	fn := call.Parent()
 	if fn == nil {

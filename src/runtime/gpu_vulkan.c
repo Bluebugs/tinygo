@@ -561,6 +561,26 @@ static int spmd_vk_zerocopy(const spmd_vk_buffer_desc *desc, uint32_t i, uint32_
     uintptr_t p = (uintptr_t)desc[i].dataPtr;
     uint32_t len = desc[i].byteLen;
     VkDeviceSize bound = ((VkDeviceSize)len + 3u) & ~(VkDeviceSize)3u;
+    // REASON OVERLOAD: "outside-pool" covers three situations, not one --
+    // (a) the pointer is in no chunk (the usual case, and what an unmarked
+    // allocation produces), (b) a zero-length buffer and (c) a range larger
+    // than maxStorageBufferRange. (b) and (c) are not "outside the pool" at
+    // all; they are ranges that cannot legally be bound as a descriptor. They
+    // deliberately share the reason rather than adding two more to the
+    // design's list of six, because all three degrade identically (copy path)
+    // and neither is diagnosable from the reason alone anyway: the verbose
+    // line already prints len=, which separates them. If a future change makes
+    // (b)/(c) worth telling apart in a log, split them then.
+    //
+    // ZERO LENGTH: a Vulkan descriptor's `range` must not be 0, so an empty
+    // pooled sub-slice cannot be bound even though it passes lookup, the chunk
+    // bound, alignment (0 % align == 0) and the byte-tail rule (0 % 4 == 0).
+    // The copy path cannot produce this -- slots are at least 4 bytes and are
+    // bound with VK_WHOLE_SIZE -- so without this guard the bound path would
+    // introduce a malformed descriptor the copy path never can. Degrading to
+    // the copy path is correct and free: a zero-length buffer moves no bytes
+    // either way.
+    if (len == 0) { *why = "outside-pool"; return 0; }
     const GC_gpu_chunk *c = GC_gpu_lookup(p);
     if (c == NULL) { *why = "outside-pool"; return 0; }
     if (p + (uintptr_t)bound > c->base + c->size) { *why = "spans-chunks"; return 0; }

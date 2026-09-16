@@ -98,14 +98,15 @@ STATIC GC_bool GC_gpu_add_chunk(const GC_gpu_chunk *ch) {
     return TRUE;
 }
 
-/* The chunk most recently added by GC_gpu_expand, for the Task 1a local
-   allocator (which carves directly out of it). Written under the lock. */
+/* The chunk most recently added by GC_gpu_expand. Used only by the
+   harness-only bump allocator below, which carves directly out of it.
+   Written under the lock. */
 STATIC GC_gpu_chunk GC_gpu_last_chunk;
 
 /* Grows the GPU pool by at least need_hblks blocks. Asks the provider for a
    whole 64 MiB chunk, or for the rounded-up request when it is larger, so an
-   object never spans two chunks. Called from GC_allochblk_nth (Task 1b) when
-   the GPU free list cannot satisfy a request.
+   object never spans two chunks. Called from GC_allochblk_nth when the GPU
+   free list cannot satisfy a request.
    Must be called with the allocation lock held (GC_scratch_alloc asserts it). */
 GC_INNER GC_bool GC_gpu_expand(size_t need_hblks) {
     if (GC_gpu_disabled || GC_gpu_provider == 0 || GC_gpu_kind < 0) return FALSE;
@@ -135,11 +136,14 @@ GC_API void GC_CALL GC_set_gpu_chunk_provider(GC_gpu_chunk_provider_proc fn) {
 }
 
 #ifndef TINYGO_GPU_POOL_BDWGC
-/* Task 1a only: a chunk-local bump allocator, with no dependency on the
-   bdwgc block pool. It proves the chunk table, the lookup and the
-   no-cross-chunk invariant; Task 1b replaces it with GC_malloc_kind on the
-   GPU kind, at which point Boehm owns lifetime, sweeping and reuse.
-   This allocator never reclaims, by construction. */
+/* A chunk-local bump allocator with no dependency on the bdwgc block pool.
+   DEAD IN EVERY PRODUCT BUILD: builder/bdwgc.go always passes
+   -DTINYGO_GPU_POOL_BDWGC, so TinyGo always takes the GC_malloc_kind path
+   below, where Boehm owns lifetime, sweeping and reuse. This path survives
+   only for the standalone C stress harness, which links gpu_pool.c against
+   mmap'd fake chunks without the rest of bdwgc and uses it to exercise the
+   chunk table, the pointer->chunk lookup and the no-cross-chunk invariant in
+   isolation. It never reclaims, by construction. */
 STATIC ptr_t GC_gpu_bump_ptr = 0;
 STATIC ptr_t GC_gpu_bump_end = 0;
 
@@ -182,9 +186,9 @@ GC_API void * GC_CALL GC_malloc_gpu(size_t lb) {
     lb = (lb + 3) & ~(size_t)3;              /* object sizes are multiples of 4 */
     if (lb == 0) lb = 4;
 #ifdef TINYGO_GPU_POOL_BDWGC
-    return GC_malloc_kind(lb, GC_gpu_kind);  /* Task 1b: real dual-pool path */
+    return GC_malloc_kind(lb, GC_gpu_kind);  /* real dual-pool path (all product builds) */
 #else
-    return GC_gpu_bump_alloc(lb);            /* Task 1a: chunk-local allocator */
+    return GC_gpu_bump_alloc(lb);            /* harness-only chunk-local allocator */
 #endif
 }
 #endif /* TINYGO_GPU_POOL */
