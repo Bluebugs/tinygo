@@ -1,5 +1,5 @@
 diff --git a/allchblk.c b/allchblk.c
-index 48677f19..abf28d15 100644
+index 48677f1..abf28d1 100644
 --- a/allchblk.c
 +++ b/allchblk.c
 @@ -58,18 +58,25 @@ int GC_use_entire_heap = FALSE;
@@ -434,7 +434,7 @@ index 48677f19..abf28d15 100644
 +}
 +#endif /* TINYGO_GPU_POOL */
 diff --git a/alloc.c b/alloc.c
-index efb8b0d5..9d479a49 100644
+index efb8b0d..926c137 100644
 --- a/alloc.c
 +++ b/alloc.c
 @@ -1568,11 +1568,14 @@ GC_os_get_mem(size_t bytes)
@@ -502,8 +502,25 @@ index efb8b0d5..9d479a49 100644
  #ifndef NO_DEBUGGING
  void
  GC_print_heap_sects(void)
+@@ -2030,6 +2061,16 @@ GC_allocobj(size_t lg, int kind)
+     return NULL;
+ 
+   while (NULL == *flh) {
++#ifdef TINYGO_GPU_POOL
++    /*
++     * Same fail-closed rule as in `GC_alloc_large`: a disabled GPU pool can
++     * never be grown, so `GC_new_hblk` below can never refill this free list
++     * and the loop would ABORT at its retry limit.  `NULL` is a value this
++     * function's caller (`GC_generic_malloc_inner_small`) already handles.
++     */
++    if (POOL_OF_KIND(kind) == GC_POOL_GPU && GC_gpu_pool_broken())
++      return NULL;
++#endif
+     /*
+      * Only a few iterations are expected at most, otherwise something
+      * is wrong in one of the functions called below.
 diff --git a/include/private/gc_priv.h b/include/private/gc_priv.h
-index 8a0c0669..973cf80e 100644
+index 8a0c066..d785bfb 100644
 --- a/include/private/gc_priv.h
 +++ b/include/private/gc_priv.h
 @@ -1243,6 +1243,15 @@ struct hblkhdr {
@@ -522,7 +539,7 @@ index 8a0c0669..973cf80e 100644
  #ifdef ENABLE_DISCLAIM
    /* This kind has a callback on reclaim. */
  #  define HAS_DISCLAIM 8
-@@ -1363,6 +1372,57 @@ struct hblk {
+@@ -1363,6 +1372,67 @@ struct hblk {
  
  #define HBLK_IS_FREE(hhdr) (((hhdr)->hb_flags & FREE_BLK) != 0)
  
@@ -553,6 +570,16 @@ index 8a0c0669..973cf80e 100644
 + */
 +GC_INNER GC_bool GC_gpu_expand(size_t /* `need_hblks` */);
 +
++/*
++ * Has the GPU pool been permanently disabled (no provider, or the provider
++ * failed)?  A pure read: it neither allocates nor takes the allocation lock,
++ * so unlike `GC_gpu_pool_enabled()` it may be called FROM the allocator.
++ * Once this is true the GPU block free list can never grow again, so
++ * `GC_allochblk` returns `NULL` forever; `GC_alloc_large` and `GC_allocobj`
++ * use this to return `NULL` instead of `ABORT`ing after their retry limit.
++ */
++GC_INNER GC_bool GC_gpu_pool_broken(void);
++
 +/* The allocation kind served by the GPU pool, or -1 if there is none. */
 +GC_EXTERN int GC_gpu_kind;
 +
@@ -580,7 +607,7 @@ index 8a0c0669..973cf80e 100644
  #define OBJ_SZ_TO_BLOCKS(lb) divHBLKSZ((lb) + HBLKSIZE - 1)
  
  /*
-@@ -2178,6 +2238,15 @@ GC_INNER GC_bool GC_is_heap_base(const void *p);
+@@ -2178,6 +2248,15 @@ GC_INNER GC_bool GC_is_heap_base(const void *p);
  
  #ifdef GC_GCJ_SUPPORT
  /* Note: `GC_hblkfreelist` and `GC_free_bytes` remain visible to GNU `gcj`. */
@@ -596,3 +623,27 @@ index 8a0c0669..973cf80e 100644
  extern struct hblk *GC_hblkfreelist[];
  extern word GC_free_bytes[];
  #endif
+diff --git a/malloc.c b/malloc.c
+index 9846e67..591f779 100644
+--- a/malloc.c
++++ b/malloc.c
+@@ -79,6 +79,19 @@ GC_alloc_large(size_t lb_adjusted, int kind, unsigned flags, size_t align_m1)
+   }
+ #endif
+   for (retry_cnt = 0; NULL == h; retry_cnt++) {
++#ifdef TINYGO_GPU_POOL
++    /*
++     * A disabled GPU pool can never be grown again, so `GC_allochblk` will
++     * keep answering `NULL` no matter how often we retry, while
++     * `GC_collect_or_expand` below keeps succeeding (it only ever grows the
++     * MAIN pool).  Without this test the loop runs to its retry limit and
++     * ABORTs the process.  Returning `NULL` instead lets the caller --
++     * ultimately `GC_malloc_gpu` -- fail cleanly, so the TinyGo runtime
++     * falls back to the normal heap and the copy path.
++     */
++    if (POOL_OF_KIND(kind) == GC_POOL_GPU && GC_gpu_pool_broken())
++      return NULL;
++#endif
+     /*
+      * Only a few iterations are expected at most, otherwise something
+      * is wrong in one of the functions called below.

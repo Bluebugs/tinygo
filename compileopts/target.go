@@ -569,7 +569,18 @@ func defaultTarget(options *Options) (*TargetSpec, error) {
 			// Consequence: with a full-sysroot VULKAN_SDK, if
 			// /usr/include/vulkan/vulkan.h also exists the system header
 			// wins. Harmless: gpu_vulkan.c uses Vulkan 1.1 core only.
-			spec.CFlags = append(spec.CFlags, "-fno-lto", "-idirafter", VulkanIncludeDir())
+			// gpu_vulkan.c registers the bdwgc GPU chunk provider, so it
+			// needs gc_gpu.h (SPMD-owned, lib/bdwgc-gpu) and the gc.h that
+			// header includes (bdwgc's public include dir). Both paths are
+			// source-tree directories that always exist.
+			//
+			// Deliberately NOT build/bdwgc-patched/include/gc: that tree is
+			// materialised lazily by the bdwgc Library callbacks, and
+			// Library.load returns a cached lib.a without materialising it at
+			// all, so a build with a warm library cache would compile this
+			// file against a missing include dir.
+			spec.CFlags = append(spec.CFlags, "-fno-lto", "-idirafter", VulkanIncludeDir(),
+				"-I{root}/lib/bdwgc-gpu", "-I{root}/lib/bdwgc/include/gc")
 			spec.ExtraFiles = append(spec.ExtraFiles, "src/runtime/gpu_vulkan.c")
 		} else {
 			wgpu := os.Getenv("WGPU_NATIVE_PATH")

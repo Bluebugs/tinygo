@@ -22,6 +22,19 @@ STATIC GC_gpu_table *GC_gpu_tab = 0;
 
 GC_API void GC_CALL GC_gpu_disable(void) { GC_gpu_disabled = 1; }
 
+/* Has the GPU pool been permanently disabled?  A pure read of a plain int:
+   it neither allocates nor takes the allocation lock, so unlike
+   GC_gpu_pool_enabled() it is safe to call FROM the allocator, with the
+   allocation lock held.  That is exactly where it is needed: once the pool is
+   disabled the GPU block free list can never be grown again, so GC_allochblk
+   returns NULL forever.  GC_alloc_large and GC_allocobj answer a persistent
+   NULL by retrying a bounded number of times and then ABORT()ing the process.
+   The patched copies of both consult this predicate and return NULL instead,
+   which turns a dead pool into a fallback to the normal heap. */
+GC_INNER GC_bool GC_gpu_pool_broken(void) {
+    return GC_gpu_disabled ? TRUE : FALSE;
+}
+
 /* Creates the GPU allocation kind. MUST be called without the allocation lock
    held: GC_new_free_list takes the lock itself, and it allocates, so the
    collector must already be initialized. */

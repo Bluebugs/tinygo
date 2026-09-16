@@ -35,6 +35,11 @@
 
 #include <vulkan/vulkan.h>
 
+// The bdwgc GPU block pool. gc_gpu.h is SPMD-owned (tinygo/lib/bdwgc-gpu);
+// compileopts/target.go puts that directory and bdwgc's public include dir on
+// this file's include path for -gpu-host=vulkan builds.
+#include "gc_gpu.h"
+
 // Fixed-size kernel table (also sizes the descriptor pool); a 65th distinct
 // kernel fails register. Tracked in PLAN.md (Vulkan register failures).
 #define SPMD_VK_MAX_KERNELS 64
@@ -295,6 +300,185 @@ static uint32_t spmd_vk_pick_memtype(uint32_t allowed) {
         }
     }
     return UINT32_MAX;
+}
+
+// ---------------------------------------------------------------------------
+// GPU allocation pool (zero-copy): bdwgc chunk provider
+// ---------------------------------------------------------------------------
+
+// bdwgc requires a chunk base aligned to HBLKSIZE. HBLKSIZE lives in bdwgc's
+// private gc_priv.h, which this file deliberately does not include (it needs a
+// large set of build-time defines), so the value is spelled out here. It is
+// only ever used to reject a misaligned mapping early with a clear message:
+// GC_gpu_expand independently re-validates `base % HBLKSIZE` and disables the
+// pool if this constant were ever to disagree with bdwgc's.
+#define SPMD_VK_HBLKSIZE 4096u
+
+int g_pool_enabled;
+uint32_t g_min_ssbo_align = 4;
+static int g_pool_reason_printed;
+
+// Test hook (SPMD_GPU_POOL_FAIL_AFTER=N): make the N+1'th chunk request fail,
+// to exercise the mid-run provider-failure path, which is otherwise
+// unreachable without exhausting device memory. -1 (the default) disables it.
+// Read once, in spmd_vk_pool_register, while still single-threaded.
+static long g_pool_fail_after = -1;
+static long g_pool_chunks_made;
+
+static void spmd_vk_pool_off(const char *why) {
+    g_pool_enabled = 0;
+    GC_gpu_disable();
+    if (g_verbose && !g_pool_reason_printed) {
+        g_pool_reason_printed = 1;
+        fprintf(stderr, "spmd_gpu(vulkan): zerocopy pool disabled: %s\n", why);
+    }
+}
+
+// Like spmd_vk_pick_memtype, but both HOST_CACHED and HOST_COHERENT are
+// mandatory, so this fails instead of falling through to a weaker type.
+//
+// HOST_CACHED, because CPU code reads and writes pool memory directly and the
+// PoC measured uncached (write-combined) host-visible mappings reading at
+// ~0.2 GB/s -- silently turning every CPU access to a marked slice into a
+// disaster.
+//
+// HOST_COHERENT, deliberately, even though design section 1 asks only for
+// HOST_VISIBLE|HOST_CACHED. See spmd_vk_has_cached_noncoherent below.
+static uint32_t spmd_vk_pick_memtype_cached(uint32_t allowed) {
+    const VkMemoryPropertyFlags HV = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const VkMemoryPropertyFlags HC = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    const VkMemoryPropertyFlags DL = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    const VkMemoryPropertyFlags CO = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags want[2] = {DL | HV | HC | CO, HV | HC | CO};
+    for (int w = 0; w < 2; w++) {
+        for (uint32_t t = 0; t < g_memprops.memoryTypeCount; t++) {
+            VkMemoryPropertyFlags f = g_memprops.memoryTypes[t].propertyFlags;
+            if ((allowed & (1u << t)) && (f & want[w]) == want[w]) {
+                return t;
+            }
+        }
+    }
+    return UINT32_MAX;
+}
+
+// Would design section 1's wider HOST_VISIBLE|HOST_CACHED predicate have found
+// a type that spmd_vk_pick_memtype_cached rejects for not being coherent?
+// Used only to print an accurate disablement reason.
+//
+// Such a device is supportable, but not by this task alone: a non-coherent
+// mapping needs vkFlushMappedMemoryRanges before a dispatch reads pool memory
+// and vkInvalidateMappedMemoryRanges after one writes it, both rounded to
+// nonCoherentAtomSize. Those calls belong at the launch boundary, which is
+// where buffers are bound -- code this task does not own. Rather than ship
+// coherence handling that no available device can exercise, the pool fails
+// closed here: allocation falls back to the normal heap and every buffer to
+// the existing copy path, which is correct, just not zero-copy.
+static int spmd_vk_has_cached_noncoherent(uint32_t allowed) {
+    const VkMemoryPropertyFlags HV = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const VkMemoryPropertyFlags HC = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    for (uint32_t t = 0; t < g_memprops.memoryTypeCount; t++) {
+        VkMemoryPropertyFlags f = g_memprops.memoryTypes[t].propertyFlags;
+        if ((allowed & (1u << t)) && (f & (HV | HC)) == (HV | HC) &&
+            (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Chunk provider for the bdwgc GPU pool: one VkDeviceMemory of a
+// HOST_VISIBLE|HOST_CACHED|HOST_COHERENT type, persistently mapped, with one
+// storage VkBuffer spanning it.
+//
+// LOCKING: called with bdwgc's allocation lock held, and possibly with the
+// world stopped for a collection. It therefore takes NO lock of its own -- in
+// particular not g_lock, which spmd_vk_pool_register holds while registering
+// this callback -- and reads only state that is immutable after registration
+// (g_device, g_memprops). Do not add a g_lock acquisition here: it would
+// invert the registration path's lock order and deadlock.
+//
+// OWNERSHIP: on success the VkBuffer, the VkDeviceMemory and the mapping are
+// kept for the lifetime of the process and are never destroyed. bdwgc does not
+// return pool memory to the provider, so live Go objects point into this
+// mapping until the program exits. Every FAILURE path, by contrast, destroys
+// everything it created before returning.
+static int spmd_vk_chunk_alloc(size_t bytes, GC_gpu_chunk *out) {
+    if (!g_pool_enabled) {
+        return 0;
+    }
+    if (bytes == 0) {
+        spmd_vk_pool_off("zero-sized chunk request");
+        return 0;
+    }
+    if (g_pool_fail_after >= 0 && g_pool_chunks_made >= g_pool_fail_after) {
+        // Test hook, not a real failure: exercise the mid-run fallback.
+        spmd_vk_pool_off("injected chunk failure (SPMD_GPU_POOL_FAIL_AFTER)");
+        return 0;
+    }
+    VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                              .size = bytes,
+                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void *map = NULL;
+    if (vkCreateBuffer(g_device, &bci, NULL, &buf) != VK_SUCCESS) {
+        spmd_vk_pool_off("vkCreateBuffer failed");
+        return 0;
+    }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g_device, buf, &mr);
+    uint32_t t = spmd_vk_pick_memtype_cached(mr.memoryTypeBits);
+    if (t == UINT32_MAX) {
+        vkDestroyBuffer(g_device, buf, NULL);
+        spmd_vk_pool_off(spmd_vk_has_cached_noncoherent(mr.memoryTypeBits)
+                             ? "only cached-but-non-coherent host-visible memory "
+                               "(flush/invalidate not implemented)"
+                             : "no HOST_VISIBLE|HOST_CACHED|HOST_COHERENT memory type");
+        return 0;
+    }
+    VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                .allocationSize = mr.size,
+                                .memoryTypeIndex = t};
+    if (vkAllocateMemory(g_device, &mai, NULL, &mem) != VK_SUCCESS) {
+        vkDestroyBuffer(g_device, buf, NULL);
+        spmd_vk_pool_off("vkAllocateMemory failed");
+        return 0;
+    }
+    if (vkBindBufferMemory(g_device, buf, mem, 0) != VK_SUCCESS ||
+        vkMapMemory(g_device, mem, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+        vkFreeMemory(g_device, mem, NULL);
+        vkDestroyBuffer(g_device, buf, NULL);
+        spmd_vk_pool_off("bind/map failed");
+        return 0;
+    }
+    // bdwgc needs an HBLKSIZE-aligned base; a mapped VkDeviceMemory is page
+    // aligned, which is >= HBLKSIZE (4096) on this target. Assert, don't
+    // assume -- and release everything if the assumption ever fails.
+    if ((uintptr_t)map % (uintptr_t)SPMD_VK_HBLKSIZE != 0) {
+        vkUnmapMemory(g_device, mem);
+        vkFreeMemory(g_device, mem, NULL);
+        vkDestroyBuffer(g_device, buf, NULL);
+        spmd_vk_pool_off("mapping is not HBLKSIZE aligned");
+        return 0;
+    }
+    // From here the chunk is handed to bdwgc and owned by the pool. Note that
+    // GC_gpu_expand re-validates it (`base % HBLKSIZE`, `size < want`) and, if
+    // it were ever to reject it, would disable the pool WITHOUT calling back
+    // here -- orphaning this buffer and mapping for the life of the process.
+    // Unreachable in practice: the alignment check above is the same test, and
+    // mr.size >= the requested (HBLKSIZE-multiple) size by Vulkan's own
+    // contract. Stated rather than guarded, because there is no correct way to
+    // reclaim it from this side once ownership has transferred.
+    out->base = (uintptr_t)map;
+    out->size = (size_t)mr.size;
+    out->tag = (uint64_t)buf;
+    g_pool_chunks_made++;
+    if (g_verbose) {
+        fprintf(stderr, "spmd_gpu(vulkan): zerocopy chunk %zu bytes at %p (memtype %u)\n",
+                (size_t)mr.size, map, t);
+    }
+    return 1;
 }
 
 static void spmd_vk_slot_free(spmd_vk_slot *s) {
@@ -646,10 +830,45 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
 // enabled, 0 if it stays disabled (every allocation then falls back to the
 // normal heap and every buffer to the copy path).
 //
-// TEMPORARY: the real provider lands in Task 5 of the zero-copy plan. Until
-// then this returns 0, so runtime.gpuPoolInit links and the pool is inert.
+// spmd_vk_pool_register runs once, from runtime.initHeap, while the program
+// is still single-threaded. The Vulkan device is created eagerly here (not
+// lazily inside the provider) because the provider can be entered while the
+// world is stopped for a GC, and blocking there on a lock held by a stopped
+// thread would deadlock.
 int32_t spmd_vk_pool_register(void) {
-    return 0;
+    // Single-threaded entry is a correctness precondition, not a style note:
+    // the provider can later run while the world is stopped, so the device
+    // must already exist. initHeap runs before any other thread is created.
+    static int called;
+    if (called) {
+        fprintf(stderr, "spmd_gpu(vulkan): spmd_vk_pool_register called twice\n");
+        abort();
+    }
+    called = 1;
+    pthread_mutex_lock(&g_lock);
+    int32_t ok = spmd_vk_available_locked();
+    if (ok) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(g_phys, &p);
+        g_min_ssbo_align = (uint32_t)p.limits.minStorageBufferOffsetAlignment;
+        if (g_min_ssbo_align == 0) {
+            g_min_ssbo_align = 4;
+        }
+        const char *fa = getenv("SPMD_GPU_POOL_FAIL_AFTER");
+        if (fa != NULL && fa[0] != '\0') {
+            g_pool_fail_after = strtol(fa, NULL, 10);
+        }
+        g_pool_enabled = 1;
+        // Registration may create the GPU allocation kind, which takes
+        // bdwgc's allocation lock. That lock is therefore acquired while
+        // g_lock is held; the provider itself never takes g_lock, so the
+        // reverse order cannot arise and this cannot deadlock.
+        GC_set_gpu_chunk_provider(spmd_vk_chunk_alloc);
+    } else {
+        spmd_vk_pool_off("no Vulkan device");
+    }
+    pthread_mutex_unlock(&g_lock);
+    return ok;
 }
 
 int32_t spmd_vk_available(void) {
