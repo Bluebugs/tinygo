@@ -29,7 +29,11 @@ import (
 var libVersions = map[string]int{
 	"musl": 3,
 	// 3: SPMD GPU block pool (lib/bdwgc-spmd-gpu-pool.patch + gpu_pool.c).
-	"bdwgc": 3,
+	// 4: -DTINYGO_GPU_POOL_BDWGC (builder/bdwgc.go), which switches
+	//    GC_malloc_gpu from the inert bump path to the real dual-pool
+	//    allocator. cflags are not part of the cache key, so this bump is
+	//    what stops a stale lib.a from being reused.
+	"bdwgc": 4,
 }
 
 // Config keeps all configuration affecting the build in a single struct.

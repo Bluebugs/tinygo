@@ -62,3 +62,32 @@ func sliceGrow(oldBuf unsafe.Pointer, oldLen, oldCap, newCap, elemSize uintptr) 
 
 	return buf, oldLen, newCap
 }
+
+// growsliceGPU is sliceGrow with the new backing array taken from the GPU
+// allocation pool. Element types are pointer-free by construction (the
+// marking pass never marks anything else), so the layout is always NoPtrs.
+func growsliceGPU(oldBuf unsafe.Pointer, oldLen, oldCap, newCap, elemSize uintptr) (unsafe.Pointer, uintptr, uintptr) {
+	if oldCap >= newCap {
+		return oldBuf, oldLen, oldCap
+	}
+
+	newCap = 1 << bits.Len(uint(newCap))
+
+	buf := allocGPU(newCap*elemSize, gclayout.NoPtrs.AsPtr())
+	if oldLen > 0 {
+		memmove(buf, oldBuf, oldLen*elemSize)
+	}
+
+	return buf, oldLen, newCap
+}
+
+// sliceAppendGPU is sliceAppend whose growth path uses growsliceGPU.
+func sliceAppendGPU(srcBuf, elemsBuf unsafe.Pointer, srcLen, srcCap, elemsLen, elemSize uintptr) (unsafe.Pointer, uintptr, uintptr) {
+	newLen := srcLen + elemsLen
+	if elemsLen > 0 {
+		srcBuf, _, srcCap = growsliceGPU(srcBuf, srcLen, srcCap, newLen, elemSize)
+		memmove(unsafe.Add(srcBuf, srcLen*elemSize), elemsBuf, elemsLen*elemSize)
+	}
+
+	return srcBuf, newLen, srcCap
+}

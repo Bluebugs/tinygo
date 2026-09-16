@@ -272,6 +272,12 @@ func mustBdwgcPatchedDir() string {
 
 var BoehmGC = Library{
 	name: "bdwgc",
+	// WARNING: the flags returned below are NOT part of the library cache key.
+	// Config.LibraryPath (compileopts/config.go) keys the cached lib.a on the
+	// target, the libc, bdwgcSPMDHash() (the patch + lib/bdwgc-gpu/* only) and
+	// libVersions["bdwgc"] -- never on these cflags. Adding, removing or
+	// changing a flag here therefore reuses a stale lib.a built with the old
+	// flags unless you also bump libVersions["bdwgc"] in that file.
 	cflags: func(target, headerPath string) []string {
 		libdir := mustBdwgcPatchedDir()
 		flags := []string{
@@ -317,6 +323,13 @@ var BoehmGC = Library{
 			// chunk provider is registered, which only the Vulkan GPU host
 			// does, so this is safe for every target.
 			"-DTINYGO_GPU_POOL",
+			// SPMD: make GC_malloc_gpu use the real dual-pool allocator
+			// (GC_malloc_kind on the GPU kind, backed by GC-managed blocks
+			// from the GPU block pool) rather than the non-reclaiming bump
+			// allocator that gpu_pool.c falls back to without it. Like
+			// TINYGO_GPU_POOL this is inert until a provider registers:
+			// GC_malloc_gpu returns NULL and every caller falls back.
+			"-DTINYGO_GPU_POOL_BDWGC",
 
 			"-I" + libdir + "/include",
 			// gc_gpu.h is installed here by copyGPUSources.

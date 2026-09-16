@@ -37,6 +37,12 @@ func initHeap() {
 	// Call GC_set_push_other_roots(gcCallback) in C because of function
 	// signature differences that do matter in WebAssembly.
 	gcInit()
+
+	// Register the GPU chunk provider, if this build has one. It must run
+	// after gcInit (registration creates the GPU allocation kind, which needs
+	// an initialized collector) and before any other goroutine exists. It is
+	// a no-op for every build without the Vulkan GPU host.
+	gpuPoolInit()
 }
 
 //export tinygo_runtime_bdwgc_init

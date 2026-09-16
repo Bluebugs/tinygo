@@ -641,6 +641,17 @@ static int32_t spmd_vk_launch_locked(int32_t kernelID, uint32_t n,
 // Public entry points: one lock/unlock site each, so early returns inside
 // the _locked functions cannot leak the (non-recursive) mutex.
 
+// spmd_vk_pool_register registers a bdwgc GPU chunk provider backed by
+// host-visible, persistently mapped Vulkan memory. Returns 1 if the pool is
+// enabled, 0 if it stays disabled (every allocation then falls back to the
+// normal heap and every buffer to the copy path).
+//
+// TEMPORARY: the real provider lands in Task 5 of the zero-copy plan. Until
+// then this returns 0, so runtime.gpuPoolInit links and the pool is inert.
+int32_t spmd_vk_pool_register(void) {
+    return 0;
+}
+
 int32_t spmd_vk_available(void) {
     pthread_mutex_lock(&g_lock);
     int32_t r = spmd_vk_available_locked();
