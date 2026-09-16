@@ -1,0 +1,598 @@
+diff --git a/allchblk.c b/allchblk.c
+index 48677f19..abf28d15 100644
+--- a/allchblk.c
++++ b/allchblk.c
+@@ -58,18 +58,25 @@ int GC_use_entire_heap = FALSE;
+ #ifndef GC_GCJ_SUPPORT
+ STATIC
+ #endif
+-struct hblk *GC_hblkfreelist[N_HBLK_FLS + 1] = { 0 };
++struct hblk *GC_hblkfreelist[GC_N_POOLS][N_HBLK_FLS + 1] = { { 0 } };
+ 
+ GC_API void GC_CALL
+ GC_iterate_free_hblks(GC_walk_free_blk_fn fn, void *client_data)
+ {
+-  int i;
++  int i, pool;
+ 
+-  for (i = 0; i <= N_HBLK_FLS; ++i) {
+-    struct hblk *h;
++  /*
++   * Iterate over every pool: `GC_compute_large_free_bytes()` is defined in
++   * terms of this function and is compared against `GC_large_free_bytes`,
++   * which accounts for GPU-pool blocks as well.
++   */
++  for (pool = 0; pool < GC_N_POOLS; ++pool) {
++    for (i = 0; i <= N_HBLK_FLS; ++i) {
++      struct hblk *h;
+ 
+-    for (h = GC_hblkfreelist[i]; h != NULL; h = HDR(h)->hb_next) {
+-      fn(h, i, client_data);
++      for (h = GC_hblkfreelist[pool][i]; h != NULL; h = HDR(h)->hb_next) {
++        fn(h, i, client_data);
++      }
+     }
+   }
+ }
+@@ -189,16 +196,18 @@ GC_print_hblkfreelist(void)
+ static int
+ free_list_index_of(const hdr *wanted)
+ {
+-  int i;
++  int i, pool;
+ 
+-  for (i = 0; i <= N_HBLK_FLS; ++i) {
+-    const struct hblk *h;
+-    const hdr *hhdr;
++  for (pool = 0; pool < GC_N_POOLS; ++pool) {
++    for (i = 0; i <= N_HBLK_FLS; ++i) {
++      const struct hblk *h;
++      const hdr *hhdr;
+ 
+-    for (h = GC_hblkfreelist[i]; h != NULL; h = hhdr->hb_next) {
+-      hhdr = HDR(h);
+-      if (hhdr == wanted)
+-        return i;
++      for (h = GC_hblkfreelist[pool][i]; h != NULL; h = hhdr->hb_next) {
++        hhdr = HDR(h);
++        if (hhdr == wanted)
++          return i;
++      }
+     }
+   }
+   return -1;
+@@ -348,7 +357,15 @@ setup_header(hdr *hhdr, struct hblk *block, size_t lb_adjusted, int kind,
+   /* Set size, kind and mark procedure fields. */
+   hhdr->hb_sz = lb_adjusted;
+   hhdr->hb_obj_kind = (unsigned char)kind;
+-  hhdr->hb_flags = (unsigned char)flags;
++  /*
++   * `flags` never carries `GPU_POOL_BLK`: that bit is a property of the
++   * memory (which chunk the block came from), not of the allocation request,
++   * so it must survive this assignment.  Losing it would strand the block on
++   * the main pool's free list when it is freed, and let it coalesce across
++   * pools.
++   */
++  hhdr->hb_flags
++      = (unsigned char)(flags | (hhdr->hb_flags & (unsigned char)GPU_POOL_BLK));
+   hhdr->hb_block = block;
+   descr = ok->ok_descriptor;
+ #if ALIGNMENT > GC_DS_TAGS
+@@ -420,10 +437,12 @@ setup_header(hdr *hhdr, struct hblk *block, size_t lb_adjusted, int kind,
+ STATIC void
+ GC_remove_from_fl_at(hdr *hhdr, size_t index)
+ {
++  int pool = POOL_OF_HDR(hhdr);
++
+   GC_ASSERT(modHBLKSZ(hhdr->hb_sz) == 0);
+   if (hhdr->hb_prev == 0) {
+-    GC_ASSERT(HDR(GC_hblkfreelist[index]) == hhdr);
+-    GC_hblkfreelist[index] = hhdr->hb_next;
++    GC_ASSERT(HDR(GC_hblkfreelist[pool][index]) == hhdr);
++    GC_hblkfreelist[pool][index] = hhdr->hb_next;
+   } else {
+     hdr *phdr;
+     GET_HDR(hhdr->hb_prev, phdr);
+@@ -496,7 +515,8 @@ STATIC void
+ GC_add_to_fl(struct hblk *h, hdr *hhdr)
+ {
+   size_t index = GC_hblk_fl_from_blocks(divHBLKSZ(hhdr->hb_sz));
+-  struct hblk *second = GC_hblkfreelist[index];
++  int pool = POOL_OF_HDR(hhdr);
++  struct hblk *second = GC_hblkfreelist[pool][index];
+ 
+ #if defined(GC_ASSERTIONS) && !defined(USE_MUNMAP) && !defined(CHERI_PURECAP)
+   {
+@@ -513,7 +533,7 @@ GC_add_to_fl(struct hblk *h, hdr *hhdr)
+   }
+ #endif
+   GC_ASSERT(modHBLKSZ(hhdr->hb_sz) == 0);
+-  GC_hblkfreelist[index] = h;
++  GC_hblkfreelist[pool][index] = h;
+   GC_free_bytes[index] += hhdr->hb_sz;
+   GC_ASSERT(GC_free_bytes[index] <= GC_large_free_bytes);
+   hhdr->hb_next = second;
+@@ -530,6 +550,32 @@ GC_add_to_fl(struct hblk *h, hdr *hhdr)
+ #define BLOCKS_MERGE_OVERFLOW(hhdr, nexthdr) \
+   ((((hhdr)->hb_sz + (nexthdr)->hb_sz) & SIZET_SIGNB) != 0)
+ 
++/*
++ * Report whether two address-adjacent blocks may be coalesced.  Blocks of
++ * different pools never merge, or a GPU object could end up partly outside
++ * any chunk.  Two GPU blocks merge only when they came from the *same* chunk:
++ * two chunks may happen to be mapped adjacently, and merging across that
++ * boundary would let a later object span two `VkBuffer` objects, which cannot
++ * be bound without a copy.  `a`/`b` are the block addresses, `ha`/`hb` their
++ * headers.
++ */
++static GC_bool
++same_pool_and_chunk(struct hblk *a, const hdr *ha, struct hblk *b,
++                    const hdr *hb)
++{
++  if (POOL_OF_HDR(ha) != POOL_OF_HDR(hb))
++    return FALSE;
++#ifdef TINYGO_GPU_POOL
++  if (POOL_OF_HDR(ha) == GC_POOL_GPU
++      && GC_gpu_lookup(ADDR(a)) != GC_gpu_lookup(ADDR(b)))
++    return FALSE;
++#else
++  UNUSED_ARG(a);
++  UNUSED_ARG(b);
++#endif
++  return TRUE;
++}
++
+ #ifdef USE_MUNMAP
+ 
+ /*
+@@ -616,11 +662,17 @@ GC_unmap_old(unsigned threshold)
+     return;
+ #  endif
+ 
++  /*
++   * Only the main pool is considered: GPU-pool blocks are persistently mapped
++   * Vulkan memory and must never be unmapped.  Since a block carrying
++   * `GPU_POOL_BLK` is only ever linked into `GC_hblkfreelist[GC_POOL_GPU]`,
++   * skipping that pool is equivalent to skipping those blocks.
++   */
+   for (i = 0; i <= N_HBLK_FLS; ++i) {
+     struct hblk *h;
+     hdr *hhdr;
+ 
+-    for (h = GC_hblkfreelist[i]; h != NULL; h = hhdr->hb_next) {
++    for (h = GC_hblkfreelist[GC_POOL_MAIN][i]; h != NULL; h = hhdr->hb_next) {
+       hhdr = HDR(h);
+       if (!IS_MAPPED(hhdr))
+         continue;
+@@ -660,7 +712,8 @@ GC_merge_unmapped(void)
+   GC_bool merged = FALSE;
+ 
+   for (i = 0; i <= N_HBLK_FLS; ++i) {
+-    struct hblk *h = GC_hblkfreelist[i];
++    /* Main pool only; see the comment in `GC_unmap_old`. */
++    struct hblk *h = GC_hblkfreelist[GC_POOL_MAIN][i];
+ 
+     while (h != NULL) {
+       struct hblk *next;
+@@ -673,6 +726,7 @@ GC_merge_unmapped(void)
+       GET_HDR(next, nexthdr);
+       /* Coalesce with successor, if possible. */
+       if (NULL == nexthdr || !HBLK_IS_FREE(nexthdr)
++          || !same_pool_and_chunk(h, hhdr, next, nexthdr)
+           || BLOCKS_MERGE_OVERFLOW(hhdr, nexthdr)) {
+         /* Not mergeable with the successor. */
+         h = hhdr->hb_next;
+@@ -729,7 +783,7 @@ GC_merge_unmapped(void)
+       GC_add_to_fl(h, hhdr);
+       merged = TRUE;
+       /* Start over at the beginning of list. */
+-      h = GC_hblkfreelist[i];
++      h = GC_hblkfreelist[GC_POOL_MAIN][i];
+     }
+   }
+   return merged;
+@@ -769,7 +823,8 @@ GC_get_first_part(struct hblk *h, hdr *hhdr, size_t size_needed, size_t index)
+   }
+   rest_hdr->hb_block = rest;
+   rest_hdr->hb_sz = total_size - size_needed;
+-  rest_hdr->hb_flags = 0;
++  /* The remainder is part of the same chunk, so it keeps the pool bit. */
++  rest_hdr->hb_flags = (unsigned char)(hhdr->hb_flags & GPU_POOL_BLK);
+ #ifdef GC_ASSERTIONS
+   /* Mark `h` as non-free, to avoid assertion about adjacent free blocks. */
+   hhdr->hb_flags &= (unsigned char)~FREE_BLK;
+@@ -803,11 +858,12 @@ GC_split_block(struct hblk *hbp, hdr *hhdr, struct hblk *last_hbp,
+   last_hdr->hb_next = next;
+   last_hdr->hb_block = last_hbp;
+   last_hdr->hb_sz = hhdr->hb_sz - h_size;
+-  last_hdr->hb_flags = 0;
++  /* `last_hbp` lies inside `hbp`, so it inherits the pool bit. */
++  last_hdr->hb_flags = (unsigned char)(hhdr->hb_flags & GPU_POOL_BLK);
+   if (prev /* `!= NULL` */) { /*< CPPCHECK */
+     HDR(prev)->hb_next = last_hbp;
+   } else {
+-    GC_hblkfreelist[index] = last_hbp;
++    GC_hblkfreelist[POOL_OF_HDR(hhdr)][index] = last_hbp;
+   }
+   if (next /* `!= NULL` */) {
+     HDR(next)->hb_prev = last_hbp;
+@@ -822,7 +878,7 @@ GC_split_block(struct hblk *hbp, hdr *hhdr, struct hblk *last_hbp,
+   last_hdr->hb_flags |= FREE_BLK;
+ }
+ 
+-STATIC struct hblk *GC_allochblk_nth(size_t lb_adjusted, int kind,
++STATIC struct hblk *GC_allochblk_nth(size_t lb_adjusted, int kind, int pool,
+                                      unsigned flags, size_t index,
+                                      int may_split, size_t align_m1);
+ 
+@@ -830,9 +886,10 @@ STATIC struct hblk *GC_allochblk_nth(size_t lb_adjusted, int kind,
+ #  define AVOID_SPLIT_REMAPPED 2
+ #endif
+ 
+-GC_INNER struct hblk *
+-GC_allochblk(size_t lb_adjusted, int kind,
+-             unsigned flags /* `IGNORE_OFF_PAGE` or 0 */, size_t align_m1)
++static struct hblk *
++GC_allochblk_in_pool(size_t lb_adjusted, int kind, int pool,
++                     unsigned flags /* `IGNORE_OFF_PAGE` or 0 */,
++                     size_t align_m1)
+ {
+   size_t blocks, start_list;
+   struct hblk *result;
+@@ -848,7 +905,7 @@ GC_allochblk(size_t lb_adjusted, int kind,
+ 
+   start_list = GC_hblk_fl_from_blocks(blocks);
+   /* Try for an exact match first. */
+-  result = GC_allochblk_nth(lb_adjusted, kind, flags, start_list, FALSE,
++  result = GC_allochblk_nth(lb_adjusted, kind, pool, flags, start_list, FALSE,
+                             align_m1);
+   if (result != NULL)
+     return result;
+@@ -886,14 +943,59 @@ GC_allochblk(size_t lb_adjusted, int kind,
+     ++start_list;
+   }
+   for (; start_list <= split_limit; ++start_list) {
+-    result = GC_allochblk_nth(lb_adjusted, kind, flags, start_list, may_split,
+-                              align_m1);
++    result = GC_allochblk_nth(lb_adjusted, kind, pool, flags, start_list,
++                              may_split, align_m1);
+     if (result != NULL)
+       break;
+   }
+   return result;
+ }
+ 
++#ifdef TINYGO_GPU_POOL
++/*
++ * Consecutive GPU-pool allocation failures since the last success.  See
++ * `GC_allochblk` for why one failure is deliberately left unanswered.
++ */
++STATIC unsigned GC_gpu_alloc_fail_cnt = 0;
++#endif
++
++GC_INNER struct hblk *
++GC_allochblk(size_t lb_adjusted, int kind,
++             unsigned flags /* `IGNORE_OFF_PAGE` or 0 */, size_t align_m1)
++{
++  int pool = POOL_OF_KIND(kind);
++  struct hblk *result
++      = GC_allochblk_in_pool(lb_adjusted, kind, pool, flags, align_m1);
++
++#ifdef TINYGO_GPU_POOL
++  if (pool == GC_POOL_GPU) {
++    if (result != NULL) {
++      GC_gpu_alloc_fail_cnt = 0;
++    } else if (++GC_gpu_alloc_fail_cnt >= 2) {
++      /*
++       * The GPU pool cannot be grown by our caller: `GC_alloc_large` answers
++       * a `NULL` with `GC_collect_or_expand`, whose `GC_expand_hp_inner`
++       * only ever grows the main pool.  So the GPU pool grows here.
++       *
++       * We deliberately let the *first* consecutive failure return `NULL`,
++       * which makes `GC_alloc_large` run a collection and retry; GPU blocks
++       * freed by that collection come back to this pool.  Only when a second
++       * attempt fails as well do we ask the provider for another chunk.
++       * Expanding on every miss instead would grow the pool to the
++       * allocation high-water mark rather than the live high-water mark.
++       */
++      GC_gpu_alloc_fail_cnt = 0;
++      if (GC_gpu_expand(OBJ_SZ_TO_BLOCKS_CHECKED(lb_adjusted)
++                        + divHBLKSZ(align_m1) + 1)) {
++        result
++            = GC_allochblk_in_pool(lb_adjusted, kind, pool, flags, align_m1);
++      }
++    }
++  }
++#endif
++  return result;
++}
++
+ #define ALIGN_PAD_SZ(p, align_m1) \
+   (((align_m1) + 1 - (size_t)ADDR(p)) & (align_m1))
+ 
+@@ -965,6 +1067,11 @@ drop_hblk_in_chunks(size_t n, struct hblk *hbp, hdr *hhdr)
+ {
+   size_t total_size = hhdr->hb_sz;
+   const struct hblk *limit = hbp + divHBLKSZ(total_size);
++  /*
++   * Every piece carved out below is part of this one parent block, so all of
++   * them belong to the parent's pool and chunk.
++   */
++  unsigned char pool_bit = (unsigned char)(hhdr->hb_flags & GPU_POOL_BLK);
+ 
+   GC_ASSERT(HDR(hbp) == hhdr);
+   GC_ASSERT(modHBLKSZ(total_size) == 0 && total_size > 0);
+@@ -972,6 +1079,18 @@ drop_hblk_in_chunks(size_t n, struct hblk *hbp, hdr *hhdr)
+   GC_bytes_dropped += total_size;
+   GC_remove_from_fl_at(hhdr, n);
+   do {
++    /*
++     * `GC_install_header()` below hands back an UNINITIALIZED header
++     * (`alloc_hdr` recycles off `GC_hdr_free_list` without zeroing it), so
++     * from the second iteration `hb_flags` holds whatever the previous owner
++     * left.  Upstream did not care, because `setup_header()` assigned
++     * `hb_flags` unconditionally; it now PRESERVES `GPU_POOL_BLK`, which would
++     * make that stale value load-bearing.  A GPU block could lose the bit and
++     * be freed onto the main list, where `GC_unmap_old()` would unmap what is
++     * really a Vulkan mapping; a main block could gain the bit and be served
++     * to a GPU allocation from outside every chunk.
++     */
++    hhdr->hb_flags = pool_bit;
+     (void)setup_header(hhdr, hbp, HBLKSIZE, PTRFREE, 0); /*< cannot fail */
+     if (GC_debugging_started)
+       BZERO(hbp, HBLKSIZE);
+@@ -1023,8 +1142,8 @@ is_hblks_mix_in_page(struct hblk *hbp, GC_bool is_ptrfree)
+  * `align_m1` value should be less than `GC_SIZE_MAX / 2`.
+  */
+ STATIC struct hblk *
+-GC_allochblk_nth(size_t lb_adjusted, int kind, unsigned flags, size_t index,
+-                 int may_split, size_t align_m1)
++GC_allochblk_nth(size_t lb_adjusted, int kind, int pool, unsigned flags,
++                 size_t index, int may_split, size_t align_m1)
+ {
+   struct hblk *hbp, *last_hbp;
+   /* The header corresponding to `hbp`. */
+@@ -1039,7 +1158,7 @@ GC_allochblk_nth(size_t lb_adjusted, int kind, unsigned flags, size_t index,
+ retry:
+ #endif
+   /* Search for a big enough block in free list. */
+-  for (hbp = GC_hblkfreelist[index];; hbp = hhdr->hb_next) {
++  for (hbp = GC_hblkfreelist[pool][index];; hbp = hhdr->hb_next) {
+     size_t size_avail; /*< bytes available in this block */
+     size_t align_ofs;
+ 
+@@ -1264,7 +1383,7 @@ GC_freehblk(struct hblk *hbp)
+   prev = GC_free_block_ending_at(hbp);
+   /* Coalesce with successor, if possible. */
+   if (nexthdr != NULL && HBLK_IS_FREE(nexthdr)
+-      && IS_MAPPED(nexthdr)
++      && IS_MAPPED(nexthdr) && same_pool_and_chunk(hbp, hhdr, next, nexthdr)
+ #ifdef CHERI_PURECAP
+       /* FIXME: Coalesce with super-capability. */
+       /*
+@@ -1283,7 +1402,7 @@ GC_freehblk(struct hblk *hbp)
+   /* Coalesce with predecessor, if possible. */
+   if (prev /* `!= NULL` */) { /*< CPPCHECK */
+     prevhdr = HDR(prev);
+-    if (IS_MAPPED(prevhdr)
++    if (IS_MAPPED(prevhdr) && same_pool_and_chunk(prev, prevhdr, hbp, hhdr)
+ #ifdef CHERI_PURECAP
+         /* FIXME: Coalesce with super-capability. */
+         && cheri_base_get(hbp) <= ADDR(prev)
+@@ -1307,3 +1426,53 @@ GC_freehblk(struct hblk *hbp)
+   GC_large_free_bytes += size;
+   GC_add_to_fl(hbp, hhdr);
+ }
++
++#ifdef TINYGO_GPU_POOL
++/*
++ * Check the pool invariant over both block free lists and return the number
++ * of violations (0 is good).  For every free block:
++ *   - it carries `GPU_POOL_BLK` if and only if it lies inside a registered
++ *     GPU chunk, so a stale or lost bit is caught either way;
++ *   - it is linked into the free list of the pool its bit selects, so a GPU
++ *     block stranded on the main list (which `GC_unmap_old` would then happily
++ *     unmap, destroying a Vulkan mapping) is caught;
++ *   - it does not extend past the end of its chunk.
++ * SCOPE: this walks the FREE LISTS ONLY, so it is a post-hoc structural
++ * check, not a live invariant assertion.  A block that was mis-stamped while
++ * it was allocated is caught only once it is reclaimed and returned to a free
++ * list; in the window between the mis-stamping and the next collection it is
++ * invisible here.  Do not read a clean result as "every allocated block is
++ * correctly stamped right now".
++ *
++ * Intended for the stress harness; it walks the lists without taking the
++ * allocation lock, so call it from single-threaded test code only.
++ */
++GC_API size_t GC_CALL
++GC_gpu_verify_pools(void)
++{
++  int pool;
++  size_t i, bad = 0;
++
++  for (pool = 0; pool < GC_N_POOLS; ++pool) {
++    for (i = 0; i <= N_HBLK_FLS; ++i) {
++      struct hblk *h;
++
++      for (h = GC_hblkfreelist[pool][i]; h != NULL; h = HDR(h)->hb_next) {
++        const hdr *hhdr = HDR(h);
++        GC_bool flagged = (hhdr->hb_flags & GPU_POOL_BLK) != 0;
++        const GC_gpu_chunk *c = GC_gpu_lookup(ADDR(h));
++
++        if (flagged != (c != NULL)) {
++          bad++;
++        } else if (POOL_OF_HDR(hhdr) != pool) {
++          bad++;
++        } else if (c != NULL
++                   && ADDR(h) + hhdr->hb_sz > c->base + c->size) {
++          bad++;
++        }
++      }
++    }
++  }
++  return bad;
++}
++#endif /* TINYGO_GPU_POOL */
+diff --git a/alloc.c b/alloc.c
+index efb8b0d5..9d479a49 100644
+--- a/alloc.c
++++ b/alloc.c
+@@ -1568,11 +1568,14 @@ GC_os_get_mem(size_t bytes)
+ }
+ 
+ /*
+- * Use the chunk of memory starting at `h` of size `sz` as part of the heap.
+- * Assumes `h` is `HBLKSIZE`-aligned, `sz` is a multiple of `HBLKSIZE`.
++ * Use the chunk of memory starting at `h` of size `sz` as part of the heap,
++ * putting its blocks on the free list of the given pool (`GC_POOL_MAIN` for
++ * ordinary heap growth, `GC_POOL_GPU` for a chunk of persistently mapped
++ * device memory donated by `GC_gpu_expand`).  Assumes `h` is
++ * `HBLKSIZE`-aligned, `sz` is a multiple of `HBLKSIZE`.
+  */
+-STATIC void
+-GC_add_to_heap(struct hblk *h, size_t sz)
++GC_INNER void
++GC_add_to_heap_pool(struct hblk *h, size_t sz, int pool)
+ {
+   hdr *hhdr;
+   ptr_t endp;
+@@ -1658,9 +1661,27 @@ GC_add_to_heap(struct hblk *h, size_t sz)
+   GC_n_heap_sects++;
+   hhdr->hb_block = h;
+   hhdr->hb_sz = sz;
+-  hhdr->hb_flags = 0;
++  /*
++   * Stamp the pool onto the section's header *before* `GC_freehblk`, which
++   * consults it both to choose the free list and to decide whether this block
++   * may coalesce with its neighbors.
++   */
++  hhdr->hb_flags = (unsigned char)(pool == GC_POOL_GPU ? GPU_POOL_BLK : 0);
+   GC_freehblk(h);
+   GC_heapsize += sz;
++#ifdef TINYGO_GPU_POOL
++  if (pool == GC_POOL_GPU) {
++    /*
++     * `GC_our_mem_bytes` ("all the memory the collector has acquired") is
++     * normally maintained by `GC_os_get_mem`, which a donated GPU chunk never
++     * goes through, yet the chunk does count towards `GC_heapsize`.  Without
++     * this, `GC_finish_collection`'s `GC_ASSERT(GC_our_mem_bytes >=
++     * GC_heapsize)` fires on the first collection after the first chunk is
++     * donated, and `GC_our_mem_bytes - GC_heapsize` underflows.
++     */
++    GC_our_mem_bytes += sz;
++  }
++#endif
+ 
+   if (ADDR_GE((ptr_t)GC_least_plausible_heap_addr, (ptr_t)h)
+       || UNLIKELY(NULL == GC_least_plausible_heap_addr)) {
+@@ -1702,6 +1723,16 @@ GC_add_to_heap(struct hblk *h, size_t sz)
+   }
+ }
+ 
++/*
++ * Ordinary heap growth.  GPU chunks enter the heap through
++ * `GC_add_to_heap_pool` instead.
++ */
++STATIC void
++GC_add_to_heap(struct hblk *h, size_t sz)
++{
++  GC_add_to_heap_pool(h, sz, GC_POOL_MAIN);
++}
++
+ #ifndef NO_DEBUGGING
+ void
+ GC_print_heap_sects(void)
+diff --git a/include/private/gc_priv.h b/include/private/gc_priv.h
+index 8a0c0669..973cf80e 100644
+--- a/include/private/gc_priv.h
++++ b/include/private/gc_priv.h
+@@ -1243,6 +1243,15 @@ struct hblkhdr {
+   /* Block is free, i.e. not in use. */
+ #define FREE_BLK 4
+ 
++  /*
++   * SPMD: this block was carved out of a GPU chunk (foreign, persistently
++   * mapped device memory donated by `GC_gpu_expand`), so it belongs to the
++   * `GC_POOL_GPU` block free list and must never be unmapped.  Note: bit 8
++   * is `HAS_DISCLAIM` under `ENABLE_DISCLAIM` and 0x10 / 0x20 are
++   * `MARK_UNCONDITIONALLY` / `LARGE_BLOCK`, so 0x40 is used here.
++   */
++#define GPU_POOL_BLK 0x40
++
+ #ifdef ENABLE_DISCLAIM
+   /* This kind has a callback on reclaim. */
+ #  define HAS_DISCLAIM 8
+@@ -1363,6 +1372,57 @@ struct hblk {
+ 
+ #define HBLK_IS_FREE(hhdr) (((hhdr)->hb_flags & FREE_BLK) != 0)
+ 
++/*
++ * SPMD GPU block pool.  Heap blocks live on one of `GC_N_POOLS` independent
++ * block free lists.  `GC_POOL_MAIN` is stock bdwgc behavior; `GC_POOL_GPU`
++ * is fed exclusively by chunks of persistently mapped Vulkan memory, so that
++ * an object allocated from the GPU kind is guaranteed to lie inside a single
++ * chunk and can be bound to a `VkBuffer` without a copy.
++ */
++#define GC_POOL_MAIN 0
++#define GC_POOL_GPU 1
++#define GC_N_POOLS 2
++
++#ifdef TINYGO_GPU_POOL
++/*
++ * Unqualified on purpose: this header is SPMD-owned and lives outside the
++ * bdwgc submodule (`lib/bdwgc-gpu/gc_gpu.h`).  The stress harness puts that
++ * directory on the include path directly; the product build copies the header
++ * into the patched tree's `include/gc/`, which is also on the include path.
++ */
++#  include "gc_gpu.h"
++
++/*
++ * Grow the GPU pool by at least `need_hblks` blocks, by asking the registered
++ * chunk provider for a new chunk and handing it to `GC_add_to_heap_pool`.
++ * MUST be called with the allocation lock held.
++ */
++GC_INNER GC_bool GC_gpu_expand(size_t /* `need_hblks` */);
++
++/* The allocation kind served by the GPU pool, or -1 if there is none. */
++GC_EXTERN int GC_gpu_kind;
++
++/*
++ * Which pool an allocation of the given kind comes from.  This is a pure
++ * test: it neither allocates nor takes the allocation lock, unlike
++ * `GC_gpu_pool_enabled()`, which may create the kind on demand and would
++ * therefore deadlock if called from the allocator.
++ */
++#  define POOL_OF_KIND(k) ((k) == GC_gpu_kind ? GC_POOL_GPU : GC_POOL_MAIN)
++#  define POOL_OF_HDR(hhdr) \
++    (((hhdr)->hb_flags & GPU_POOL_BLK) != 0 ? GC_POOL_GPU : GC_POOL_MAIN)
++#else
++#  define POOL_OF_KIND(k) ((void)(k), GC_POOL_MAIN)
++#  define POOL_OF_HDR(hhdr) ((void)(hhdr), GC_POOL_MAIN)
++#endif /* !TINYGO_GPU_POOL */
++
++/*
++ * Use the chunk of memory starting at `h` of size `sz` as part of the heap,
++ * adding its blocks to the free list of the given pool.  Assumes `h` is
++ * `HBLKSIZE`-aligned and `sz` is a multiple of `HBLKSIZE`.
++ */
++GC_INNER void GC_add_to_heap_pool(struct hblk *h, size_t sz, int pool);
++
+ #define OBJ_SZ_TO_BLOCKS(lb) divHBLKSZ((lb) + HBLKSIZE - 1)
+ 
+ /*
+@@ -2178,6 +2238,15 @@ GC_INNER GC_bool GC_is_heap_base(const void *p);
+ 
+ #ifdef GC_GCJ_SUPPORT
+ /* Note: `GC_hblkfreelist` and `GC_free_bytes` remain visible to GNU `gcj`. */
++#ifdef TINYGO_GPU_POOL
++/*
++ * `GC_hblkfreelist` is `[GC_N_POOLS][N_HBLK_FLS + 1]` with the SPMD GPU pool
++ * patch, and `N_HBLK_FLS` is private to `allchblk.c`, so the flat declaration
++ * `gcj` expects cannot be spelled here.  The two features are not combined in
++ * the TinyGo/SPMD build.
++ */
++#  error GC_GCJ_SUPPORT is not supported together with TINYGO_GPU_POOL
++#endif
+ extern struct hblk *GC_hblkfreelist[];
+ extern word GC_free_bytes[];
+ #endif

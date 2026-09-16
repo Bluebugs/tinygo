@@ -3,11 +3,12 @@
 # and runs the GPU-pool stress harness. Exit 0 only on "PASS".
 set -euo pipefail
 cd "$(dirname "$0")"
-# Sources come from two places: the pristine bdwgc submodule (or, once Task 1b
-# exists, the patched tree) and the SPMD-owned lib/bdwgc-gpu/. BDWGC_DIR is
-# overridable so Task 1b can point this at build/bdwgc-patched without editing
-# the script.
-LIB="${BDWGC_DIR:-../../lib/bdwgc}"
+# Sources come from two places: the patched bdwgc tree that `make build-tinygo`
+# materialises (pristine submodule + lib/bdwgc-spmd-gpu-pool.patch + the
+# SPMD-owned sources) and lib/bdwgc-gpu/ itself. Building from the same tree as
+# the product means the harness and TinyGo compile identical sources.
+# BDWGC_DIR is overridable, e.g. to point at the raw submodule.
+LIB="${BDWGC_DIR:-../../build/bdwgc-patched}"
 GPUDIR=../../lib/bdwgc-gpu
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT

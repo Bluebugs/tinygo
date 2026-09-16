@@ -37,6 +37,12 @@ GC_API void * GC_CALL GC_malloc_gpu(size_t lb);
 /* Lock-free lookup: the chunk containing p, or NULL. */
 GC_API const GC_gpu_chunk * GC_CALL GC_gpu_lookup(uintptr_t p);
 GC_API size_t GC_CALL GC_gpu_chunk_count(void);
+/* Test hook (implemented in the patched allchblk.c): walks both block free
+   lists and returns the number of pool/chunk invariant violations -- a block
+   carries GPU_POOL_BLK iff it lies inside a chunk, sits on the matching
+   pool's list, and does not extend past its chunk. Returns 0 when healthy.
+   Walks the lists without the allocation lock: single-threaded test use. */
+GC_API size_t GC_CALL GC_gpu_verify_pools(void);
 /* Accessors, so callers that cannot spell GC_gpu_chunk (the TinyGo runtime
    reaches these through //export declarations) can still read a chunk. */
 GC_API uintptr_t GC_CALL GC_gpu_chunk_base(const GC_gpu_chunk *c);

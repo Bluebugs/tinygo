@@ -108,6 +108,15 @@ static void check_object(void *p, size_t n) {
 int main(void) {
     GC_set_gpu_chunk_provider(fake_chunk);
     GC_INIT();
+    /* We build with -DGC_DONT_REGISTER_MAIN_STATIC_DATA, exactly like TinyGo
+       (which scans its roots itself), so this program's static data is NOT a
+       root by default. keep[] and normal_head are the only statics holding
+       live references, so register them explicitly. Without this the
+       retention checks below do not test retention at all: every kept object
+       is unreachable, gets reclaimed, and its memory is handed out again.
+       (Task 1a could not notice: chunk memory was not GC-managed at all.) */
+    GC_add_roots((char *)keep, (char *)keep + sizeof(keep));
+    GC_add_roots((char *)&normal_head, (char *)&normal_head + sizeof(normal_head));
     if (!GC_gpu_pool_enabled()) { fprintf(stderr, "FAIL: pool not enabled\n"); return 1; }
 
     /* Oversize requests must be REJECTED, not silently truncated: the
@@ -125,6 +134,11 @@ int main(void) {
     }
 
     unsigned s = 1;
+    /* OR of every base pointer returned by GC_malloc_gpu. The lowest set bit
+       of the result is the strongest alignment every result satisfied, which
+       is what the launch-time binding rule needs to know (a bound buffer's
+       offset must be a multiple of minStorageBufferOffsetAlignment). */
+    uintptr_t align_or = 0;
     double gpu_ns = 0, atomic_ns = 0;
     size_t gpu_ops = 0, atomic_ops = 0;
 
@@ -144,6 +158,7 @@ int main(void) {
         if (((uintptr_t)p & 3u) != 0) {
             fprintf(stderr, "FAIL: GC_malloc_gpu(%zu) returned unaligned %p\n", n, p); return 1;
         }
+        align_or |= (uintptr_t)p;
         check_object(p, n);
         unsigned char pat = (unsigned char)(i & 0xff);
         memset(p, pat, n);
@@ -185,7 +200,28 @@ int main(void) {
 
         if ((i % GC_EVERY) == 0) {
             GC_gcollect();
-            for (size_t k = 0; k < KEEP; k++) if (keep[k].p) check_object(keep[k].p, keep[k].n);
+            /* Structural check of the block free lists themselves, not just of
+               the objects we happen to hold. This catches a block that lost or
+               gained GPU_POOL_BLK and therefore sits on the wrong pool's free
+               list -- e.g. a GPU block stranded on the main list, which
+               GC_unmap_old would then unmap even though it is a Vulkan
+               mapping, or a main block on the GPU list that could be served to
+               a GPU allocation from outside every chunk. */
+            size_t bad = GC_gpu_verify_pools();
+            if (bad != 0) {
+                fprintf(stderr, "FAIL: %zu pool/chunk invariant violation(s) "
+                        "on the block free lists at round %ld\n", bad, i);
+                return 1;
+            }
+            /* check_object() asks "does [p, p+n) lie inside one chunk?", so it
+               must be given the object BASE. keep[k].p is deliberately an
+               interior pointer (offset keep[k].off), and passing it together
+               with the full size n would overshoot the object's end by off
+               bytes and report a bogus "spans past chunk" for any object that
+               happens to sit at the tail of a chunk. */
+            for (size_t k = 0; k < KEEP; k++)
+                if (keep[k].p)
+                    check_object((unsigned char *)keep[k].p - keep[k].off, keep[k].n);
         }
     }
 
@@ -205,6 +241,8 @@ int main(void) {
     double ratio = gpu_mean / atomic_mean;
     printf("chunks=%zu samples=%zu gpu_ns=%.1f atomic_ns=%.1f ratio=%.2f lookup_ns=%.1f sink=%zu\n",
            GC_gpu_chunk_count(), gpu_ops, gpu_mean, atomic_mean, ratio, lookup_ns, sink);
+    /* Lowest set bit of the OR of all base pointers. */
+    printf("min_align=%zu\n", (size_t)(align_or & (~align_or + 1)));
 #ifdef TINYGO_GPU_POOL_BDWGC
     /* The real STOP GATE: GC_malloc_gpu is the dual-pool allocator here. */
     if (ratio > 1.5) {

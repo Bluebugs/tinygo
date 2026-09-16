@@ -3,13 +3,18 @@
 package compileopts
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/google/shlex"
 	"github.com/tinygo-org/tinygo/goenv"
@@ -22,8 +27,9 @@ import (
 // builder.Library struct but that's hard to do since we want to know the
 // library path in advance in several places).
 var libVersions = map[string]int{
-	"musl":  3,
-	"bdwgc": 2,
+	"musl": 3,
+	// 3: SPMD GPU block pool (lib/bdwgc-spmd-gpu-pool.patch + gpu_pool.c).
+	"bdwgc": 3,
 }
 
 // Config keeps all configuration affecting the build in a single struct.
@@ -411,6 +417,56 @@ func (c *Config) LibcNeedsMalloc() bool {
 	return false
 }
 
+var (
+	bdwgcSPMDHashOnce sync.Once
+	bdwgcSPMDHashVal  string
+)
+
+// bdwgcSPMDHash returns a short hash of the SPMD GPU-pool inputs that
+// libVersions does not cover: lib/bdwgc-spmd-gpu-pool.patch and the SPMD-owned
+// sources in lib/bdwgc-gpu. It is folded into the bdwgc library cache key, so
+// editing the patch or gpu_pool.c rebuilds the library instead of silently
+// reusing a stale lib.a built from the previous sources.
+//
+// The lib/bdwgc submodule itself is pinned by git and is only ever modified
+// through the patch, so it is deliberately not hashed here (it is large, and
+// this runs on every build).
+//
+// CONSEQUENCE: bumping the lib/bdwgc submodule to a new upstream commit does
+// NOT change this hash, so such a bump still requires manually incrementing
+// libVersions["bdwgc"] above, exactly as it did before this hash existed.
+// Only the patch and lib/bdwgc-gpu/* are covered automatically. See the
+// PLAN.md deferred item about wiring the submodule SHA into the key.
+func bdwgcSPMDHash() string {
+	bdwgcSPMDHashOnce.Do(func() {
+		root := goenv.Get("TINYGOROOT")
+		paths := []string{filepath.Join(root, "lib/bdwgc-spmd-gpu-pool.patch")}
+		filepath.WalkDir(filepath.Join(root, "lib/bdwgc-gpu"), func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !d.Type().IsRegular() {
+				return nil
+			}
+			paths = append(paths, path)
+			return nil
+		})
+		sort.Strings(paths)
+
+		h := sha256.New()
+		for _, p := range paths {
+			data, err := os.ReadFile(p)
+			if err != nil {
+				// Fold the absence in, so the key still changes if the file
+				// shows up later. The builder reports the real error.
+				fmt.Fprintf(h, "missing %s\n", filepath.Base(p))
+				continue
+			}
+			fmt.Fprintf(h, "%s %d\n", filepath.Base(p), len(data))
+			h.Write(data)
+		}
+		bdwgcSPMDHashVal = hex.EncodeToString(h.Sum(nil))[:8]
+	})
+	return bdwgcSPMDHashVal
+}
+
 // LibraryPath returns the path to the library build directory. The path will be
 // a library path in the cache directory (which might not yet be built).
 func (c *Config) LibraryPath(name string) string {
@@ -427,6 +483,11 @@ func (c *Config) LibraryPath(name string) string {
 	if name == "bdwgc" {
 		// Boehm GC is compiled against a particular libc.
 		archname += "-" + c.Target.Libc
+		// The SPMD GPU block pool is applied to the vendored bdwgc at build
+		// time, from a patch plus SPMD-owned sources. Neither is covered by
+		// libVersions, so without this a cached lib.a would be reused after
+		// the patch or gpu_pool.c changed, silently linking stale objects.
+		archname += "-spmd" + bdwgcSPMDHash()
 	}
 
 	// Append a version string, if this library has a version.
